@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request, redirect, url_for
+from flask import Flask, jsonify, render_template, request, redirect, url_for, make_response
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "alerts.db"
@@ -85,11 +85,28 @@ def save_alert_batch(data: dict):
 
 @app.route("/")
 def index():
-    with get_db() as conn:
-        alerts = conn.execute(
-            "SELECT * FROM alerts ORDER BY id DESC LIMIT 300"
-        ).fetchall()
-    return render_template("index.html", alerts=alerts)
+    try:
+        with get_db() as conn:
+            alerts = conn.execute(
+                "SELECT * FROM alerts ORDER BY id DESC LIMIT 300"
+            ).fetchall()
+        html = render_template("index.html", alerts=alerts)
+    except Exception:
+        import traceback
+        # Surface the real error instead of ever returning a silent blank
+        # page - this makes any future problem immediately visible.
+        return f"<pre>{traceback.format_exc()}</pre>", 500
+
+    # Build the response manually and set Content-Length explicitly. Some
+    # proxies mishandle chunked responses (no Content-Length) for HTML
+    # pages, which can result in the browser receiving an empty body even
+    # though the server rendered the page correctly. Setting this directly
+    # avoids relying on chunked transfer-encoding at all.
+    body = html.encode("utf-8")
+    response = make_response(body)
+    response.headers["Content-Type"] = "text/html; charset=utf-8"
+    response.headers["Content-Length"] = str(len(body))
+    return response
 
 
 @app.route("/api/alerts")
