@@ -3,15 +3,26 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, redirect, url_for, make_response
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "alerts.db"
+IST_OFFSET = timedelta(hours=5, minutes=30)
 
 app = Flask(__name__)
+
+
+def ist_date_str(created_at_iso: str) -> str:
+    """Convert a stored UTC timestamp to its IST calendar date (YYYY-MM-DD),
+    so 'today' matches the Indian trading day rather than the UTC day."""
+    try:
+        dt = datetime.fromisoformat(created_at_iso)
+    except (ValueError, TypeError):
+        return ""
+    return (dt + IST_OFFSET).strftime("%Y-%m-%d")
 
 
 def get_db():
@@ -86,11 +97,34 @@ def save_alert_batch(data: dict):
 @app.route("/")
 def index():
     try:
+        selected_date = request.args.get("date", "")
+        today_str = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+        if not selected_date:
+            selected_date = today_str
+
         with get_db() as conn:
-            alerts = conn.execute(
-                "SELECT * FROM alerts ORDER BY id DESC LIMIT 300"
+            all_alerts = conn.execute(
+                "SELECT * FROM alerts ORDER BY id DESC LIMIT 2000"
             ).fetchall()
-        html = render_template("index.html", alerts=alerts)
+
+        # Group every stored alert by its IST calendar date, so "today" and
+        # past days both work correctly regardless of server (UTC) time.
+        available_dates = sorted(
+            {ist_date_str(a["created_at"]) for a in all_alerts if a["created_at"]},
+            reverse=True,
+        )
+        if selected_date not in available_dates and available_dates:
+            selected_date = available_dates[0]
+
+        alerts = [a for a in all_alerts if ist_date_str(a["created_at"]) == selected_date]
+
+        html = render_template(
+            "index.html",
+            alerts=alerts,
+            available_dates=available_dates,
+            selected_date=selected_date,
+            today_str=today_str,
+        )
     except Exception:
         import traceback
         # Surface the real error instead of ever returning a silent blank
@@ -111,11 +145,20 @@ def index():
 
 @app.route("/api/alerts")
 def api_alerts():
+    selected_date = request.args.get("date", "")
+    today_str = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    if not selected_date:
+        selected_date = today_str
+
     with get_db() as conn:
-        alerts = conn.execute(
-            "SELECT * FROM alerts ORDER BY id DESC LIMIT 300"
+        all_alerts = conn.execute(
+            "SELECT * FROM alerts ORDER BY id DESC LIMIT 2000"
         ).fetchall()
-    return jsonify([dict(a) for a in alerts])
+
+    alerts = [
+        dict(a) for a in all_alerts if ist_date_str(a["created_at"]) == selected_date
+    ]
+    return jsonify(alerts)
 
 
 @app.route("/webhook/chartink", methods=["POST"])
