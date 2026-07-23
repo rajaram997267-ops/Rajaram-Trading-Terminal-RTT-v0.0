@@ -52,6 +52,29 @@
       70% { box-shadow: 0 0 0 8px rgba(0,200,150,0); }
       100% { box-shadow: 0 0 0 0 rgba(0,200,150,0); }
     }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    select {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 13px;
+      padding: 8px 12px;
+      border-radius: 8px;
+    }
+    .count {
+      font-size: 12px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      border-radius: 8px;
+      white-space: nowrap;
+    }
+    .count b { color: var(--text); }
     button {
       background: #ff5370;
       color: #fff;
@@ -81,6 +104,13 @@
     .symbol { font-size: 19px; font-weight: 700; }
     .price { color: var(--gold); font-weight: 600; }
     .price::before { content: "Rs "; opacity: 0.7; }
+    .alert-title {
+      font-size: 12px;
+      color: var(--text);
+      opacity: 0.85;
+      margin-top: 8px;
+      line-height: 1.4;
+    }
     .badge {
       display: inline-block;
       background: rgba(0,200,150,0.1);
@@ -89,7 +119,7 @@
       padding: 3px 8px;
       border-radius: 999px;
       font-size: 11px;
-      margin: 8px 0;
+      margin-top: 8px;
     }
     .meta {
       color: var(--muted);
@@ -98,7 +128,7 @@
       justify-content: space-between;
       border-top: 1px solid var(--border);
       padding-top: 8px;
-      margin-top: 6px;
+      margin-top: 8px;
     }
     .empty {
       padding: 60px 20px;
@@ -115,9 +145,22 @@
       <h2><span class="pulse"></span>Chartink Alerts Dashboard</h2>
       <div class="sub">Webhook endpoint: <code>/webhook/chartink</code> - auto-refreshes every 5s</div>
     </div>
-    <form method="post" action="/clear" onsubmit="return confirm('Clear all saved alerts?');">
-      <button type="submit">Clear All</button>
-    </form>
+    <div class="controls">
+      <select id="dateSelect" onchange="location.href = '/?date=' + this.value;">
+        {% for d in available_dates %}
+          <option value="{{ d }}" {% if d == selected_date %}selected{% endif %}>
+            {{ d }}{% if d == today_str %} (today){% endif %}
+          </option>
+        {% endfor %}
+        {% if not available_dates %}
+          <option value="{{ today_str }}" selected>{{ today_str }} (today)</option>
+        {% endif %}
+      </select>
+      <div class="count">alerts this day: <b id="dayCount">{{ alerts|length }}</b></div>
+      <form method="post" action="/clear" onsubmit="return confirm('Clear all saved alerts (all days)?');">
+        <button type="submit">Clear All</button>
+      </form>
+    </div>
   </div>
 
   <div id="alertsContainer">
@@ -129,6 +172,9 @@
             <div class="symbol">{{ alert["symbol"] or "Unknown" }}</div>
             <div class="price">{{ alert["trigger_price"] or "-" }}</div>
           </div>
+          {% if alert["alert_name"] %}
+          <div class="alert-title">{{ alert["alert_name"] }}</div>
+          {% endif %}
           <div class="badge">{{ alert["scan_name"] or "Scan alert" }}</div>
           <div class="meta">
             <span>{{ alert["triggered_at"] or "" }}</span>
@@ -138,33 +184,55 @@
         {% endfor %}
       </div>
     {% else %}
-      <div class="empty">No alerts yet. Point your Chartink alert's webhook URL at <code>/webhook/chartink</code> and they'll show up here.</div>
+      <div class="empty">No alerts yet for this day. Point your Chartink alert's webhook URL at <code>/webhook/chartink</code> and they'll show up here.</div>
     {% endif %}
   </div>
 
   <script>
+    const SELECTED_DATE = {{ selected_date|tojson }};
+    const TODAY_STR = {{ today_str|tojson }};
+
+    function cardHTML(a) {
+      const titleHtml = a.alert_name
+        ? `<div class="alert-title">${escapeHtml(a.alert_name)}</div>`
+        : "";
+      return `
+        <div class="card">
+          <div class="card-top">
+            <div class="symbol">${escapeHtml(a.symbol || "Unknown")}</div>
+            <div class="price">${escapeHtml(String(a.trigger_price || "-"))}</div>
+          </div>
+          ${titleHtml}
+          <div class="badge">${escapeHtml(a.scan_name || "Scan alert")}</div>
+          <div class="meta">
+            <span>${escapeHtml(a.triggered_at || "")}</span>
+            <span>${escapeHtml((a.created_at || "").slice(0, 19))}</span>
+          </div>
+        </div>
+      `;
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement("div");
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    // Poll for new alerts every 5 seconds and re-render, without a full
+    // page reload. Only auto-refreshes while viewing today - a past day's
+    // list won't change, so there's no need to keep polling for it.
     async function refreshAlerts() {
+      if (SELECTED_DATE !== TODAY_STR) return;
       try {
-        const res = await fetch("/api/alerts");
+        const res = await fetch("/api/alerts?date=" + encodeURIComponent(SELECTED_DATE));
         const alerts = await res.json();
         const container = document.getElementById("alertsContainer");
+        document.getElementById("dayCount").textContent = alerts.length;
         if (alerts.length === 0) {
-          container.innerHTML = '<div class="empty">No alerts yet. Point your Chartink alert\'s webhook URL at <code>/webhook/chartink</code> and they\'ll show up here.</div>';
+          container.innerHTML = '<div class="empty">No alerts yet for this day. Point your Chartink alert\'s webhook URL at <code>/webhook/chartink</code> and they\'ll show up here.</div>';
           return;
         }
-        container.innerHTML = '<div class="grid" id="grid">' + alerts.map(a => `
-          <div class="card">
-            <div class="card-top">
-              <div class="symbol">${a.symbol || "Unknown"}</div>
-              <div class="price">${a.trigger_price || "-"}</div>
-            </div>
-            <div class="badge">${a.scan_name || "Scan alert"}</div>
-            <div class="meta">
-              <span>${a.triggered_at || ""}</span>
-              <span>${(a.created_at || "").slice(0, 19)}</span>
-            </div>
-          </div>
-        `).join("") + '</div>';
+        container.innerHTML = '<div class="grid" id="grid">' + alerts.map(cardHTML).join("") + '</div>';
       } catch (err) {
         console.error("Refresh failed", err);
       }
