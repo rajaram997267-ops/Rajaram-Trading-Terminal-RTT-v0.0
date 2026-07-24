@@ -25,6 +25,29 @@ def ist_date_str(created_at_iso: str) -> str:
     return (dt + IST_OFFSET).strftime("%Y-%m-%d")
 
 
+def categorize(alert: dict) -> str:
+    """Group an alert into Sell / Buy / Others based on the scan name (and
+    alert name as a fallback) Chartink assigned to it."""
+    text = f"{alert.get('scan_name', '')} {alert.get('alert_name', '')}".lower()
+    if "sell" in text:
+        return "Sell"
+    if "buy" in text:
+        return "Buy"
+    return "Others"
+
+
+CATEGORY_ORDER = ["Sell", "Buy", "Others"]
+
+
+def group_by_category(alerts: list[dict]) -> list[tuple[str, list[dict]]]:
+    """Split alerts into Sell / Buy / Others sections, in that fixed order,
+    skipping any section that has no alerts."""
+    buckets = {name: [] for name in CATEGORY_ORDER}
+    for alert in alerts:
+        buckets[categorize(alert)].append(alert)
+    return [(name, buckets[name]) for name in CATEGORY_ORDER if buckets[name]]
+
+
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -116,11 +139,17 @@ def index():
         if selected_date not in available_dates and available_dates:
             selected_date = available_dates[0]
 
-        alerts = [a for a in all_alerts if ist_date_str(a["created_at"]) == selected_date]
+        alerts = [
+            dict(a) for a in all_alerts if ist_date_str(a["created_at"]) == selected_date
+        ]
+        for a in alerts:
+            a["category"] = categorize(a)
+        grouped = group_by_category(alerts)
 
         html = render_template(
             "index.html",
             alerts=alerts,
+            grouped=grouped,
             available_dates=available_dates,
             selected_date=selected_date,
             today_str=today_str,
@@ -158,6 +187,8 @@ def api_alerts():
     alerts = [
         dict(a) for a in all_alerts if ist_date_str(a["created_at"]) == selected_date
     ]
+    for a in alerts:
+        a["category"] = categorize(a)
     return jsonify(alerts)
 
 
