@@ -167,6 +167,12 @@
       height: 1px;
       background: var(--border);
     }
+    .section-header select {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 6px;
+      max-width: 140px;
+    }
     .categories-row {
       display: flex;
       align-items: flex-start;
@@ -228,15 +234,22 @@
     {% if grouped %}
       <div class="categories-row">
         {% for category, items in grouped %}
-        <div class="category-column">
+        {% set sectors = items|map(attribute="sector")|unique|sort|list %}
+        <div class="category-column" data-category="{{ category }}">
           <div class="section-header {{ category|lower }}">
             <h3>{{ category }}</h3>
             <span class="section-count">{{ items|length }}</span>
             <div class="section-line"></div>
+            <select data-category="{{ category }}" onchange="onSectorFilterChange(this)">
+              <option value="">All sectors</option>
+              {% for s in sectors %}
+              <option value="{{ s }}">{{ s }}</option>
+              {% endfor %}
+            </select>
           </div>
           <div class="category-grid">
             {% for alert in items %}
-            <div class="card">
+            <div class="card" data-sector="{{ alert['sector'] }}">
               <div class="card-top">
                 <div class="symbol">{{ alert["symbol"] or "Unknown" }}</div>
                 <div class="price">{{ alert["trigger_price"] or "-" }}</div>
@@ -264,6 +277,9 @@
     const SELECTED_DATE = {{ selected_date|tojson }};
     const TODAY_STR = {{ today_str|tojson }};
     const CATEGORY_ORDER = ["Sell", "Buy", "Others"];
+    // Remembers the chosen sector per column so it survives the 5s
+    // auto-refresh instead of resetting to "All sectors" every time.
+    const sectorFilters = {};
 
     function categorize(alert) {
       const text = ((alert.scan_name || "") + " " + (alert.alert_name || "")).toLowerCase();
@@ -277,7 +293,7 @@
         ? `<div class="alert-title">${escapeHtml(a.alert_name)}</div>`
         : "";
       return `
-        <div class="card">
+        <div class="card" data-sector="${escapeHtml(a.sector || "Unclassified")}">
           <div class="card-top">
             <div class="symbol">${escapeHtml(a.symbol || "Unknown")}</div>
             <div class="price">${escapeHtml(String(a.trigger_price || "-"))}</div>
@@ -293,12 +309,18 @@
     }
 
     function sectionHTML(category, items) {
+      const sectors = [...new Set(items.map(a => a.sector || "Unclassified"))].sort();
+      const currentValue = sectorFilters[category] || "";
+      const options = ['<option value="">All sectors</option>']
+        .concat(sectors.map(s => `<option value="${escapeHtml(s)}" ${s === currentValue ? "selected" : ""}>${escapeHtml(s)}</option>`))
+        .join("");
       return `
-        <div class="category-column">
+        <div class="category-column" data-category="${category}">
           <div class="section-header ${category.toLowerCase()}">
             <h3>${category}</h3>
             <span class="section-count">${items.length}</span>
             <div class="section-line"></div>
+            <select data-category="${category}" onchange="onSectorFilterChange(this)">${options}</select>
           </div>
           <div class="category-grid">${items.map(cardHTML).join("")}</div>
         </div>
@@ -310,6 +332,31 @@
       div.textContent = str;
       return div.innerHTML;
     }
+
+    // Called when a sector dropdown changes - remembers the choice and
+    // shows/hides cards in that column without touching the others.
+    function onSectorFilterChange(selectEl) {
+      const category = selectEl.dataset.category;
+      sectorFilters[category] = selectEl.value;
+      applySectorFilter(category);
+    }
+
+    function applySectorFilter(category) {
+      const value = sectorFilters[category] || "";
+      const column = document.querySelector(`.category-column[data-category="${category}"]`);
+      if (!column) return;
+      column.querySelectorAll(".card").forEach(card => {
+        card.style.display = (!value || card.dataset.sector === value) ? "" : "none";
+      });
+    }
+
+    function applyAllSectorFilters() {
+      CATEGORY_ORDER.forEach(cat => applySectorFilter(cat));
+    }
+
+    // Apply any filters already set (e.g. from the initial server-rendered
+    // page) as soon as the page loads.
+    applyAllSectorFilters();
 
     // Poll for new alerts every 5 seconds and re-render, without a full
     // page reload. Only auto-refreshes while viewing today - a past day's
@@ -332,6 +379,7 @@
           .map(cat => sectionHTML(cat, buckets[cat]))
           .join("");
         container.innerHTML = `<div class="categories-row">${columns}</div>`;
+        applyAllSectorFilters();
       } catch (err) {
         console.error("Refresh failed", err);
       }
