@@ -167,6 +167,37 @@
       height: 1px;
       background: var(--border);
     }
+    .categories-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 0;
+    }
+    .category-column {
+      flex: 1;
+      min-width: 0;
+      padding: 0 20px;
+      border-right: 1px solid var(--border);
+    }
+    .category-column:first-child { padding-left: 0; }
+    .category-column:last-child { border-right: none; padding-right: 0; }
+    .category-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 12px;
+    }
+    @media (max-width: 640px) {
+      .categories-row {
+        flex-direction: column;
+      }
+      .category-column {
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        padding: 0 0 20px 0;
+        margin-bottom: 20px;
+        width: 100%;
+      }
+      .category-column:last-child { border-bottom: none; margin-bottom: 0; }
+    }
   </style>
 </head>
 <body>
@@ -195,33 +226,35 @@
 
   <div id="alertsContainer">
     {% if grouped %}
-      {% for category, items in grouped %}
-      <div class="section">
-        <div class="section-header {{ category|lower }}">
-          <h3>{{ category }}</h3>
-          <span class="section-count">{{ items|length }}</span>
-          <div class="section-line"></div>
-        </div>
-        <div class="grid">
-          {% for alert in items %}
-          <div class="card">
-            <div class="card-top">
-              <div class="symbol">{{ alert["symbol"] or "Unknown" }}</div>
-              <div class="price">{{ alert["trigger_price"] or "-" }}</div>
-            </div>
-            {% if alert["alert_name"] %}
-            <div class="alert-title">{{ alert["alert_name"] }}</div>
-            {% endif %}
-            <div class="badge">{{ alert["scan_name"] or "Scan alert" }}</div>
-            <div class="meta">
-              <span>{{ alert["triggered_at"] or "" }}</span>
-              <span>{{ alert["created_at"][:19] }}</span>
-            </div>
+      <div class="categories-row">
+        {% for category, items in grouped %}
+        <div class="category-column">
+          <div class="section-header {{ category|lower }}">
+            <h3>{{ category }}</h3>
+            <span class="section-count">{{ items|length }}</span>
+            <div class="section-line"></div>
           </div>
-          {% endfor %}
+          <div class="category-grid">
+            {% for alert in items %}
+            <div class="card">
+              <div class="card-top">
+                <div class="symbol">{{ alert["symbol"] or "Unknown" }}</div>
+                <div class="price">{{ alert["trigger_price"] or "-" }}</div>
+              </div>
+              {% if alert["alert_name"] %}
+              <div class="alert-title">{{ alert["alert_name"] }}</div>
+              {% endif %}
+              <div class="badge">{{ alert["scan_name"] or "Scan alert" }}</div>
+              <div class="meta">
+                <span>{{ alert["triggered_at"] or "" }}</span>
+                <span>{{ alert["created_at"][:19] }}</span>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
         </div>
+        {% endfor %}
       </div>
-      {% endfor %}
     {% else %}
       <div class="empty">No alerts yet for this day. Point your Chartink alert's webhook URL at <code>/webhook/chartink</code> and they'll show up here.</div>
     {% endif %}
@@ -261,13 +294,13 @@
 
     function sectionHTML(category, items) {
       return `
-        <div class="section">
+        <div class="category-column">
           <div class="section-header ${category.toLowerCase()}">
             <h3>${category}</h3>
             <span class="section-count">${items.length}</span>
             <div class="section-line"></div>
           </div>
-          <div class="grid">${items.map(cardHTML).join("")}</div>
+          <div class="category-grid">${items.map(cardHTML).join("")}</div>
         </div>
       `;
     }
@@ -294,10 +327,11 @@
         }
         const buckets = { Sell: [], Buy: [], Others: [] };
         alerts.forEach(a => buckets[categorize(a)].push(a));
-        container.innerHTML = CATEGORY_ORDER
+        const columns = CATEGORY_ORDER
           .filter(cat => buckets[cat].length > 0)
           .map(cat => sectionHTML(cat, buckets[cat]))
           .join("");
+        container.innerHTML = `<div class="categories-row">${columns}</div>`;
       } catch (err) {
         console.error("Refresh failed", err);
       }
