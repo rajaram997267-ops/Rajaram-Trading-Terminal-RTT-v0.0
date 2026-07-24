@@ -137,6 +137,36 @@
       border: 1px solid var(--border);
       border-radius: 10px;
     }
+    .section {
+      margin-bottom: 28px;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .section-header h3 {
+      margin: 0;
+      font-size: 15px;
+      letter-spacing: 0.02em;
+    }
+    .section-count {
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 999px;
+    }
+    .section-header.sell h3 { color: #ff5370; }
+    .section-header.buy h3 { color: var(--green); }
+    .section-header.others h3 { color: var(--gold); }
+    .section-line {
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
   </style>
 </head>
 <body>
@@ -164,25 +194,34 @@
   </div>
 
   <div id="alertsContainer">
-    {% if alerts %}
-      <div class="grid" id="grid">
-        {% for alert in alerts %}
-        <div class="card">
-          <div class="card-top">
-            <div class="symbol">{{ alert["symbol"] or "Unknown" }}</div>
-            <div class="price">{{ alert["trigger_price"] or "-" }}</div>
-          </div>
-          {% if alert["alert_name"] %}
-          <div class="alert-title">{{ alert["alert_name"] }}</div>
-          {% endif %}
-          <div class="badge">{{ alert["scan_name"] or "Scan alert" }}</div>
-          <div class="meta">
-            <span>{{ alert["triggered_at"] or "" }}</span>
-            <span>{{ alert["created_at"][:19] }}</span>
-          </div>
+    {% if grouped %}
+      {% for category, items in grouped %}
+      <div class="section">
+        <div class="section-header {{ category|lower }}">
+          <h3>{{ category }}</h3>
+          <span class="section-count">{{ items|length }}</span>
+          <div class="section-line"></div>
         </div>
-        {% endfor %}
+        <div class="grid">
+          {% for alert in items %}
+          <div class="card">
+            <div class="card-top">
+              <div class="symbol">{{ alert["symbol"] or "Unknown" }}</div>
+              <div class="price">{{ alert["trigger_price"] or "-" }}</div>
+            </div>
+            {% if alert["alert_name"] %}
+            <div class="alert-title">{{ alert["alert_name"] }}</div>
+            {% endif %}
+            <div class="badge">{{ alert["scan_name"] or "Scan alert" }}</div>
+            <div class="meta">
+              <span>{{ alert["triggered_at"] or "" }}</span>
+              <span>{{ alert["created_at"][:19] }}</span>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
       </div>
+      {% endfor %}
     {% else %}
       <div class="empty">No alerts yet for this day. Point your Chartink alert's webhook URL at <code>/webhook/chartink</code> and they'll show up here.</div>
     {% endif %}
@@ -191,6 +230,14 @@
   <script>
     const SELECTED_DATE = {{ selected_date|tojson }};
     const TODAY_STR = {{ today_str|tojson }};
+    const CATEGORY_ORDER = ["Sell", "Buy", "Others"];
+
+    function categorize(alert) {
+      const text = ((alert.scan_name || "") + " " + (alert.alert_name || "")).toLowerCase();
+      if (text.includes("sell")) return "Sell";
+      if (text.includes("buy")) return "Buy";
+      return "Others";
+    }
 
     function cardHTML(a) {
       const titleHtml = a.alert_name
@@ -208,6 +255,19 @@
             <span>${escapeHtml(a.triggered_at || "")}</span>
             <span>${escapeHtml((a.created_at || "").slice(0, 19))}</span>
           </div>
+        </div>
+      `;
+    }
+
+    function sectionHTML(category, items) {
+      return `
+        <div class="section">
+          <div class="section-header ${category.toLowerCase()}">
+            <h3>${category}</h3>
+            <span class="section-count">${items.length}</span>
+            <div class="section-line"></div>
+          </div>
+          <div class="grid">${items.map(cardHTML).join("")}</div>
         </div>
       `;
     }
@@ -232,7 +292,12 @@
           container.innerHTML = '<div class="empty">No alerts yet for this day. Point your Chartink alert\'s webhook URL at <code>/webhook/chartink</code> and they\'ll show up here.</div>';
           return;
         }
-        container.innerHTML = '<div class="grid" id="grid">' + alerts.map(cardHTML).join("") + '</div>';
+        const buckets = { Sell: [], Buy: [], Others: [] };
+        alerts.forEach(a => buckets[categorize(a)].push(a));
+        container.innerHTML = CATEGORY_ORDER
+          .filter(cat => buckets[cat].length > 0)
+          .map(cat => sectionHTML(cat, buckets[cat]))
+          .join("");
       } catch (err) {
         console.error("Refresh failed", err);
       }
