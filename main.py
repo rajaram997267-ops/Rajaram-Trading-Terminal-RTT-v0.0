@@ -262,26 +262,50 @@ def categorize(alert: dict) -> str:
 CATEGORY_ORDER = ["Sell", "Buy", "Others"]
 
 
-def annotate_confirmations(items: list[dict]) -> None:
-    """Mark alerts whose stock was triggered by more than one distinct scan
-    within the same category (e.g. a stock hit by both 'Rajaram369-Buy' and
-    the RSI-combined scan) - a stronger, double-confirmed signal."""
-    scans_by_symbol: dict[str, set] = {}
+def merge_duplicate_symbols(items: list[dict]) -> list[dict]:
+    """Merge alerts for the same stock (within one category) into a single
+    card. When two different scans both flag the same stock - e.g.
+    'Rajaram369-Buy' and the RSI-combined scan - that's one stronger signal,
+    not two separate things to show, so it becomes one card listing both
+    scan names instead of a duplicate card per scan."""
+    groups: dict[str, list[dict]] = {}
     for a in items:
-        scans_by_symbol.setdefault(a.get("symbol", ""), set()).add(a.get("scan_name", ""))
-    for a in items:
-        a["confirmed_count"] = len(scans_by_symbol.get(a.get("symbol", ""), set()))
+        groups.setdefault(a.get("symbol", ""), []).append(a)
+
+    merged = []
+    for symbol, group in groups.items():
+        seen_scans = set()
+        scan_names = []
+        alert_name = ""
+        for a in group:
+            sn = a.get("scan_name", "")
+            if sn not in seen_scans:
+                seen_scans.add(sn)
+                scan_names.append(sn)
+            if not alert_name and a.get("alert_name"):
+                alert_name = a["alert_name"]
+
+        newest = group[0]  # group[0] is newest since input is newest-first
+        combined = dict(newest)
+        combined["alert_name"] = alert_name
+        combined["scan_names"] = scan_names
+        combined["confirmed_count"] = len(scan_names)
+        merged.append(combined)
+    return merged
 
 
 def group_by_category(alerts: list[dict]) -> list[tuple[str, list[dict]]]:
     """Split alerts into Sell / Buy / Others sections, in that fixed order,
-    skipping any section that has no alerts."""
+    merging duplicate stocks within each section, skipping any section that
+    has no alerts."""
     buckets = {name: [] for name in CATEGORY_ORDER}
     for alert in alerts:
         buckets[categorize(alert)].append(alert)
-    for items in buckets.values():
-        annotate_confirmations(items)
-    return [(name, buckets[name]) for name in CATEGORY_ORDER if buckets[name]]
+    result = []
+    for name in CATEGORY_ORDER:
+        if buckets[name]:
+            result.append((name, merge_duplicate_symbols(buckets[name])))
+    return result
 
 
 def get_db():
@@ -381,12 +405,15 @@ def index():
         for a in alerts:
             a["category"] = categorize(a)
             a["sector"] = get_sector(a.get("symbol", ""))
+        all_sectors = sorted({a["sector"] for a in alerts})
         grouped = group_by_category(alerts)
+        merged_count = sum(len(items) for _, items in grouped)
 
         html = render_template(
             "index.html",
-            alerts=alerts,
+            alerts_count=merged_count,
             grouped=grouped,
+            all_sectors=all_sectors,
             available_dates=available_dates,
             selected_date=selected_date,
             today_str=today_str,
@@ -431,10 +458,13 @@ def api_alerts():
     by_category: dict[str, list[dict]] = {}
     for a in alerts:
         by_category.setdefault(a["category"], []).append(a)
-    for items in by_category.values():
-        annotate_confirmations(items)
 
-    return jsonify(alerts)
+    merged_alerts: list[dict] = []
+    for name in CATEGORY_ORDER:
+        if name in by_category:
+            merged_alerts.extend(merge_duplicate_symbols(by_category[name]))
+
+    return jsonify(merged_alerts)
 
 
 @app.route("/webhook/chartink", methods=["POST"])
