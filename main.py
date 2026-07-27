@@ -379,16 +379,9 @@ def index():
             dict(a) for a in all_alerts if ist_date_str(a["created_at"]) == selected_date
         ]
         for a in alerts:
-        a["category"] = categorize(a)
-        a["sector"] = get_sector(a.get("symbol", ""))
-
-        by_category: dict[str, list[dict]] = {}
-        for a in alerts:
-        by_category.setdefault(a["category"], []).append(a)
-        for items in by_category.values():
-        annotate_confirmations(items)
-
-        return jsonify(alerts)
+            a["category"] = categorize(a)
+            a["sector"] = get_sector(a.get("symbol", ""))
+        grouped = group_by_category(alerts)
 
         html = render_template(
             "index.html",
@@ -398,7 +391,7 @@ def index():
             selected_date=selected_date,
             today_str=today_str,
         )
-        except Exception:
+    except Exception:
         import traceback
         # Surface the real error instead of ever returning a silent blank
         # page - this makes any future problem immediately visible.
