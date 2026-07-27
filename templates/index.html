@@ -167,6 +167,21 @@
       height: 1px;
       background: var(--border);
     }
+    .card.confirmed {
+      border-color: var(--gold);
+      box-shadow: 0 0 0 1px rgba(255,184,0,0.35);
+    }
+    .confirm-badge {
+      display: inline-block;
+      background: rgba(255,184,0,0.12);
+      color: var(--gold);
+      border: 1px solid rgba(255,184,0,0.35);
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+      margin-left: 8px;
+    }
     .section-header select {
       font-size: 11px;
       padding: 3px 8px;
@@ -249,9 +264,9 @@
           </div>
           <div class="category-grid">
             {% for alert in items %}
-            <div class="card" data-sector="{{ alert['sector'] }}">
+            <div class="card{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}" data-sector="{{ alert['sector'] }}">
               <div class="card-top">
-                <div class="symbol">{{ alert["symbol"] or "Unknown" }}</div>
+                <div class="symbol">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x confirmed</span>{% endif %}</div>
                 <div class="price">{{ alert["trigger_price"] or "-" }}</div>
               </div>
               {% if alert["alert_name"] %}
@@ -292,10 +307,14 @@
       const titleHtml = a.alert_name
         ? `<div class="alert-title">${escapeHtml(a.alert_name)}</div>`
         : "";
+      const isConfirmed = a.confirmed_count && a.confirmed_count > 1;
+      const confirmBadge = isConfirmed
+        ? `<span class="confirm-badge">${a.confirmed_count}x confirmed</span>`
+        : "";
       return `
-        <div class="card" data-sector="${escapeHtml(a.sector || "Unclassified")}">
+        <div class="card${isConfirmed ? " confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}">
           <div class="card-top">
-            <div class="symbol">${escapeHtml(a.symbol || "Unknown")}</div>
+            <div class="symbol">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</div>
             <div class="price">${escapeHtml(String(a.trigger_price || "-"))}</div>
           </div>
           ${titleHtml}
