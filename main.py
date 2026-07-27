@@ -262,12 +262,25 @@ def categorize(alert: dict) -> str:
 CATEGORY_ORDER = ["Sell", "Buy", "Others"]
 
 
+def annotate_confirmations(items: list[dict]) -> None:
+    """Mark alerts whose stock was triggered by more than one distinct scan
+    within the same category (e.g. a stock hit by both 'Rajaram369-Buy' and
+    the RSI-combined scan) - a stronger, double-confirmed signal."""
+    scans_by_symbol: dict[str, set] = {}
+    for a in items:
+        scans_by_symbol.setdefault(a.get("symbol", ""), set()).add(a.get("scan_name", ""))
+    for a in items:
+        a["confirmed_count"] = len(scans_by_symbol.get(a.get("symbol", ""), set()))
+
+
 def group_by_category(alerts: list[dict]) -> list[tuple[str, list[dict]]]:
     """Split alerts into Sell / Buy / Others sections, in that fixed order,
     skipping any section that has no alerts."""
     buckets = {name: [] for name in CATEGORY_ORDER}
     for alert in alerts:
         buckets[categorize(alert)].append(alert)
+    for items in buckets.values():
+        annotate_confirmations(items)
     return [(name, buckets[name]) for name in CATEGORY_ORDER if buckets[name]]
 
 
@@ -366,9 +379,16 @@ def index():
             dict(a) for a in all_alerts if ist_date_str(a["created_at"]) == selected_date
         ]
         for a in alerts:
-            a["category"] = categorize(a)
-            a["sector"] = get_sector(a.get("symbol", ""))
-        grouped = group_by_category(alerts)
+        a["category"] = categorize(a)
+        a["sector"] = get_sector(a.get("symbol", ""))
+
+        by_category: dict[str, list[dict]] = {}
+        for a in alerts:
+        by_category.setdefault(a["category"], []).append(a)
+        for items in by_category.values():
+        annotate_confirmations(items)
+
+        return jsonify(alerts)
 
         html = render_template(
             "index.html",
@@ -378,7 +398,7 @@ def index():
             selected_date=selected_date,
             today_str=today_str,
         )
-    except Exception:
+        except Exception:
         import traceback
         # Surface the real error instead of ever returning a silent blank
         # page - this makes any future problem immediately visible.
@@ -414,6 +434,13 @@ def api_alerts():
     for a in alerts:
         a["category"] = categorize(a)
         a["sector"] = get_sector(a.get("symbol", ""))
+
+    by_category: dict[str, list[dict]] = {}
+    for a in alerts:
+        by_category.setdefault(a["category"], []).append(a)
+    for items in by_category.values():
+        annotate_confirmations(items)
+
     return jsonify(alerts)
 
 
