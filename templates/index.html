@@ -111,6 +111,12 @@
       margin-top: 8px;
       line-height: 1.4;
     }
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
     .badge {
       display: inline-block;
       background: rgba(0,200,150,0.1);
@@ -119,7 +125,6 @@
       padding: 3px 8px;
       border-radius: 999px;
       font-size: 11px;
-      margin-top: 8px;
     }
     .meta {
       color: var(--muted);
@@ -182,11 +187,32 @@
       font-weight: 600;
       margin-left: 8px;
     }
-    .section-header select {
-      font-size: 11px;
-      padding: 3px 8px;
-      border-radius: 6px;
-      max-width: 140px;
+    .layout {
+      display: flex;
+      align-items: flex-start;
+      gap: 24px;
+    }
+    .sidebar {
+      width: 200px;
+      flex-shrink: 0;
+      border-right: 1px solid var(--border);
+      padding-right: 20px;
+      position: sticky;
+      top: 24px;
+    }
+    .sidebar h4 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .sidebar select {
+      width: 100%;
+    }
+    .main-content {
+      flex: 1;
+      min-width: 0;
     }
     .categories-row {
       display: flex;
@@ -205,6 +231,18 @@
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
       gap: 12px;
+    }
+    @media (max-width: 900px) {
+      .layout {
+        flex-direction: column;
+      }
+      .sidebar {
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        padding: 0 0 16px 0;
+        position: static;
+      }
     }
     @media (max-width: 640px) {
       .categories-row {
@@ -238,63 +276,75 @@
           <option value="{{ today_str }}" selected>{{ today_str }} (today)</option>
         {% endif %}
       </select>
-      <div class="count">alerts this day: <b id="dayCount">{{ alerts|length }}</b></div>
+      <div class="count">alerts this day: <b id="dayCount">{{ alerts_count }}</b></div>
       <form method="post" action="/clear" onsubmit="return confirm('Clear all saved alerts (all days)?');">
         <button type="submit">Clear All</button>
       </form>
     </div>
   </div>
 
-  <div id="alertsContainer">
-    {% if grouped %}
-      <div class="categories-row">
-        {% for category, items in grouped %}
-        {% set sectors = items|map(attribute="sector")|unique|sort|list %}
-        <div class="category-column" data-category="{{ category }}">
-          <div class="section-header {{ category|lower }}">
-            <h3>{{ category }}</h3>
-            <span class="section-count">{{ items|length }}</span>
-            <div class="section-line"></div>
-            <select data-category="{{ category }}" onchange="onSectorFilterChange(this)">
-              <option value="">All sectors</option>
-              {% for s in sectors %}
-              <option value="{{ s }}">{{ s }}</option>
-              {% endfor %}
-            </select>
-          </div>
-          <div class="category-grid">
-            {% for alert in items %}
-            <div class="card{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}" data-sector="{{ alert['sector'] }}">
-              <div class="card-top">
-                <div class="symbol">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x confirmed</span>{% endif %}</div>
-                <div class="price">{{ alert["trigger_price"] or "-" }}</div>
+  <div class="layout">
+    <div class="sidebar">
+      <h4>Sector</h4>
+      <select id="globalSectorSelect" onchange="onGlobalSectorChange(this)">
+        <option value="">All sectors</option>
+        {% for s in all_sectors %}
+        <option value="{{ s }}">{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="main-content">
+      <div id="alertsContainer">
+        {% if grouped %}
+          <div class="categories-row">
+            {% for category, items in grouped %}
+            <div class="category-column" data-category="{{ category }}">
+              <div class="section-header {{ category|lower }}">
+                <h3>{{ category }}</h3>
+                <span class="section-count">{{ items|length }}</span>
+                <div class="section-line"></div>
               </div>
-              {% if alert["alert_name"] %}
-              <div class="alert-title">{{ alert["alert_name"] }}</div>
-              {% endif %}
-              <div class="badge">{{ alert["scan_name"] or "Scan alert" }}</div>
-              <div class="meta">
-                <span>{{ alert["triggered_at"] or "" }}</span>
-                <span>{{ alert["created_at"][:19] }}</span>
+              <div class="category-grid">
+                {% for alert in items %}
+                <div class="card{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}" data-sector="{{ alert['sector'] }}">
+                  <div class="card-top">
+                    <div class="symbol">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x confirmed</span>{% endif %}</div>
+                    <div class="price">{{ alert["trigger_price"] or "-" }}</div>
+                  </div>
+                  {% if alert["alert_name"] %}
+                  <div class="alert-title">{{ alert["alert_name"] }}</div>
+                  {% endif %}
+                  <div class="badges">
+                    {% for sn in alert.get("scan_names", [alert.get("scan_name", "Scan alert")]) %}
+                    <span class="badge">{{ sn or "Scan alert" }}</span>
+                    {% endfor %}
+                  </div>
+                  <div class="meta">
+                    <span>{{ alert["triggered_at"] or "" }}</span>
+                    <span>{{ alert["created_at"][:19] }}</span>
+                  </div>
+                </div>
+                {% endfor %}
               </div>
             </div>
             {% endfor %}
           </div>
-        </div>
-        {% endfor %}
+        {% else %}
+          <div class="empty">No alerts yet for this day. Point your Chartink alert's webhook URL at <code>/webhook/chartink</code> and they'll show up here.</div>
+        {% endif %}
       </div>
-    {% else %}
-      <div class="empty">No alerts yet for this day. Point your Chartink alert's webhook URL at <code>/webhook/chartink</code> and they'll show up here.</div>
-    {% endif %}
+    </div>
   </div>
+
 
   <script>
     const SELECTED_DATE = {{ selected_date|tojson }};
     const TODAY_STR = {{ today_str|tojson }};
     const CATEGORY_ORDER = ["Sell", "Buy", "Others"];
-    // Remembers the chosen sector per column so it survives the 5s
+    // Remembers the globally chosen sector so it survives the 5s
     // auto-refresh instead of resetting to "All sectors" every time.
-    const sectorFilters = {};
+    let globalSector = "";
 
     function categorize(alert) {
       const text = ((alert.scan_name || "") + " " + (alert.alert_name || "")).toLowerCase();
@@ -311,6 +361,8 @@
       const confirmBadge = isConfirmed
         ? `<span class="confirm-badge">${a.confirmed_count}x confirmed</span>`
         : "";
+      const scanNames = (a.scan_names && a.scan_names.length) ? a.scan_names : [a.scan_name || "Scan alert"];
+      const badgesHtml = scanNames.map(sn => `<span class="badge">${escapeHtml(sn || "Scan alert")}</span>`).join("");
       return `
         <div class="card${isConfirmed ? " confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}">
           <div class="card-top">
@@ -318,7 +370,7 @@
             <div class="price">${escapeHtml(String(a.trigger_price || "-"))}</div>
           </div>
           ${titleHtml}
-          <div class="badge">${escapeHtml(a.scan_name || "Scan alert")}</div>
+          <div class="badges">${badgesHtml}</div>
           <div class="meta">
             <span>${escapeHtml(a.triggered_at || "")}</span>
             <span>${escapeHtml((a.created_at || "").slice(0, 19))}</span>
@@ -328,18 +380,12 @@
     }
 
     function sectionHTML(category, items) {
-      const sectors = [...new Set(items.map(a => a.sector || "Unclassified"))].sort();
-      const currentValue = sectorFilters[category] || "";
-      const options = ['<option value="">All sectors</option>']
-        .concat(sectors.map(s => `<option value="${escapeHtml(s)}" ${s === currentValue ? "selected" : ""}>${escapeHtml(s)}</option>`))
-        .join("");
       return `
         <div class="category-column" data-category="${category}">
           <div class="section-header ${category.toLowerCase()}">
             <h3>${category}</h3>
             <span class="section-count">${items.length}</span>
             <div class="section-line"></div>
-            <select data-category="${category}" onchange="onSectorFilterChange(this)">${options}</select>
           </div>
           <div class="category-grid">${items.map(cardHTML).join("")}</div>
         </div>
@@ -352,30 +398,32 @@
       return div.innerHTML;
     }
 
-    // Called when a sector dropdown changes - remembers the choice and
-    // shows/hides cards in that column without touching the others.
-    function onSectorFilterChange(selectEl) {
-      const category = selectEl.dataset.category;
-      sectorFilters[category] = selectEl.value;
-      applySectorFilter(category);
+    // Called when the sidebar's sector dropdown changes - shows/hides
+    // cards across ALL columns (Sell, Buy, Others) at once.
+    function onGlobalSectorChange(selectEl) {
+      globalSector = selectEl.value;
+      applyGlobalFilter();
     }
 
-    function applySectorFilter(category) {
-      const value = sectorFilters[category] || "";
-      const column = document.querySelector(`.category-column[data-category="${category}"]`);
-      if (!column) return;
-      column.querySelectorAll(".card").forEach(card => {
-        card.style.display = (!value || card.dataset.sector === value) ? "" : "none";
+    function applyGlobalFilter() {
+      document.querySelectorAll("#alertsContainer .card").forEach(card => {
+        card.style.display = (!globalSector || card.dataset.sector === globalSector) ? "" : "none";
       });
     }
 
-    function applyAllSectorFilters() {
-      CATEGORY_ORDER.forEach(cat => applySectorFilter(cat));
+    // Rebuilds the sidebar's option list from the current alerts, keeping
+    // the previously selected sector chosen if it's still present.
+    function rebuildSectorOptions(alerts) {
+      const select = document.getElementById("globalSectorSelect");
+      const sectors = [...new Set(alerts.map(a => a.sector || "Unclassified"))].sort();
+      const options = ['<option value="">All sectors</option>']
+        .concat(sectors.map(s => `<option value="${escapeHtml(s)}" ${s === globalSector ? "selected" : ""}>${escapeHtml(s)}</option>`))
+        .join("");
+      select.innerHTML = options;
     }
 
-    // Apply any filters already set (e.g. from the initial server-rendered
-    // page) as soon as the page loads.
-    applyAllSectorFilters();
+    // Apply any filter already set as soon as the page loads.
+    applyGlobalFilter();
 
     // Poll for new alerts every 5 seconds and re-render, without a full
     // page reload. Only auto-refreshes while viewing today - a past day's
@@ -387,6 +435,7 @@
         const alerts = await res.json();
         const container = document.getElementById("alertsContainer");
         document.getElementById("dayCount").textContent = alerts.length;
+        rebuildSectorOptions(alerts);
         if (alerts.length === 0) {
           container.innerHTML = '<div class="empty">No alerts yet for this day. Point your Chartink alert\'s webhook URL at <code>/webhook/chartink</code> and they\'ll show up here.</div>';
           return;
@@ -398,7 +447,7 @@
           .map(cat => sectionHTML(cat, buckets[cat]))
           .join("");
         container.innerHTML = `<div class="categories-row">${columns}</div>`;
-        applyAllSectorFilters();
+        applyGlobalFilter();
       } catch (err) {
         console.error("Refresh failed", err);
       }
