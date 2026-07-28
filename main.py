@@ -680,7 +680,11 @@ def run_paper_trade_check() -> dict:
                     )
                 conn.commit()
         except urllib.error.HTTPError as e:
-            msg = f"Upstox API error {e.code} for {symbol}"
+            try:
+                body = e.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                body = ""
+            msg = f"Upstox API error {e.code} for {symbol}: {body}"
             errors.append(msg)
             with get_db() as conn:
                 conn.execute(
