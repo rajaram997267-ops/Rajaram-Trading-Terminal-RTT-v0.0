@@ -360,11 +360,29 @@ def init_db():
                 exit_reason TEXT,
                 last_checked_price REAL,
                 last_checked_time TEXT,
-                last_error TEXT
+                last_error TEXT,
+                quantity INTEGER DEFAULT 0
             )
             """
         )
+        # Migration: earlier deployments today created this table without
+        # the quantity column - add it if it's missing, so existing rows
+        # (and the database in general) don't get wiped for this update.
+        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_trades)").fetchall()}
+        if "quantity" not in existing_cols:
+            conn.execute("ALTER TABLE paper_trades ADD COLUMN quantity INTEGER DEFAULT 0")
         conn.commit()
+
+
+DEFAULT_CAPITAL = 100000.0
+
+
+def get_capital() -> float:
+    value = get_setting("paper_trade_capital", str(DEFAULT_CAPITAL))
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return DEFAULT_CAPITAL
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:
@@ -445,12 +463,15 @@ def create_paper_trades_for_batch(data: dict) -> None:
         prices = [str(data.get("price", ""))]
 
     now = datetime.utcnow().isoformat()
+    capital = get_capital()
     with get_db() as conn:
         for i, symbol in enumerate(stocks):
             price = prices[i] if i < len(prices) else ""
             try:
                 price_val = float(price)
             except (ValueError, TypeError):
+                continue
+            if price_val <= 0:
                 continue
 
             existing = conn.execute(
@@ -460,13 +481,17 @@ def create_paper_trades_for_batch(data: dict) -> None:
             if existing:
                 continue
 
+            quantity = int(capital // price_val)  # whole shares only
+            if quantity < 1:
+                quantity = 1  # smallest possible position rather than skipping the trade
+
             conn.execute(
                 """
                 INSERT INTO paper_trades
-                    (symbol, direction, entry_price, entry_time, status)
-                VALUES (?, ?, ?, ?, 'OPEN')
+                    (symbol, direction, entry_price, entry_time, status, quantity)
+                VALUES (?, ?, ?, ?, 'OPEN', ?)
                 """,
-                (symbol, category, price_val, now),
+                (symbol, category, price_val, now, quantity),
             )
         conn.commit()
 
@@ -679,10 +704,11 @@ def run_paper_trade_check() -> dict:
             with get_db() as conn:
                 if exited:
                     entry_price = trade["entry_price"]
+                    qty = trade["quantity"] or 1
                     if trade["direction"] == "Buy":
-                        pnl = exit_price - entry_price
+                        pnl = (exit_price - entry_price) * qty
                     else:
-                        pnl = entry_price - exit_price
+                        pnl = (entry_price - exit_price) * qty
                     conn.execute(
                         """
                         UPDATE paper_trades
@@ -854,6 +880,7 @@ def paper_trading():
     win_rate = round((wins / total_closed) * 100, 1) if total_closed else 0
 
     token_saved = bool(get_setting("upstox_access_token"))
+    capital = get_capital()
 
     html = render_template(
         "paper_trading.html",
@@ -864,6 +891,7 @@ def paper_trading():
         total_closed=total_closed,
         wins=wins,
         token_saved=token_saved,
+        capital=capital,
     )
     body = html.encode("utf-8")
     response = make_response(body)
@@ -895,6 +923,19 @@ def paper_trading_settings():
         return jsonify({"status": "error", "message": "No token provided"}), 400
     set_setting("upstox_access_token", token)
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/paper-trading/capital", methods=["POST"])
+def paper_trading_capital():
+    data = request.get_json(silent=True) or {}
+    try:
+        capital = float(data.get("capital"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid amount"}), 400
+    if capital <= 0:
+        return jsonify({"status": "error", "message": "Amount must be positive"}), 400
+    set_setting("paper_trade_capital", str(capital))
+    return jsonify({"status": "ok", "capital": capital})
 
 
 @app.route("/api/paper-trading/check", methods=["POST"])
