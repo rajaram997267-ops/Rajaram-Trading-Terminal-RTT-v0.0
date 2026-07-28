@@ -597,14 +597,34 @@ def get_instrument_key(symbol: str) -> str | None:
     return _instrument_cache.get((symbol or "").upper())
 
 
-def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[float, float, float, float]]:
-    """Fetches today's 5-minute candles for a stock from Upstox.
-    Returns a list of (open, high, low, close), oldest first.
+def resample_1min_to_5min(candles_1min: list) -> list[tuple[float, float, float, float]]:
+    """candles_1min: list of (timestamp_str, open, high, low, close, volume, oi),
+    oldest first. Groups consecutive 1-min candles into 5-min buckets aligned
+    to the clock (e.g. 09:15-09:19), the way real 5-min candles work."""
+    buckets: dict = {}
+    order = []
+    for c in candles_1min:
+        ts_str, o, h, l, cl = c[0], c[1], c[2], c[3], c[4]
+        dt = datetime.fromisoformat(ts_str)
+        bucket_minute = (dt.minute // 5) * 5
+        bucket_key = dt.replace(minute=bucket_minute, second=0, microsecond=0)
+        if bucket_key not in buckets:
+            buckets[bucket_key] = [o, h, l, cl]
+            order.append(bucket_key)
+        else:
+            b = buckets[bucket_key]
+            b[1] = max(b[1], h)
+            b[2] = min(b[2], l)
+            b[3] = cl
+    return [tuple(buckets[k]) for k in order]
 
-    NOTE: written from Upstox's documented v2 historical-candle API but not
-    tested live (no internet access in the build sandbox) - the endpoint
-    path or response shape may need a small fix once tested for real."""
-    url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/5minute"
+
+def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[float, float, float, float]]:
+    """Fetches today's 1-minute candles from Upstox (their intraday API only
+    supports 1minute or 30minute - not 5minute directly) and combines them
+    into 5-minute candles ourselves. Returns (open, high, low, close),
+    oldest first."""
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/1minute"
     req = urllib.request.Request(
         url,
         headers={
@@ -618,7 +638,7 @@ def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[flo
     raw_candles = payload.get("data", {}).get("candles", [])
     # Upstox candle format: [timestamp, open, high, low, close, volume, oi]
     raw_candles = sorted(raw_candles, key=lambda c: c[0])
-    return [(c[1], c[2], c[3], c[4]) for c in raw_candles]
+    return resample_1min_to_5min(raw_candles)
 
 
 def run_paper_trade_check() -> dict:
