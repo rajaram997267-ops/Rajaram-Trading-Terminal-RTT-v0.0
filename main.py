@@ -861,6 +861,23 @@ def clear_alerts():
     return redirect(url_for("index"))
 
 
+def attach_unrealized_pnl(open_trades: list[dict]) -> None:
+    """Adds an 'unrealized_pnl' field to each open trade, computed from its
+    last checked price - the same math as a real exit, just against
+    whatever price was last fetched instead of a confirmed exit price."""
+    for t in open_trades:
+        last_price = t.get("last_checked_price")
+        if last_price is None:
+            t["unrealized_pnl"] = None
+            continue
+        qty = t.get("quantity") or 1
+        entry = t["entry_price"]
+        if t["direction"] == "Buy":
+            t["unrealized_pnl"] = round((last_price - entry) * qty, 2)
+        else:
+            t["unrealized_pnl"] = round((entry - last_price) * qty, 2)
+
+
 @app.route("/paper-trading")
 def paper_trading():
     with get_db() as conn:
@@ -873,6 +890,7 @@ def paper_trading():
 
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
+    attach_unrealized_pnl(open_trades)
 
     total_pnl = sum(t["pnl"] for t in closed_trades if t["pnl"] is not None)
     wins = sum(1 for t in closed_trades if (t["pnl"] or 0) > 0)
@@ -909,8 +927,10 @@ def paper_trading_data():
         closed_trades = conn.execute(
             "SELECT * FROM paper_trades WHERE status = 'CLOSED' ORDER BY id DESC LIMIT 200"
         ).fetchall()
+    open_trades = [dict(t) for t in open_trades]
+    attach_unrealized_pnl(open_trades)
     return jsonify({
-        "open": [dict(t) for t in open_trades],
+        "open": open_trades,
         "closed": [dict(t) for t in closed_trades],
     })
 
