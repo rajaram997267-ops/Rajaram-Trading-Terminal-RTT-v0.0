@@ -191,7 +191,7 @@
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-        <th>Last checked price</th><th>Last checked</th><th>Note</th>
+        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>Last checked</th><th>Note</th>
       </tr>
       {% for t in open_trades %}
       <tr>
@@ -201,6 +201,7 @@
         <td>{{ t.entry_price }}</td>
         <td>{{ t.entry_time[:19] }}</td>
         <td>{{ t.last_checked_price or "-" }}</td>
+        <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl if t.unrealized_pnl is not none else "-" }}</td>
         <td>{{ (t.last_checked_time or "")[:19] }}</td>
         <td class="error-note">{{ t.last_error or "" }}</td>
       </tr>
@@ -307,7 +308,10 @@
         container.innerHTML = '<div class="empty">No open paper trades yet. They\'re created automatically from Buy/Sell alerts.</div>';
         return;
       }
-      const rows = trades.map(t => `
+      const rows = trades.map(t => {
+        const pnlClass = t.unrealized_pnl > 0 ? "pnl-pos" : (t.unrealized_pnl < 0 ? "pnl-neg" : "");
+        const pnlText = (t.unrealized_pnl === null || t.unrealized_pnl === undefined) ? "-" : t.unrealized_pnl;
+        return `
         <tr>
           <td>${escapeHtml(t.symbol)}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
@@ -315,14 +319,16 @@
           <td>${t.entry_price}</td>
           <td>${(t.entry_time || "").slice(0, 19)}</td>
           <td>${t.last_checked_price || "-"}</td>
+          <td class="${pnlClass}">${pnlText}</td>
           <td>${(t.last_checked_time || "").slice(0, 19)}</td>
           <td class="error-note">${escapeHtml(t.last_error || "")}</td>
         </tr>
-      `).join("");
+      `;
+      }).join("");
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-              <th>Last checked price</th><th>Last checked</th><th>Note</th></tr>
+              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>Last checked</th><th>Note</th></tr>
           ${rows}
         </table>
       `;
