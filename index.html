@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chartink Alerts Dashboard</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: #131722;
+      --border: #1e222d;
+      --text: #e6e9f0;
+      --muted: #6b7280;
+      --green: #00c896;
+      --gold: #ffb800;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+    }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    h2 { margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 13px; }
+    .sub code {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: var(--green);
+    }
+    .pulse {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      margin-right: 6px;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(0,200,150,0.5); }
+      70% { box-shadow: 0 0 0 8px rgba(0,200,150,0); }
+      100% { box-shadow: 0 0 0 0 rgba(0,200,150,0); }
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    select {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 13px;
+      padding: 8px 12px;
+      border-radius: 8px;
+    }
+    .count {
+      font-size: 12px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      border-radius: 8px;
+      white-space: nowrap;
+    }
+    .count b { color: var(--text); }
+    button {
+      background: #ff5370;
+      color: #fff;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:hover { opacity: 0.9; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: 14px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+    }
+    .card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+    }
+    .symbol { font-size: 19px; font-weight: 700; }
+    .price { color: var(--gold); font-weight: 600; }
+    .price::before { content: "Rs "; opacity: 0.7; }
+    .alert-title {
+      font-size: 12px;
+      color: var(--text);
+      opacity: 0.85;
+      margin-top: 8px;
+      line-height: 1.4;
+    }
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(0,200,150,0.1);
+      color: var(--green);
+      border: 1px solid rgba(0,200,150,0.25);
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+    }
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+      border-top: 1px solid var(--border);
+      padding-top: 8px;
+      margin-top: 8px;
+    }
+    .empty {
+      padding: 60px 20px;
+      text-align: center;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .section {
+      margin-bottom: 28px;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    .section-header h3 {
+      margin: 0;
+      font-size: 15px;
+      letter-spacing: 0.02em;
+    }
+    .section-count {
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 999px;
+    }
+    .section-header.sell h3 { color: #ff5370; }
+    .section-header.buy h3 { color: var(--green); }
+    .section-header.others h3 { color: var(--gold); }
+    .section-line {
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+    .card.confirmed {
+      border-color: var(--gold);
+      box-shadow: 0 0 0 1px rgba(255,184,0,0.35);
+    }
+    .confirm-badge {
+      display: inline-block;
+      background: rgba(255,184,0,0.12);
+      color: var(--gold);
+      border: 1px solid rgba(255,184,0,0.35);
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+      margin-left: 8px;
+    }
+    .layout {
+      display: flex;
+      align-items: flex-start;
+      gap: 24px;
+    }
+    .sidebar {
+      width: 200px;
+      flex-shrink: 0;
+      border-right: 1px solid var(--border);
+      padding-right: 20px;
+      position: sticky;
+      top: 24px;
+    }
+    .sidebar h4 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .sidebar select {
+      width: 100%;
+    }
+    .main-content {
+      flex: 1;
+      min-width: 0;
+    }
+    .categories-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 0;
+    }
+    .category-column {
+      flex: 1;
+      min-width: 0;
+      padding: 0 20px;
+      border-right: 1px solid var(--border);
+    }
+    .category-column:first-child { padding-left: 0; }
+    .category-column:last-child { border-right: none; padding-right: 0; }
+    .category-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+      gap: 12px;
+    }
+    @media (max-width: 900px) {
+      .layout {
+        flex-direction: column;
+      }
+      .sidebar {
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        padding: 0 0 16px 0;
+        position: static;
+      }
+    }
+    @media (max-width: 640px) {
+      .categories-row {
+        flex-direction: column;
+      }
+      .category-column {
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        padding: 0 0 20px 0;
+        margin-bottom: 20px;
+        width: 100%;
+      }
+      .category-column:last-child { border-bottom: none; margin-bottom: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div>
+      <h2><span class="pulse"></span>Chartink Alerts Dashboard</h2>
+      <div class="sub">Webhook endpoint: <code>/webhook/chartink</code> &middot; auto-refreshes every 5s &middot; <a href="/paper-trading" style="color: var(--green);">Paper Trading &rarr;</a></div>
+    </div>
+    <div class="controls">
+      <select id="dateSelect" onchange="location.href = '/?date=' + this.value;">
+        {% for d in available_dates %}
+          <option value="{{ d }}" {% if d == selected_date %}selected{% endif %}>
+            {{ d }}{% if d == today_str %} (today){% endif %}
+          </option>
+        {% endfor %}
+        {% if not available_dates %}
+          <option value="{{ today_str }}" selected>{{ today_str }} (today)</option>
+        {% endif %}
+      </select>
+      <div class="count">alerts this day: <b id="dayCount">{{ alerts_count }}</b></div>
+      <form method="post" action="/clear" onsubmit="return confirm('Clear all saved alerts (all days)?');">
+        <button type="submit">Clear All</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="layout">
+    <div class="sidebar">
+      <h4>Sector</h4>
+      <select id="globalSectorSelect" onchange="onGlobalSectorChange(this)">
+        <option value="">All sectors</option>
+        {% for s in all_sectors %}
+        <option value="{{ s }}">{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="main-content">
+      <div id="alertsContainer">
+        {% if grouped %}
+          <div class="categories-row">
+            {% for category, items in grouped %}
+            <div class="category-column" data-category="{{ category }}">
+              <div class="section-header {{ category|lower }}">
+                <h3>{{ category }}</h3>
+                <span class="section-count">{{ items|length }}</span>
+                <div class="section-line"></div>
+              </div>
+              <div class="category-grid">
+                {% for alert in items %}
+                <div class="card{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}" data-sector="{{ alert['sector'] }}">
+                  <div class="card-top">
+                    <div class="symbol">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x confirmed</span>{% endif %}</div>
+                    <div class="price">{{ alert["trigger_price"] or "-" }}</div>
+                  </div>
+                  {% if alert["alert_name"] %}
+                  <div class="alert-title">{{ alert["alert_name"] }}</div>
+                  {% endif %}
+                  <div class="badges">
+                    {% for sn in alert.get("scan_names", [alert.get("scan_name", "Scan alert")]) %}
+                    <span class="badge">{{ sn or "Scan alert" }}</span>
+                    {% endfor %}
+                  </div>
+                  <div class="meta">
+                    <span>{{ alert["triggered_at"] or "" }}</span>
+                    <span>{{ alert["created_at"][:19] }}</span>
+                  </div>
+                </div>
+                {% endfor %}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty">No alerts yet for this day. Point your Chartink alert's webhook URL at <code>/webhook/chartink</code> and they'll show up here.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+
+  <script>
+    const SELECTED_DATE = {{ selected_date|tojson }};
+    const TODAY_STR = {{ today_str|tojson }};
+    const CATEGORY_ORDER = ["Sell", "Buy", "Others"];
+    // Remembers the globally chosen sector so it survives the 5s
+    // auto-refresh instead of resetting to "All sectors" every time.
+    let globalSector = "";
+
+    function categorize(alert) {
+      const text = ((alert.scan_name || "") + " " + (alert.alert_name || "")).toLowerCase();
+      if (text.includes("sell")) return "Sell";
+      if (text.includes("buy")) return "Buy";
+      return "Others";
+    }
+
+    function cardHTML(a) {
+      const titleHtml = a.alert_name
+        ? `<div class="alert-title">${escapeHtml(a.alert_name)}</div>`
+        : "";
+      const isConfirmed = a.confirmed_count && a.confirmed_count > 1;
+      const confirmBadge = isConfirmed
+        ? `<span class="confirm-badge">${a.confirmed_count}x confirmed</span>`
+        : "";
+      const scanNames = (a.scan_names && a.scan_names.length) ? a.scan_names : [a.scan_name || "Scan alert"];
+      const badgesHtml = scanNames.map(sn => `<span class="badge">${escapeHtml(sn || "Scan alert")}</span>`).join("");
+      return `
+        <div class="card${isConfirmed ? " confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}">
+          <div class="card-top">
+            <div class="symbol">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</div>
+            <div class="price">${escapeHtml(String(a.trigger_price || "-"))}</div>
+          </div>
+          ${titleHtml}
+          <div class="badges">${badgesHtml}</div>
+          <div class="meta">
+            <span>${escapeHtml(a.triggered_at || "")}</span>
+            <span>${escapeHtml((a.created_at || "").slice(0, 19))}</span>
+          </div>
+        </div>
+      `;
+    }
+
+    function sectionHTML(category, items) {
+      return `
+        <div class="category-column" data-category="${category}">
+          <div class="section-header ${category.toLowerCase()}">
+            <h3>${category}</h3>
+            <span class="section-count">${items.length}</span>
+            <div class="section-line"></div>
+          </div>
+          <div class="category-grid">${items.map(cardHTML).join("")}</div>
+        </div>
+      `;
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement("div");
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    // Called when the sidebar's sector dropdown changes - shows/hides
+    // cards across ALL columns (Sell, Buy, Others) at once.
+    function onGlobalSectorChange(selectEl) {
+      globalSector = selectEl.value;
+      applyGlobalFilter();
+    }
+
+    function applyGlobalFilter() {
+      document.querySelectorAll("#alertsContainer .card").forEach(card => {
+        card.style.display = (!globalSector || card.dataset.sector === globalSector) ? "" : "none";
+      });
+    }
+
+    // Rebuilds the sidebar's option list from the current alerts, keeping
+    // the previously selected sector chosen if it's still present.
+    function rebuildSectorOptions(alerts) {
+      const select = document.getElementById("globalSectorSelect");
+      const sectors = [...new Set(alerts.map(a => a.sector || "Unclassified"))].sort();
+      const options = ['<option value="">All sectors</option>']
+        .concat(sectors.map(s => `<option value="${escapeHtml(s)}" ${s === globalSector ? "selected" : ""}>${escapeHtml(s)}</option>`))
+        .join("");
+      select.innerHTML = options;
+    }
+
+    // Apply any filter already set as soon as the page loads.
+    applyGlobalFilter();
+
+    // Poll for new alerts every 5 seconds and re-render, without a full
+    // page reload. Only auto-refreshes while viewing today - a past day's
+    // list won't change, so there's no need to keep polling for it.
+    async function refreshAlerts() {
+      if (SELECTED_DATE !== TODAY_STR) return;
+      try {
+        const res = await fetch("/api/alerts?date=" + encodeURIComponent(SELECTED_DATE));
+        const alerts = await res.json();
+        const container = document.getElementById("alertsContainer");
+        document.getElementById("dayCount").textContent = alerts.length;
+        rebuildSectorOptions(alerts);
+        if (alerts.length === 0) {
+          container.innerHTML = '<div class="empty">No alerts yet for this day. Point your Chartink alert\'s webhook URL at <code>/webhook/chartink</code> and they\'ll show up here.</div>';
+          return;
+        }
+        const buckets = { Sell: [], Buy: [], Others: [] };
+        alerts.forEach(a => buckets[categorize(a)].push(a));
+        const columns = CATEGORY_ORDER
+          .filter(cat => buckets[cat].length > 0)
+          .map(cat => sectionHTML(cat, buckets[cat]))
+          .join("");
+        container.innerHTML = `<div class="categories-row">${columns}</div>`;
+        applyGlobalFilter();
+      } catch (err) {
+        console.error("Refresh failed", err);
+      }
+    }
+    setInterval(refreshAlerts, 5000);
+  </script>
+</body>
+</html>

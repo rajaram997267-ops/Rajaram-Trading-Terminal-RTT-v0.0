@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import csv
+import gzip
+import io
 import json
 import sqlite3
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -332,6 +337,49 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                direction TEXT,
+                entry_price REAL,
+                entry_time TEXT,
+                status TEXT DEFAULT 'OPEN',
+                exit_price REAL,
+                exit_time TEXT,
+                pnl REAL,
+                exit_reason TEXT,
+                last_checked_price REAL,
+                last_checked_time TEXT,
+                last_error TEXT
+            )
+            """
+        )
+        conn.commit()
+
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    with get_db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
         conn.commit()
 
 
@@ -375,6 +423,245 @@ def save_alert_batch(data: dict):
                 ),
             )
         conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Paper trading
+# ---------------------------------------------------------------------------
+
+def create_paper_trades_for_batch(data: dict) -> None:
+    """Every Buy/Sell alert automatically becomes an open paper trade, one
+    per stock. If a stock already has an open paper trade in the same
+    direction, skip it - a re-confirming alert shouldn't stack a second
+    position on top of one already open."""
+    category = categorize(data)
+    if category not in ("Buy", "Sell"):
+        return
+
+    stocks = [s.strip() for s in str(data.get("stocks", "")).split(",") if s.strip()]
+    prices = [p.strip() for p in str(data.get("trigger_prices", "")).split(",") if p.strip()]
+    if not stocks:
+        stocks = [data.get("symbol", "UNKNOWN")]
+        prices = [str(data.get("price", ""))]
+
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        for i, symbol in enumerate(stocks):
+            price = prices[i] if i < len(prices) else ""
+            try:
+                price_val = float(price)
+            except (ValueError, TypeError):
+                continue
+
+            existing = conn.execute(
+                "SELECT id FROM paper_trades WHERE symbol = ? AND direction = ? AND status = 'OPEN'",
+                (symbol, category),
+            ).fetchone()
+            if existing:
+                continue
+
+            conn.execute(
+                """
+                INSERT INTO paper_trades
+                    (symbol, direction, entry_price, entry_time, status)
+                VALUES (?, ?, ?, ?, 'OPEN')
+                """,
+                (symbol, category, price_val, now),
+            )
+        conn.commit()
+
+
+def calculate_ema(values: list[float], period: int = 5) -> list[float | None]:
+    """Seeded with a simple average of the first `period` values, then the
+    usual exponential smoothing after that. Same length as `values`, with
+    None for the seeding gap at the start."""
+    n = len(values)
+    if n < period:
+        return [None] * n
+    k = 2 / (period + 1)
+    ema: list[float | None] = [None] * (period - 1)
+    seed = sum(values[:period]) / period
+    ema.append(seed)
+    for price in values[period:]:
+        ema.append(price * k + ema[-1] * (1 - k))
+    return ema
+
+
+def check_exit(direction: str, candles: list[tuple[float, float, float, float]]):
+    """candles: list of (open, high, low, close), oldest first.
+    Buy exit: 2 consecutive red candles (close < open) closing below the
+              EMA(5) of the LOW price series.
+    Sell exit: 2 consecutive green candles (close > open) closing above the
+               EMA(5) of the HIGH price series.
+    Returns (exited: bool, exit_price: float | None)."""
+    if len(candles) < 7:  # EMA(5) needs 5 to seed, plus 2 confirming candles
+        return False, None
+
+    opens = [c[0] for c in candles]
+    highs = [c[1] for c in candles]
+    lows = [c[2] for c in candles]
+    closes = [c[3] for c in candles]
+
+    if direction == "Buy":
+        ema_line = calculate_ema(lows, 5)
+        for i in (-1, -2):
+            if ema_line[i] is None:
+                return False, None
+            if not (closes[i] < opens[i] and closes[i] < ema_line[i]):
+                return False, None
+        return True, closes[-1]
+    else:
+        ema_line = calculate_ema(highs, 5)
+        for i in (-1, -2):
+            if ema_line[i] is None:
+                return False, None
+            if not (closes[i] > opens[i] and closes[i] > ema_line[i]):
+                return False, None
+        return True, closes[-1]
+
+
+_instrument_cache: dict[str, str] = {}
+_instrument_cache_date: str | None = None
+
+UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
+
+
+def _load_instrument_master() -> None:
+    """Downloads Upstox's public instrument master file and builds a
+    trading-symbol -> instrument_key lookup for NSE equities. Cached for
+    the day since it's a large file and doesn't change intraday.
+
+    NOTE: this was written from Upstox's documented CSV format but could
+    not be tested against the live file (no internet access in the build
+    sandbox) - if this fails, the actual column names may differ slightly
+    and will need a small fix once you see the real error."""
+    global _instrument_cache, _instrument_cache_date
+    req = urllib.request.Request(UPSTOX_INSTRUMENTS_URL, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = gzip.decompress(resp.read())
+    text = raw.decode("utf-8", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    mapping = {}
+    for row in reader:
+        exch = (row.get("exchange") or "").upper()
+        itype = (row.get("instrument_type") or "").upper()
+        tsym = (row.get("tradingsymbol") or row.get("trading_symbol") or "").upper()
+        ikey = row.get("instrument_key") or ""
+        if exch == "NSE_EQ" and itype == "EQ" and tsym and ikey:
+            mapping[tsym] = ikey
+    _instrument_cache = mapping
+    _instrument_cache_date = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+
+
+def get_instrument_key(symbol: str) -> str | None:
+    today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    if _instrument_cache_date != today or not _instrument_cache:
+        _load_instrument_master()
+    return _instrument_cache.get((symbol or "").upper())
+
+
+def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[float, float, float, float]]:
+    """Fetches today's 5-minute candles for a stock from Upstox.
+    Returns a list of (open, high, low, close), oldest first.
+
+    NOTE: written from Upstox's documented v2 historical-candle API but not
+    tested live (no internet access in the build sandbox) - the endpoint
+    path or response shape may need a small fix once tested for real."""
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/5minute"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode())
+    raw_candles = payload.get("data", {}).get("candles", [])
+    # Upstox candle format: [timestamp, open, high, low, close, volume, oi]
+    raw_candles = sorted(raw_candles, key=lambda c: c[0])
+    return [(c[1], c[2], c[3], c[4]) for c in raw_candles]
+
+
+def run_paper_trade_check() -> dict:
+    """Checks every open paper trade against the live 5-min candle exit
+    rule, closing any that qualify. Returns a summary dict for the UI."""
+    access_token = get_setting("upstox_access_token")
+    if not access_token:
+        return {"checked": 0, "closed": 0, "error": "No Upstox access token saved yet."}
+
+    with get_db() as conn:
+        open_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE status = 'OPEN'"
+        ).fetchall()
+
+    checked = 0
+    closed = 0
+    errors = []
+    now = datetime.utcnow().isoformat()
+
+    for trade in open_trades:
+        checked += 1
+        symbol = trade["symbol"]
+        try:
+            instrument_key = get_instrument_key(symbol)
+            if not instrument_key:
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE paper_trades SET last_error = ?, last_checked_time = ? WHERE id = ?",
+                        (f"No instrument_key found for {symbol}", now, trade["id"]),
+                    )
+                    conn.commit()
+                continue
+
+            candles = fetch_5min_candles(instrument_key, access_token)
+            exited, exit_price = check_exit(trade["direction"], candles)
+            last_price = candles[-1][3] if candles else None
+
+            with get_db() as conn:
+                if exited:
+                    entry_price = trade["entry_price"]
+                    if trade["direction"] == "Buy":
+                        pnl = exit_price - entry_price
+                    else:
+                        pnl = entry_price - exit_price
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET status = 'CLOSED', exit_price = ?, exit_time = ?,
+                            pnl = ?, exit_reason = ?, last_checked_price = ?,
+                            last_checked_time = ?, last_error = NULL
+                        WHERE id = ?
+                        """,
+                        (exit_price, now, pnl, "5-EMA exit rule", last_price, now, trade["id"]),
+                    )
+                    closed += 1
+                else:
+                    conn.execute(
+                        "UPDATE paper_trades SET last_checked_price = ?, last_checked_time = ?, last_error = NULL WHERE id = ?",
+                        (last_price, now, trade["id"]),
+                    )
+                conn.commit()
+        except urllib.error.HTTPError as e:
+            msg = f"Upstox API error {e.code} for {symbol}"
+            errors.append(msg)
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE paper_trades SET last_error = ?, last_checked_time = ? WHERE id = ?",
+                    (msg, now, trade["id"]),
+                )
+                conn.commit()
+        except Exception as e:
+            msg = f"{symbol}: {e}"
+            errors.append(msg)
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE paper_trades SET last_error = ?, last_checked_time = ? WHERE id = ?",
+                    (msg, now, trade["id"]),
+                )
+                conn.commit()
+
+    return {"checked": checked, "closed": closed, "errors": errors}
 
 
 @app.route("/")
@@ -474,6 +761,7 @@ def chartink_webhook():
         data = request.form.to_dict()
 
     save_alert_batch(data)
+    create_paper_trades_for_batch(data)
     return jsonify({"status": "ok"}), 200
 
 
@@ -483,6 +771,74 @@ def clear_alerts():
         conn.execute("DELETE FROM alerts")
         conn.commit()
     return redirect(url_for("index"))
+
+
+@app.route("/paper-trading")
+def paper_trading():
+    with get_db() as conn:
+        open_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE status = 'OPEN' ORDER BY id DESC"
+        ).fetchall()
+        closed_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE status = 'CLOSED' ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+
+    open_trades = [dict(t) for t in open_trades]
+    closed_trades = [dict(t) for t in closed_trades]
+
+    total_pnl = sum(t["pnl"] for t in closed_trades if t["pnl"] is not None)
+    wins = sum(1 for t in closed_trades if (t["pnl"] or 0) > 0)
+    total_closed = len(closed_trades)
+    win_rate = round((wins / total_closed) * 100, 1) if total_closed else 0
+
+    token_saved = bool(get_setting("upstox_access_token"))
+
+    html = render_template(
+        "paper_trading.html",
+        open_trades=open_trades,
+        closed_trades=closed_trades,
+        total_pnl=round(total_pnl, 2),
+        win_rate=win_rate,
+        total_closed=total_closed,
+        wins=wins,
+        token_saved=token_saved,
+    )
+    body = html.encode("utf-8")
+    response = make_response(body)
+    response.headers["Content-Type"] = "text/html; charset=utf-8"
+    response.headers["Content-Length"] = str(len(body))
+    return response
+
+
+@app.route("/api/paper-trading/data")
+def paper_trading_data():
+    with get_db() as conn:
+        open_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE status = 'OPEN' ORDER BY id DESC"
+        ).fetchall()
+        closed_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE status = 'CLOSED' ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+    return jsonify({
+        "open": [dict(t) for t in open_trades],
+        "closed": [dict(t) for t in closed_trades],
+    })
+
+
+@app.route("/api/paper-trading/settings", methods=["POST"])
+def paper_trading_settings():
+    data = request.get_json(silent=True) or {}
+    token = (data.get("access_token") or "").strip()
+    if not token:
+        return jsonify({"status": "error", "message": "No token provided"}), 400
+    set_setting("upstox_access_token", token)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/api/paper-trading/check", methods=["POST"])
+def paper_trading_check():
+    result = run_paper_trade_check()
+    return jsonify(result)
 
 
 init_db()  # runs on import too, so gunicorn (used in production) creates the table
