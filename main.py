@@ -522,6 +522,7 @@ def check_exit(direction: str, candles: list[tuple[float, float, float, float]])
 
 _instrument_cache: dict[str, str] = {}
 _instrument_cache_date: str | None = None
+_instrument_debug: dict = {}
 
 UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
 
@@ -535,22 +536,58 @@ def _load_instrument_master() -> None:
     not be tested against the live file (no internet access in the build
     sandbox) - if this fails, the actual column names may differ slightly
     and will need a small fix once you see the real error."""
-    global _instrument_cache, _instrument_cache_date
-    req = urllib.request.Request(UPSTOX_INSTRUMENTS_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = gzip.decompress(resp.read())
-    text = raw.decode("utf-8", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
-    mapping = {}
-    for row in reader:
-        exch = (row.get("exchange") or "").upper()
-        itype = (row.get("instrument_type") or "").upper()
-        tsym = (row.get("tradingsymbol") or row.get("trading_symbol") or "").upper()
-        ikey = row.get("instrument_key") or ""
-        if exch == "NSE_EQ" and itype == "EQ" and tsym and ikey:
-            mapping[tsym] = ikey
-    _instrument_cache = mapping
-    _instrument_cache_date = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    global _instrument_cache, _instrument_cache_date, _instrument_debug
+    try:
+        req = urllib.request.Request(UPSTOX_INSTRUMENTS_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            raw_bytes = resp.read()
+
+        # Try gzip first (expected), but fall back to plain text in case
+        # the URL now serves an uncompressed file.
+        try:
+            raw = gzip.decompress(raw_bytes)
+        except OSError:
+            raw = raw_bytes
+
+        text = raw.decode("utf-8", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        fieldnames = reader.fieldnames or []
+        sample_rows = []
+        mapping = {}
+        row_count = 0
+        for i, row in enumerate(reader):
+            row_count = i + 1
+            if i < 3:
+                sample_rows.append(dict(row))
+            exch = (row.get("exchange") or "").upper()
+            itype = (row.get("instrument_type") or "").upper()
+            tsym = (row.get("tradingsymbol") or row.get("trading_symbol") or "").upper()
+            ikey = row.get("instrument_key") or ""
+            if exch == "NSE_EQ" and itype == "EQ" and tsym and ikey:
+                mapping[tsym] = ikey
+
+        _instrument_cache = mapping
+        _instrument_cache_date = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+        _instrument_debug = {
+            "ok": True,
+            "content_type": content_type,
+            "raw_bytes_len": len(raw_bytes),
+            "decompressed_len": len(raw),
+            "fieldnames": fieldnames,
+            "sample_rows": sample_rows,
+            "total_rows_scanned": row_count,
+            "matched_count": len(mapping),
+            "error": None,
+        }
+    except Exception as e:
+        import traceback
+        _instrument_cache = {}
+        _instrument_debug = {
+            "ok": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+        }
 
 
 def get_instrument_key(symbol: str) -> str | None:
@@ -839,6 +876,16 @@ def paper_trading_settings():
 def paper_trading_check():
     result = run_paper_trade_check()
     return jsonify(result)
+
+
+@app.route("/api/paper-trading/debug-instruments")
+def debug_instruments():
+    """Diagnostic-only: forces a fresh download of Upstox's instrument
+    master and shows exactly what came back - real column names, sample
+    rows, and any error - so a mismatch in the parsing code can be spotted
+    and fixed precisely."""
+    _load_instrument_master()
+    return jsonify(_instrument_debug)
 
 
 init_db()  # runs on import too, so gunicorn (used in production) creates the table
