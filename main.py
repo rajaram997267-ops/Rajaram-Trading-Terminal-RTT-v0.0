@@ -564,7 +564,7 @@ def _load_instrument_master() -> None:
             itype = (row.get("instrument_type") or "").upper()
             tsym = (row.get("tradingsymbol") or row.get("trading_symbol") or "").upper()
             ikey = row.get("instrument_key") or ""
-            if exch == "NSE_EQ" and itype == "EQ" and tsym and ikey:
+            if exch == "NSE_EQ" and itype == "EQUITY" and tsym and ikey:
                 mapping[tsym] = ikey
 
         _instrument_cache = mapping
