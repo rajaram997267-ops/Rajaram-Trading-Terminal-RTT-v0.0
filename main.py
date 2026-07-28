@@ -610,6 +610,7 @@ def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[flo
         headers={
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         },
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
