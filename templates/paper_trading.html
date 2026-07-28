@@ -159,6 +159,13 @@
     </span>
   </div>
 
+  <div class="settings-box">
+    <span>Capital per trade (Rs):</span>
+    <input type="text" id="capitalInput" style="max-width: 160px; flex: none;" value="{{ capital|int }}">
+    <button class="secondary" onclick="saveCapital()">Save amount</button>
+    <span class="token-status" id="capitalStatus">Used for new trades only - existing open trades keep their original quantity</span>
+  </div>
+
   <div class="stats">
     <div class="stat-card">
       <div class="label">Open trades</div>
@@ -173,7 +180,7 @@
       <div class="value" id="statWinRate">{{ win_rate }}%</div>
     </div>
     <div class="stat-card">
-      <div class="label">Total P&amp;L (points)</div>
+      <div class="label">Total P&amp;L (Rs)</div>
       <div class="value {% if total_pnl > 0 %}pos{% elif total_pnl < 0 %}neg{% endif %}" id="statPnl">{{ total_pnl }}</div>
     </div>
   </div>
@@ -183,13 +190,14 @@
     {% if open_trades %}
     <table>
       <tr>
-        <th>Symbol</th><th>Direction</th><th>Entry price</th><th>Entry time</th>
+        <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
         <th>Last checked price</th><th>Last checked</th><th>Note</th>
       </tr>
       {% for t in open_trades %}
       <tr>
         <td>{{ t.symbol }}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
+        <td>{{ t.quantity }}</td>
         <td>{{ t.entry_price }}</td>
         <td>{{ t.entry_time[:19] }}</td>
         <td>{{ t.last_checked_price or "-" }}</td>
@@ -208,13 +216,14 @@
     {% if closed_trades %}
     <table>
       <tr>
-        <th>Symbol</th><th>Direction</th><th>Entry</th><th>Exit</th>
-        <th>P&amp;L</th><th>Exit reason</th><th>Exit time</th>
+        <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Exit</th>
+        <th>P&amp;L (Rs)</th><th>Exit reason</th><th>Exit time</th>
       </tr>
       {% for t in closed_trades %}
       <tr>
         <td>{{ t.symbol }}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
+        <td>{{ t.quantity }}</td>
         <td>{{ t.entry_price }}</td>
         <td>{{ t.exit_price }}</td>
         <td class="{% if t.pnl and t.pnl > 0 %}pnl-pos{% elif t.pnl and t.pnl < 0 %}pnl-neg{% endif %}">{{ t.pnl }}</td>
@@ -245,6 +254,25 @@
       } else {
         statusEl.textContent = "Failed to save token";
         statusEl.classList.remove("saved");
+      }
+    }
+
+    async function saveCapital() {
+      const amount = parseFloat(document.getElementById("capitalInput").value);
+      const statusEl = document.getElementById("capitalStatus");
+      if (!amount || amount <= 0) {
+        statusEl.textContent = "Enter a valid amount greater than 0";
+        return;
+      }
+      const res = await fetch("/api/paper-trading/capital", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ capital: amount }),
+      });
+      if (res.ok) {
+        statusEl.textContent = `Saved - new trades will use Rs ${amount} of capital`;
+      } else {
+        statusEl.textContent = "Failed to save amount";
       }
     }
 
@@ -283,6 +311,7 @@
         <tr>
           <td>${escapeHtml(t.symbol)}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
+          <td>${t.quantity}</td>
           <td>${t.entry_price}</td>
           <td>${(t.entry_time || "").slice(0, 19)}</td>
           <td>${t.last_checked_price || "-"}</td>
@@ -292,7 +321,7 @@
       `).join("");
       container.innerHTML = `
         <table>
-          <tr><th>Symbol</th><th>Direction</th><th>Entry price</th><th>Entry time</th>
+          <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
               <th>Last checked price</th><th>Last checked</th><th>Note</th></tr>
           ${rows}
         </table>
@@ -311,6 +340,7 @@
           <tr>
             <td>${escapeHtml(t.symbol)}</td>
             <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
+            <td>${t.quantity}</td>
             <td>${t.entry_price}</td>
             <td>${t.exit_price}</td>
             <td class="${pnlClass}">${t.pnl}</td>
@@ -321,8 +351,8 @@
       }).join("");
       container.innerHTML = `
         <table>
-          <tr><th>Symbol</th><th>Direction</th><th>Entry</th><th>Exit</th>
-              <th>P&amp;L</th><th>Exit reason</th><th>Exit time</th></tr>
+          <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Exit</th>
+              <th>P&amp;L (Rs)</th><th>Exit reason</th><th>Exit time</th></tr>
           ${rows}
         </table>
       `;
