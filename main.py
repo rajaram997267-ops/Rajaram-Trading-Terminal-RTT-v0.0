@@ -447,14 +447,35 @@ def save_alert_batch(data: dict):
 # Paper trading
 # ---------------------------------------------------------------------------
 
+def get_current_capital() -> float:
+    """The account balance available for the next trade: the starting
+    capital plus every closed trade's P&L so far, compounding - this is
+    what actually answers 'how would 1 lakh grow over the month'."""
+    base = get_capital()
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0) AS total FROM paper_trades WHERE status = 'CLOSED'"
+        ).fetchone()
+    return base + (row["total"] or 0)
+
+
 def create_paper_trades_for_batch(data: dict) -> None:
-    """Every Buy/Sell alert automatically becomes an open paper trade, one
-    per stock. If a stock already has an open paper trade in the same
-    direction, skip it - a re-confirming alert shouldn't stack a second
-    position on top of one already open."""
+    """Single-position paper trading: only one trade is ever open at a
+    time, using the full current account balance. A new alert only starts
+    a trade if nothing is currently open - it does NOT stack multiple
+    simultaneous positions. This simulates actually growing one pool of
+    capital sequentially, trade after trade, rather than evaluating every
+    signal independently."""
     category = categorize(data)
     if category not in ("Buy", "Sell"):
         return
+
+    with get_db() as conn:
+        already_open = conn.execute(
+            "SELECT id FROM paper_trades WHERE status = 'OPEN' LIMIT 1"
+        ).fetchone()
+    if already_open:
+        return  # a trade is already running - wait for it to exit first
 
     stocks = [s.strip() for s in str(data.get("stocks", "")).split(",") if s.strip()]
     prices = [p.strip() for p in str(data.get("trigger_prices", "")).split(",") if p.strip()]
@@ -462,37 +483,37 @@ def create_paper_trades_for_batch(data: dict) -> None:
         stocks = [data.get("symbol", "UNKNOWN")]
         prices = [str(data.get("price", ""))]
 
+    # Only the first valid stock in this alert becomes the trade - capital
+    # is fully committed to one position at a time, not split further.
+    symbol = None
+    price_val = None
+    for i, s in enumerate(stocks):
+        p = prices[i] if i < len(prices) else ""
+        try:
+            candidate = float(p)
+        except (ValueError, TypeError):
+            continue
+        if candidate > 0:
+            symbol, price_val = s, candidate
+            break
+    if symbol is None:
+        return
+
+    capital = get_current_capital()
+    quantity = int(capital // price_val)
+    if quantity < 1:
+        quantity = 1
+
     now = datetime.utcnow().isoformat()
-    capital = get_capital()
     with get_db() as conn:
-        for i, symbol in enumerate(stocks):
-            price = prices[i] if i < len(prices) else ""
-            try:
-                price_val = float(price)
-            except (ValueError, TypeError):
-                continue
-            if price_val <= 0:
-                continue
-
-            existing = conn.execute(
-                "SELECT id FROM paper_trades WHERE symbol = ? AND direction = ? AND status = 'OPEN'",
-                (symbol, category),
-            ).fetchone()
-            if existing:
-                continue
-
-            quantity = int(capital // price_val)  # whole shares only
-            if quantity < 1:
-                quantity = 1  # smallest possible position rather than skipping the trade
-
-            conn.execute(
-                """
-                INSERT INTO paper_trades
-                    (symbol, direction, entry_price, entry_time, status, quantity)
-                VALUES (?, ?, ?, ?, 'OPEN', ?)
-                """,
-                (symbol, category, price_val, now, quantity),
-            )
+        conn.execute(
+            """
+            INSERT INTO paper_trades
+                (symbol, direction, entry_price, entry_time, status, quantity)
+            VALUES (?, ?, ?, ?, 'OPEN', ?)
+            """,
+            (symbol, category, price_val, now, quantity),
+        )
         conn.commit()
 
 
@@ -899,6 +920,7 @@ def paper_trading():
 
     token_saved = bool(get_setting("upstox_access_token"))
     capital = get_capital()
+    current_capital = get_current_capital()
 
     html = render_template(
         "paper_trading.html",
@@ -910,6 +932,7 @@ def paper_trading():
         wins=wins,
         token_saved=token_saved,
         capital=capital,
+        current_capital=round(current_capital, 2),
     )
     body = html.encode("utf-8")
     response = make_response(body)
@@ -932,6 +955,7 @@ def paper_trading_data():
     return jsonify({
         "open": open_trades,
         "closed": [dict(t) for t in closed_trades],
+        "current_capital": round(get_current_capital(), 2),
     })
 
 
@@ -956,6 +980,17 @@ def paper_trading_capital():
         return jsonify({"status": "error", "message": "Amount must be positive"}), 400
     set_setting("paper_trade_capital", str(capital))
     return jsonify({"status": "ok", "capital": capital})
+
+
+@app.route("/api/paper-trading/reset", methods=["POST"])
+def paper_trading_reset():
+    """Clears all paper trades so single-position sequential trading can
+    start clean - needed once when switching from the old model (many
+    simultaneous trades) to this one (one at a time)."""
+    with get_db() as conn:
+        conn.execute("DELETE FROM paper_trades")
+        conn.commit()
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/paper-trading/check", methods=["POST"])
