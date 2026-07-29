@@ -4,17 +4,20 @@ import csv
 import gzip
 import io
 import json
-import sqlite3
+import os
 import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import psycopg2
+import psycopg2.extras
+
 from flask import Flask, jsonify, render_template, request, redirect, url_for, make_response
 
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "alerts.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
 app = Flask(__name__)
@@ -313,10 +316,48 @@ def group_by_category(alerts: list[dict]) -> list[tuple[str, list[dict]]]:
     return result
 
 
+class PGConnWrapper:
+    """Makes a psycopg2 connection usable the same way the rest of this
+    file already uses sqlite3 connections: conn.execute(sql, params) returns
+    a cursor with .fetchall()/.fetchone(), and rows support row["column"]
+    access via RealDictCursor. This lets every existing query in this file
+    work unchanged - only this class and init_db()'s schema needed to
+    change for the Postgres move."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, query, params=None):
+        pg_query = query.replace("?", "%s")  # sqlite-style -> psycopg2-style
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(pg_query, params or ())
+        return cur
+
+    def commit(self):
+        self._conn.commit()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
+        return False
+
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set - add your Neon "
+            "connection string in Render's Environment settings."
+        )
+    conn = psycopg2.connect(DATABASE_URL)
+    return PGConnWrapper(conn)
 
 
 def init_db():
@@ -324,7 +365,7 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 batch_id TEXT,
                 symbol TEXT,
                 trigger_price TEXT,
@@ -348,31 +389,24 @@ def init_db():
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS paper_trades (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 symbol TEXT,
                 direction TEXT,
-                entry_price REAL,
+                entry_price DOUBLE PRECISION,
                 entry_time TEXT,
                 status TEXT DEFAULT 'OPEN',
-                exit_price REAL,
+                exit_price DOUBLE PRECISION,
                 exit_time TEXT,
-                pnl REAL,
+                pnl DOUBLE PRECISION,
                 exit_reason TEXT,
-                last_checked_price REAL,
+                last_checked_price DOUBLE PRECISION,
                 last_checked_time TEXT,
                 last_error TEXT,
-                quantity INTEGER DEFAULT 0
+                quantity INTEGER DEFAULT 0,
+                pnl_pct DOUBLE PRECISION
             )
             """
         )
-        # Migration: earlier deployments today created this table without
-        # the quantity column - add it if it's missing, so existing rows
-        # (and the database in general) don't get wiped for this update.
-        existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_trades)").fetchall()}
-        if "quantity" not in existing_cols:
-            conn.execute("ALTER TABLE paper_trades ADD COLUMN quantity INTEGER DEFAULT 0")
-        if "pnl_pct" not in existing_cols:
-            conn.execute("ALTER TABLE paper_trades ADD COLUMN pnl_pct REAL")
         conn.commit()
 
 
