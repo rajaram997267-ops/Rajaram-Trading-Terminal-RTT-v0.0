@@ -371,6 +371,8 @@ def init_db():
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(paper_trades)").fetchall()}
         if "quantity" not in existing_cols:
             conn.execute("ALTER TABLE paper_trades ADD COLUMN quantity INTEGER DEFAULT 0")
+        if "pnl_pct" not in existing_cols:
+            conn.execute("ALTER TABLE paper_trades ADD COLUMN pnl_pct REAL")
         conn.commit()
 
 
@@ -730,15 +732,18 @@ def run_paper_trade_check() -> dict:
                         pnl = (exit_price - entry_price) * qty
                     else:
                         pnl = (entry_price - exit_price) * qty
+                    pnl = round(pnl, 2)
+                    capital_used = entry_price * qty
+                    pnl_pct = round((pnl / capital_used) * 100, 2) if capital_used else 0
                     conn.execute(
                         """
                         UPDATE paper_trades
                         SET status = 'CLOSED', exit_price = ?, exit_time = ?,
-                            pnl = ?, exit_reason = ?, last_checked_price = ?,
+                            pnl = ?, pnl_pct = ?, exit_reason = ?, last_checked_price = ?,
                             last_checked_time = ?, last_error = NULL
                         WHERE id = ?
                         """,
-                        (exit_price, now, pnl, "5-EMA exit rule", last_price, now, trade["id"]),
+                        (exit_price, now, pnl, pnl_pct, "5-EMA exit rule", last_price, now, trade["id"]),
                     )
                     closed += 1
                 else:
@@ -883,20 +888,26 @@ def clear_alerts():
 
 
 def attach_unrealized_pnl(open_trades: list[dict]) -> None:
-    """Adds an 'unrealized_pnl' field to each open trade, computed from its
-    last checked price - the same math as a real exit, just against
-    whatever price was last fetched instead of a confirmed exit price."""
+    """Adds 'unrealized_pnl' and 'unrealized_pnl_pct' to each open trade.
+    The percentage is against the capital actually deployed for that
+    specific trade (entry_price * quantity), not the account's total
+    current capital - so it answers 'what % gain/loss is this trade at',
+    useful for deciding whether a target has been hit."""
     for t in open_trades:
         last_price = t.get("last_checked_price")
-        if last_price is None:
-            t["unrealized_pnl"] = None
-            continue
         qty = t.get("quantity") or 1
         entry = t["entry_price"]
+        capital_used = entry * qty
+        if last_price is None:
+            t["unrealized_pnl"] = None
+            t["unrealized_pnl_pct"] = None
+            continue
         if t["direction"] == "Buy":
-            t["unrealized_pnl"] = round((last_price - entry) * qty, 2)
+            pnl = (last_price - entry) * qty
         else:
-            t["unrealized_pnl"] = round((entry - last_price) * qty, 2)
+            pnl = (entry - last_price) * qty
+        t["unrealized_pnl"] = round(pnl, 2)
+        t["unrealized_pnl_pct"] = round((pnl / capital_used) * 100, 2) if capital_used else 0
 
 
 @app.route("/paper-trading")
@@ -991,6 +1002,61 @@ def paper_trading_reset():
         conn.execute("DELETE FROM paper_trades")
         conn.commit()
     return jsonify({"status": "ok"})
+
+
+@app.route("/api/paper-trading/manual-exit/<int:trade_id>", methods=["POST"])
+def paper_trading_manual_exit(trade_id):
+    """Manually closes an open trade right now, at the freshest price we
+    can get - since the 5-EMA rule doesn't cover every situation you might
+    want to exit on (e.g. hitting a target %, end of day, news, etc.)."""
+    with get_db() as conn:
+        trade = conn.execute(
+            "SELECT * FROM paper_trades WHERE id = ? AND status = 'OPEN'", (trade_id,)
+        ).fetchone()
+    if not trade:
+        return jsonify({"status": "error", "message": "Trade not found or already closed"}), 404
+
+    exit_price = None
+    access_token = get_setting("upstox_access_token")
+    if access_token:
+        try:
+            instrument_key = get_instrument_key(trade["symbol"])
+            if instrument_key:
+                candles = fetch_5min_candles(instrument_key, access_token)
+                if candles:
+                    exit_price = candles[-1][3]
+        except Exception:
+            pass  # fall back to last_checked_price below
+
+    if exit_price is None:
+        exit_price = trade["last_checked_price"]
+    if exit_price is None:
+        return jsonify({"status": "error", "message": "No price available - save a token and run Check Exits Now at least once first"}), 400
+
+    entry_price = trade["entry_price"]
+    qty = trade["quantity"] or 1
+    if trade["direction"] == "Buy":
+        pnl = (exit_price - entry_price) * qty
+    else:
+        pnl = (entry_price - exit_price) * qty
+    pnl = round(pnl, 2)
+    capital_used = entry_price * qty
+    pnl_pct = round((pnl / capital_used) * 100, 2) if capital_used else 0
+    now = datetime.utcnow().isoformat()
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE paper_trades
+            SET status = 'CLOSED', exit_price = ?, exit_time = ?,
+                pnl = ?, pnl_pct = ?, exit_reason = ?, last_checked_time = ?
+            WHERE id = ?
+            """,
+            (exit_price, now, pnl, pnl_pct, "Manual exit", now, trade_id),
+        )
+        conn.commit()
+
+    return jsonify({"status": "ok", "exit_price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct})
 
 
 @app.route("/api/paper-trading/check", methods=["POST"])
