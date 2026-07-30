@@ -136,6 +136,44 @@
       font-size: 12px;
       color: var(--muted);
     }
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 40px;
+      height: 22px;
+      flex: none;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: var(--border);
+      transition: .2s;
+      border-radius: 22px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 16px; width: 16px;
+      left: 3px; bottom: 3px;
+      background-color: var(--text);
+      transition: .2s;
+      border-radius: 50%;
+    }
+    input:checked + .slider { background-color: var(--red); }
+    input:checked + .slider:before { transform: translateX(18px); }
+    .live-badge {
+      font-size: 11px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .live-OPEN { background: rgba(0, 200, 150, 0.15); color: var(--green); }
+    .live-FAILED { background: rgba(255, 83, 112, 0.15); color: var(--red); }
+    .live-CLOSED { background: rgba(255, 184, 0, 0.15); color: var(--gold); }
+    .live-NONE { color: var(--muted); }
   </style>
 </head>
 <body>
@@ -167,6 +205,17 @@
     <button style="background: var(--red); margin-left: auto;" onclick="resetPaperTrading()">Reset paper trading</button>
   </div>
 
+  <div class="settings-box" style="border-color: {% if live_trading_enabled %}var(--red){% else %}var(--border){% endif %};">
+    <label class="switch">
+      <input type="checkbox" id="liveToggle" {% if live_trading_enabled %}checked{% endif %} onchange="toggleLiveTrading()">
+      <span class="slider"></span>
+    </label>
+    <span>Live trading (real Upstox orders)</span>
+    <span class="token-status" id="liveStatus" style="{% if live_trading_enabled %}color: var(--red);{% endif %}">
+      {% if live_trading_enabled %}ON - Buy alerts place real CNC market orders, sized off your Upstox available funds{% else %}OFF - paper trading only{% endif %}
+    </span>
+  </div>
+
   <div class="stats">
     <div class="stat-card">
       <div class="label">Current capital (Rs)</div>
@@ -196,7 +245,7 @@
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th>
+        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th>Live</th><th></th>
       </tr>
       {% for t in open_trades %}
       <tr>
@@ -210,6 +259,11 @@
         <td class="{% if t.unrealized_pnl_pct and t.unrealized_pnl_pct > 0 %}pnl-pos{% elif t.unrealized_pnl_pct and t.unrealized_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl_pct if t.unrealized_pnl_pct is not none else "-" }}{% if t.unrealized_pnl_pct is not none %}%{% endif %}</td>
         <td>{{ (t.last_checked_time or "")[:19] }}</td>
         <td class="error-note">{{ t.last_error or "" }}</td>
+        <td>
+          <span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span>
+          {% if t.live_quantity %}<div class="sub" style="font-size:11px;">{{ t.live_quantity }} sh</div>{% endif %}
+          {% if t.live_error %}<div class="error-note" title="{{ t.live_error }}">{{ t.live_error[:30] }}{% if t.live_error|length > 30 %}...{% endif %}</div>{% endif %}
+        </td>
         <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit({{ t.id }})">Exit Now</button></td>
       </tr>
       {% endfor %}
@@ -225,7 +279,7 @@
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Exit</th>
-        <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th>
+        <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th><th>Live</th>
       </tr>
       {% for t in closed_trades %}
       <tr>
@@ -239,6 +293,10 @@
         <td>{{ t.balance_after }}</td>
         <td>{{ t.exit_reason }}</td>
         <td>{{ (t.exit_time or "")[:19] }}</td>
+        <td>
+          <span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span>
+          {% if t.live_quantity %}<div class="sub" style="font-size:11px;">{{ t.live_quantity }} sh</div>{% endif %}
+        </td>
       </tr>
       {% endfor %}
     </table>
@@ -264,6 +322,35 @@
       } else {
         statusEl.textContent = "Failed to save token";
         statusEl.classList.remove("saved");
+      }
+    }
+
+    async function toggleLiveTrading() {
+      const checkbox = document.getElementById("liveToggle");
+      const statusEl = document.getElementById("liveStatus");
+      const enabled = checkbox.checked;
+      if (enabled && !confirm(
+        "This turns ON live trading. The NEXT Buy alert will place a real " +
+        "CNC market order on Upstox, sized off your actual available funds. Continue?"
+      )) {
+        checkbox.checked = false;
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/live-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await res.json();
+        statusEl.textContent = result.live_trading_enabled
+          ? "ON - Buy alerts place real CNC market orders, sized off your Upstox available funds"
+          : "OFF - paper trading only";
+        statusEl.style.color = result.live_trading_enabled ? "var(--red)" : "";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        checkbox.checked = !enabled;
+        console.error(err);
       }
     }
 
@@ -361,6 +448,11 @@
           <td class="${pnlClass}">${pctText}</td>
           <td>${(t.last_checked_time || "").slice(0, 19)}</td>
           <td class="error-note">${escapeHtml(t.last_error || "")}</td>
+          <td>
+            <span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span>
+            ${t.live_quantity ? `<div class="sub" style="font-size:11px;">${t.live_quantity} sh</div>` : ""}
+            ${t.live_error ? `<div class="error-note" title="${escapeHtml(t.live_error)}">${escapeHtml(t.live_error.slice(0, 30))}${t.live_error.length > 30 ? "..." : ""}</div>` : ""}
+          </td>
           <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit(${t.id})">Exit Now</button></td>
         </tr>
       `;
@@ -368,7 +460,7 @@
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th></tr>
+              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th>Live</th><th></th></tr>
           ${rows}
         </table>
       `;
@@ -395,13 +487,17 @@
             <td>${t.balance_after}</td>
             <td>${escapeHtml(t.exit_reason || "")}</td>
             <td>${(t.exit_time || "").slice(0, 19)}</td>
+            <td>
+              <span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span>
+              ${t.live_quantity ? `<div class="sub" style="font-size:11px;">${t.live_quantity} sh</div>` : ""}
+            </td>
           </tr>
         `;
       }).join("");
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Exit</th>
-              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th></tr>
+              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th><th>Live</th></tr>
           ${rows}
         </table>
       `;
