@@ -403,10 +403,26 @@ def init_db():
                 last_checked_time TEXT,
                 last_error TEXT,
                 quantity INTEGER DEFAULT 0,
-                pnl_pct DOUBLE PRECISION
+                pnl_pct DOUBLE PRECISION,
+                live_status TEXT DEFAULT 'NONE',
+                live_entry_order_id TEXT,
+                live_exit_order_id TEXT,
+                live_error TEXT,
+                live_quantity INTEGER
             )
             """
         )
+        # ADD COLUMN IF NOT EXISTS so existing Render/Neon databases (created
+        # before live trading existed) pick up the new columns without
+        # needing a manual migration.
+        for stmt in (
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_status TEXT DEFAULT 'NONE'",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_entry_order_id TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_order_id TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_error TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_quantity INTEGER",
+        ):
+            conn.execute(stmt)
         conn.commit()
 
 
@@ -419,6 +435,14 @@ def get_capital() -> float:
         return float(value)
     except (ValueError, TypeError):
         return DEFAULT_CAPITAL
+
+
+def get_live_trading_enabled() -> bool:
+    """Master safety switch for placing real orders on Upstox. Defaults to
+    OFF - live orders only fire once this is explicitly turned on via
+    /api/paper-trading/live-toggle, so the app can never start placing real
+    trades just because the code was deployed."""
+    return get_setting("live_trading_enabled", "false") == "true"
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:
@@ -542,15 +566,93 @@ def create_paper_trades_for_batch(data: dict) -> None:
 
     now = datetime.utcnow().isoformat()
     with get_db() as conn:
-        conn.execute(
+        row = conn.execute(
             """
             INSERT INTO paper_trades
                 (symbol, direction, entry_price, entry_time, status, quantity)
             VALUES (?, ?, ?, ?, 'OPEN', ?)
+            RETURNING id
             """,
             (symbol, category, price_val, now, quantity),
-        )
+        ).fetchone()
         conn.commit()
+
+    # Live trading only ever goes long via CNC (Delivery) - CNC can't open a
+    # fresh short, so Sell-direction alerts stay paper-trade only, same as
+    # before. Buy alerts also go live, but only when the safety switch is on
+    # and a token is saved; any failure here is recorded on the trade and
+    # never blocks the paper trade itself.
+    if category == "Buy" and get_live_trading_enabled():
+        trade_id = row["id"]
+        access_token = get_setting("upstox_access_token")
+        if not access_token:
+            with get_db() as conn:
+                conn.execute(
+                    "UPDATE paper_trades SET live_status = 'FAILED', live_error = ? WHERE id = ?",
+                    ("Live trading is on but no Upstox access token is saved", trade_id),
+                )
+                conn.commit()
+        else:
+            try:
+                instrument_key = get_instrument_key(symbol)
+            except Exception:
+                instrument_key = None
+            if not instrument_key:
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE paper_trades SET live_status = 'FAILED', live_error = ? WHERE id = ?",
+                        (f"No instrument_key found for {symbol}", trade_id),
+                    )
+                    conn.commit()
+            else:
+                available_funds = get_upstox_available_funds(access_token)
+                if available_funds is None:
+                    with get_db() as conn:
+                        conn.execute(
+                            "UPDATE paper_trades SET live_status = 'FAILED', live_error = ? WHERE id = ?",
+                            ("Could not fetch available Upstox funds - live order skipped", trade_id),
+                        )
+                        conn.commit()
+                else:
+                    live_quantity = int(available_funds // price_val)
+                    if live_quantity < 1:
+                        with get_db() as conn:
+                            conn.execute(
+                                """
+                                UPDATE paper_trades
+                                SET live_status = 'FAILED', live_error = ?, live_quantity = ?
+                                WHERE id = ?
+                                """,
+                                (
+                                    f"Available funds (Rs {available_funds:.2f}) not enough for "
+                                    f"1 share at Rs {price_val}",
+                                    live_quantity,
+                                    trade_id,
+                                ),
+                            )
+                            conn.commit()
+                    else:
+                        result = place_live_order(instrument_key, "BUY", live_quantity, access_token)
+                        with get_db() as conn:
+                            if result["ok"]:
+                                conn.execute(
+                                    """
+                                    UPDATE paper_trades
+                                    SET live_status = 'OPEN', live_entry_order_id = ?, live_quantity = ?
+                                    WHERE id = ?
+                                    """,
+                                    (result["order_id"], live_quantity, trade_id),
+                                )
+                            else:
+                                conn.execute(
+                                    """
+                                    UPDATE paper_trades
+                                    SET live_status = 'FAILED', live_error = ?, live_quantity = ?
+                                    WHERE id = ?
+                                    """,
+                                    (result["error"], live_quantity, trade_id),
+                                )
+                            conn.commit()
 
 
 def calculate_ema(values: list[float], period: int = 5) -> list[float | None]:
@@ -723,6 +825,116 @@ def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[flo
     return resample_1min_to_5min(raw_candles)
 
 
+UPSTOX_FUNDS_URL = "https://api.upstox.com/v3/user/get-funds-and-margin"
+
+
+def get_upstox_available_funds(access_token: str) -> float | None:
+    """Fetches the user's actual available-to-trade balance from Upstox, so
+    live order quantity is sized off real account funds rather than the
+    paper-trading capital setting. Returns None (never raises) if the call
+    fails for any reason - callers must treat that as 'funds unknown' and
+    skip placing the live order rather than guessing."""
+    req = urllib.request.Request(
+        UPSTOX_FUNDS_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode())
+        available = (payload.get("data") or {}).get("available_to_trade") or {}
+        total = available.get("total")
+        if total is None:
+            # fall back to the cash-only breakdown if 'total' isn't present
+            total = (available.get("cash_available_to_trade") or {}).get("total")
+        return float(total) if total is not None else None
+    except Exception:
+        return None
+
+
+UPSTOX_ORDER_URL = "https://api.upstox.com/v3/order/place"
+
+
+def place_live_order(instrument_key: str, transaction_type: str, quantity: int, access_token: str) -> dict:
+    """Places a real order on Upstox: CNC (Delivery) product, Market order,
+    DAY validity - matching the decisions for this app (live trading only
+    ever goes long, so transaction_type is effectively always 'BUY' to open
+    and 'SELL' to close the same delivery position).
+
+    Never raises - a live-order failure must not be able to crash paper
+    trade creation or the exit-check loop. Returns:
+      {"ok": True, "order_id": "..."} on success
+      {"ok": False, "error": "..."} on failure
+    """
+    body = {
+        "quantity": quantity,
+        "product": "D",  # CNC / Delivery
+        "validity": "DAY",
+        "price": 0,  # ignored by Upstox for MARKET orders
+        "tag": "chartink-auto",
+        "instrument_token": instrument_key,
+        "order_type": "MARKET",
+        "transaction_type": transaction_type,  # "BUY" or "SELL"
+        "disclosed_quantity": 0,
+        "trigger_price": 0,
+        "is_amo": False,
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        UPSTOX_ORDER_URL,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode())
+        order_ids = (payload.get("data") or {}).get("order_ids") or []
+        order_id = order_ids[0] if order_ids else None
+        if not order_id:
+            return {"ok": False, "error": f"No order_id in response: {payload}"}
+        return {"ok": True, "order_id": order_id}
+    except urllib.error.HTTPError as e:
+        try:
+            body_text = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            body_text = ""
+        return {"ok": False, "error": f"HTTP {e.code}: {body_text}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[str | None, str | None]:
+    """If this paper trade has a live position open (live_status == 'OPEN'),
+    places the closing SELL order on Upstox. Returns (order_id, error) - both
+    None if there was no live position to close, since that's the normal
+    case for Sell-direction trades and for any trade from before live
+    trading was turned on."""
+    if trade.get("live_status") != "OPEN":
+        return None, None
+    if not access_token:
+        return None, "Live position open but no Upstox access token saved - could not close it"
+
+    try:
+        instrument_key = get_instrument_key(trade["symbol"])
+    except Exception as e:
+        return None, f"Could not look up instrument_key to close live position: {e}"
+    if not instrument_key:
+        return None, f"No instrument_key found for {trade['symbol']} - could not close live position"
+
+    qty = trade.get("live_quantity") or trade["quantity"] or 1
+    result = place_live_order(instrument_key, "SELL", qty, access_token)
+    if result["ok"]:
+        return result["order_id"], None
+    return None, f"Failed to close live position: {result['error']}"
+
+
 def run_paper_trade_check() -> dict:
     """Checks every open paper trade against the live 5-min candle exit
     rule, closing any that qualify. Returns a summary dict for the UI."""
@@ -758,6 +970,9 @@ def run_paper_trade_check() -> dict:
             exited, exit_price = check_exit(trade["direction"], candles)
             last_price = candles[-1][3] if candles else None
 
+            if exited:
+                live_exit_order_id, live_exit_error = _close_live_position_if_any(trade, access_token)
+
             with get_db() as conn:
                 if exited:
                     entry_price = trade["entry_price"]
@@ -774,10 +989,19 @@ def run_paper_trade_check() -> dict:
                         UPDATE paper_trades
                         SET status = 'CLOSED', exit_price = ?, exit_time = ?,
                             pnl = ?, pnl_pct = ?, exit_reason = ?, last_checked_price = ?,
-                            last_checked_time = ?, last_error = NULL
+                            last_checked_time = ?, last_error = NULL,
+                            live_exit_order_id = COALESCE(?, live_exit_order_id),
+                            live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
+                            live_error = COALESCE(?, live_error)
                         WHERE id = ?
                         """,
-                        (exit_price, now, pnl, pnl_pct, "5-EMA exit rule", last_price, now, trade["id"]),
+                        (
+                            exit_price, now, pnl, pnl_pct, "5-EMA exit rule", last_price, now,
+                            live_exit_order_id,
+                            live_exit_order_id is not None,
+                            live_exit_error,
+                            trade["id"],
+                        ),
                     )
                     closed += 1
                 else:
@@ -978,6 +1202,7 @@ def paper_trading():
     capital = get_capital()
     attach_running_balance(closed_trades, capital)
     current_capital = get_current_capital()
+    live_trading_enabled = get_live_trading_enabled()
 
     html = render_template(
         "paper_trading.html",
@@ -990,6 +1215,7 @@ def paper_trading():
         token_saved=token_saved,
         capital=capital,
         current_capital=round(current_capital, 2),
+        live_trading_enabled=live_trading_enabled,
     )
     body = html.encode("utf-8")
     response = make_response(body)
@@ -1015,6 +1241,7 @@ def paper_trading_data():
         "open": open_trades,
         "closed": closed_trades,
         "current_capital": round(get_current_capital(), 2),
+        "live_trading_enabled": get_live_trading_enabled(),
     })
 
 
@@ -1039,6 +1266,17 @@ def paper_trading_capital():
         return jsonify({"status": "error", "message": "Amount must be positive"}), 400
     set_setting("paper_trade_capital", str(capital))
     return jsonify({"status": "ok", "capital": capital})
+
+
+@app.route("/api/paper-trading/live-toggle", methods=["POST"])
+def paper_trading_live_toggle():
+    """Master on/off switch for placing real Upstox orders. Off by default -
+    turning this on means the NEXT Buy alert (and its eventual exit) will
+    place real CNC market orders with real money."""
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    set_setting("live_trading_enabled", "true" if enabled else "false")
+    return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
 @app.route("/api/paper-trading/reset", methods=["POST"])
@@ -1092,15 +1330,26 @@ def paper_trading_manual_exit(trade_id):
     pnl_pct = round((pnl / capital_used) * 100, 2) if capital_used else 0
     now = datetime.utcnow().isoformat()
 
+    live_exit_order_id, live_exit_error = _close_live_position_if_any(trade, access_token)
+
     with get_db() as conn:
         conn.execute(
             """
             UPDATE paper_trades
             SET status = 'CLOSED', exit_price = ?, exit_time = ?,
-                pnl = ?, pnl_pct = ?, exit_reason = ?, last_checked_time = ?
+                pnl = ?, pnl_pct = ?, exit_reason = ?, last_checked_time = ?,
+                live_exit_order_id = COALESCE(?, live_exit_order_id),
+                live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
+                live_error = COALESCE(?, live_error)
             WHERE id = ?
             """,
-            (exit_price, now, pnl, pnl_pct, "Manual exit", now, trade_id),
+            (
+                exit_price, now, pnl, pnl_pct, "Manual exit", now,
+                live_exit_order_id,
+                live_exit_order_id is not None,
+                live_exit_error,
+                trade_id,
+            ),
         )
         conn.commit()
 
