@@ -854,6 +854,46 @@ def get_upstox_available_funds(access_token: str) -> float | None:
         return None
 
 
+_funds_display_cache: dict = {"value": None, "fetched_at": None}
+FUNDS_DISPLAY_CACHE_SECONDS = 20
+
+
+def get_upstox_available_funds_for_display(access_token: str) -> float | None:
+    """Same data as get_upstox_available_funds(), but cached for a short
+    window - this is only for showing a number on the page (which polls
+    every 60s and can have multiple tabs open), not for sizing a live order.
+    Order placement always calls get_upstox_available_funds() directly so
+    it never uses a stale balance."""
+    global _funds_display_cache
+    now = datetime.utcnow()
+    fetched_at = _funds_display_cache["fetched_at"]
+    if fetched_at and (now - fetched_at).total_seconds() < FUNDS_DISPLAY_CACHE_SECONDS:
+        return _funds_display_cache["value"]
+    value = get_upstox_available_funds(access_token)
+    _funds_display_cache = {"value": value, "fetched_at": now}
+    return value
+
+
+def compute_live_stats(open_trades: list[dict], closed_trades: list[dict]) -> dict:
+    """Live trading only ever goes long (Buy alerts, CNC), so P&L for a
+    live-closed trade is just (exit - entry) * live_quantity - the same
+    entry/exit prices the paper trade recorded, since the live order is a
+    market order placed alongside it."""
+    live_open = sum(1 for t in open_trades if t.get("live_status") == "OPEN")
+    live_closed_trades = [t for t in closed_trades if t.get("live_status") == "CLOSED"]
+    live_pnl = 0.0
+    for t in live_closed_trades:
+        qty = t.get("live_quantity") or 0
+        entry = t.get("entry_price") or 0
+        exit_p = t.get("exit_price") or 0
+        live_pnl += (exit_p - entry) * qty
+    return {
+        "live_open": live_open,
+        "live_closed": len(live_closed_trades),
+        "live_pnl": round(live_pnl, 2),
+    }
+
+
 UPSTOX_ORDER_URL = "https://api.upstox.com/v3/order/place"
 
 
@@ -1204,6 +1244,11 @@ def paper_trading():
     current_capital = get_current_capital()
     live_trading_enabled = get_live_trading_enabled()
 
+    live_stats = compute_live_stats(open_trades, closed_trades)
+    live_available_funds = None
+    if token_saved:
+        live_available_funds = get_upstox_available_funds_for_display(get_setting("upstox_access_token"))
+
     html = render_template(
         "paper_trading.html",
         open_trades=open_trades,
@@ -1216,6 +1261,10 @@ def paper_trading():
         capital=capital,
         current_capital=round(current_capital, 2),
         live_trading_enabled=live_trading_enabled,
+        live_open=live_stats["live_open"],
+        live_closed=live_stats["live_closed"],
+        live_pnl=live_stats["live_pnl"],
+        live_available_funds=live_available_funds,
     )
     body = html.encode("utf-8")
     response = make_response(body)
@@ -1237,11 +1286,20 @@ def paper_trading_data():
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
     attach_running_balance(closed_trades, get_capital())
+
+    live_stats = compute_live_stats(open_trades, closed_trades)
+    access_token = get_setting("upstox_access_token")
+    live_available_funds = get_upstox_available_funds_for_display(access_token) if access_token else None
+
     return jsonify({
         "open": open_trades,
         "closed": closed_trades,
         "current_capital": round(get_current_capital(), 2),
         "live_trading_enabled": get_live_trading_enabled(),
+        "live_open": live_stats["live_open"],
+        "live_closed": live_stats["live_closed"],
+        "live_pnl": live_stats["live_pnl"],
+        "live_available_funds": live_available_funds,
     })
 
 
