@@ -160,20 +160,15 @@
   </div>
 
   <div class="settings-box">
-    <span>Starting capital (Rs):</span>
+    <span>Capital per trade (Rs):</span>
     <input type="text" id="capitalInput" style="max-width: 160px; flex: none;" value="{{ capital|int }}">
     <button class="secondary" onclick="saveCapital()">Save amount</button>
-    <span class="token-status" id="capitalStatus">Only used to seed the account - once trades start closing, the balance compounds automatically</span>
-    <button style="background: var(--red); margin-left: auto;" onclick="resetPaperTrading()">Reset paper trading</button>
+    <span class="token-status" id="capitalStatus">Used for new trades only - existing open trades keep their original quantity</span>
   </div>
 
   <div class="stats">
     <div class="stat-card">
-      <div class="label">Current capital (Rs)</div>
-      <div class="value {% if current_capital > capital %}pos{% elif current_capital < capital %}neg{% endif %}" id="statCurrentCapital">{{ current_capital }}</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Open trade</div>
+      <div class="label">Open trades</div>
       <div class="value" id="statOpen">{{ open_trades|length }}</div>
     </div>
     <div class="stat-card">
@@ -190,13 +185,13 @@
     </div>
   </div>
 
-  <h3 class="section-title">Open trade <span style="font-size:11px; color: var(--muted); font-weight: normal;">(only one at a time - new alerts are ignored until this exits)</span></h3>
+  <h3 class="section-title">Open trades</h3>
   <div id="openTradesContainer">
     {% if open_trades %}
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th>
+        <th>Last checked price</th><th>Last checked</th><th>Note</th>
       </tr>
       {% for t in open_trades %}
       <tr>
@@ -206,11 +201,8 @@
         <td>{{ t.entry_price }}</td>
         <td>{{ t.entry_time[:19] }}</td>
         <td>{{ t.last_checked_price or "-" }}</td>
-        <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl if t.unrealized_pnl is not none else "-" }}</td>
-        <td class="{% if t.unrealized_pnl_pct and t.unrealized_pnl_pct > 0 %}pnl-pos{% elif t.unrealized_pnl_pct and t.unrealized_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl_pct if t.unrealized_pnl_pct is not none else "-" }}{% if t.unrealized_pnl_pct is not none %}%{% endif %}</td>
         <td>{{ (t.last_checked_time or "")[:19] }}</td>
         <td class="error-note">{{ t.last_error or "" }}</td>
-        <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit({{ t.id }})">Exit Now</button></td>
       </tr>
       {% endfor %}
     </table>
@@ -225,7 +217,7 @@
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Exit</th>
-        <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Exit reason</th><th>Exit time</th>
+        <th>P&amp;L (Rs)</th><th>Exit reason</th><th>Exit time</th>
       </tr>
       {% for t in closed_trades %}
       <tr>
@@ -235,7 +227,6 @@
         <td>{{ t.entry_price }}</td>
         <td>{{ t.exit_price }}</td>
         <td class="{% if t.pnl and t.pnl > 0 %}pnl-pos{% elif t.pnl and t.pnl < 0 %}pnl-neg{% endif %}">{{ t.pnl }}</td>
-        <td class="{% if t.pnl_pct and t.pnl_pct > 0 %}pnl-pos{% elif t.pnl_pct and t.pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.pnl_pct if t.pnl_pct is not none else "-" }}{% if t.pnl_pct is not none %}%{% endif %}</td>
         <td>{{ t.exit_reason }}</td>
         <td>{{ (t.exit_time or "")[:19] }}</td>
       </tr>
@@ -279,21 +270,9 @@
         body: JSON.stringify({ capital: amount }),
       });
       if (res.ok) {
-        statusEl.textContent = `Saved - Rs ${amount} starting capital`;
+        statusEl.textContent = `Saved - new trades will use Rs ${amount} of capital`;
       } else {
         statusEl.textContent = "Failed to save amount";
-      }
-    }
-
-    async function resetPaperTrading() {
-      if (!confirm("This deletes ALL paper trades (open and closed) and restarts from your starting capital. Continue?")) {
-        return;
-      }
-      const res = await fetch("/api/paper-trading/reset", { method: "POST" });
-      if (res.ok) {
-        location.reload();
-      } else {
-        alert("Reset failed - see console");
       }
     }
 
@@ -316,22 +295,6 @@
       }
     }
 
-    async function manualExit(tradeId) {
-      if (!confirm("Exit this trade now at the last known price?")) return;
-      try {
-        const res = await fetch(`/api/paper-trading/manual-exit/${tradeId}`, { method: "POST" });
-        const result = await res.json();
-        if (!res.ok) {
-          alert(result.message || "Manual exit failed");
-          return;
-        }
-        await refreshTrades();
-      } catch (err) {
-        alert("Manual exit failed - see console");
-        console.error(err);
-      }
-    }
-
     function escapeHtml(str) {
       const div = document.createElement("div");
       div.textContent = str;
@@ -344,11 +307,7 @@
         container.innerHTML = '<div class="empty">No open paper trades yet. They\'re created automatically from Buy/Sell alerts.</div>';
         return;
       }
-      const rows = trades.map(t => {
-        const pnlClass = t.unrealized_pnl > 0 ? "pnl-pos" : (t.unrealized_pnl < 0 ? "pnl-neg" : "");
-        const pnlText = (t.unrealized_pnl === null || t.unrealized_pnl === undefined) ? "-" : t.unrealized_pnl;
-        const pctText = (t.unrealized_pnl_pct === null || t.unrealized_pnl_pct === undefined) ? "-" : t.unrealized_pnl_pct + "%";
-        return `
+      const rows = trades.map(t => `
         <tr>
           <td>${escapeHtml(t.symbol)}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
@@ -356,18 +315,14 @@
           <td>${t.entry_price}</td>
           <td>${(t.entry_time || "").slice(0, 19)}</td>
           <td>${t.last_checked_price || "-"}</td>
-          <td class="${pnlClass}">${pnlText}</td>
-          <td class="${pnlClass}">${pctText}</td>
           <td>${(t.last_checked_time || "").slice(0, 19)}</td>
           <td class="error-note">${escapeHtml(t.last_error || "")}</td>
-          <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit(${t.id})">Exit Now</button></td>
         </tr>
-      `;
-      }).join("");
+      `).join("");
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th></tr>
+              <th>Last checked price</th><th>Last checked</th><th>Note</th></tr>
           ${rows}
         </table>
       `;
@@ -381,7 +336,6 @@
       }
       const rows = trades.map(t => {
         const pnlClass = t.pnl > 0 ? "pnl-pos" : (t.pnl < 0 ? "pnl-neg" : "");
-        const pctText = (t.pnl_pct === null || t.pnl_pct === undefined) ? "-" : t.pnl_pct + "%";
         return `
           <tr>
             <td>${escapeHtml(t.symbol)}</td>
@@ -390,7 +344,6 @@
             <td>${t.entry_price}</td>
             <td>${t.exit_price}</td>
             <td class="${pnlClass}">${t.pnl}</td>
-            <td class="${pnlClass}">${pctText}</td>
             <td>${escapeHtml(t.exit_reason || "")}</td>
             <td>${(t.exit_time || "").slice(0, 19)}</td>
           </tr>
@@ -399,7 +352,7 @@
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Exit</th>
-              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Exit reason</th><th>Exit time</th></tr>
+              <th>P&amp;L (Rs)</th><th>Exit reason</th><th>Exit time</th></tr>
           ${rows}
         </table>
       `;
@@ -422,9 +375,6 @@
         pnlEl.classList.remove("pos", "neg");
         if (totalPnl > 0) pnlEl.classList.add("pos");
         if (totalPnl < 0) pnlEl.classList.add("neg");
-        if (data.current_capital !== undefined) {
-          document.getElementById("statCurrentCapital").textContent = data.current_capital;
-        }
       } catch (err) {
         console.error("Refresh failed", err);
       }
