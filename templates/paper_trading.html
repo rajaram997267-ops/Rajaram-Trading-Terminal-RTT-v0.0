@@ -239,6 +239,25 @@
     </div>
   </div>
 
+  <div class="stats">
+    <div class="stat-card" style="border-color: var(--red);">
+      <div class="label">Upstox available funds (Rs)</div>
+      <div class="value" id="statLiveFunds">{{ live_available_funds if live_available_funds is not none else "-" }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Live open</div>
+      <div class="value" id="statLiveOpen">{{ live_open }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Live closed</div>
+      <div class="value" id="statLiveClosed">{{ live_closed }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Live P&amp;L (Rs)</div>
+      <div class="value {% if live_pnl > 0 %}pos{% elif live_pnl < 0 %}neg{% endif %}" id="statLivePnl">{{ live_pnl }}</div>
+    </div>
+  </div>
+
   <h3 class="section-title">Open trade <span style="font-size:11px; color: var(--muted); font-weight: normal;">(only one at a time - new alerts are ignored until this exits)</span></h3>
   <div id="openTradesContainer">
     {% if open_trades %}
@@ -522,6 +541,23 @@
         if (totalPnl < 0) pnlEl.classList.add("neg");
         if (data.current_capital !== undefined) {
           document.getElementById("statCurrentCapital").textContent = data.current_capital;
+        }
+        if (data.live_available_funds !== undefined) {
+          document.getElementById("statLiveFunds").textContent =
+            data.live_available_funds === null ? "-" : data.live_available_funds;
+        }
+        if (data.live_open !== undefined) {
+          document.getElementById("statLiveOpen").textContent = data.live_open;
+        }
+        if (data.live_closed !== undefined) {
+          document.getElementById("statLiveClosed").textContent = data.live_closed;
+        }
+        if (data.live_pnl !== undefined) {
+          const liveEl = document.getElementById("statLivePnl");
+          liveEl.textContent = data.live_pnl;
+          liveEl.classList.remove("pos", "neg");
+          if (data.live_pnl > 0) liveEl.classList.add("pos");
+          if (data.live_pnl < 0) liveEl.classList.add("neg");
         }
       } catch (err) {
         console.error("Refresh failed", err);
