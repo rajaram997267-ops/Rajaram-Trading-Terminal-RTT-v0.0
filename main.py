@@ -827,18 +827,33 @@ def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[flo
 
 UPSTOX_FUNDS_URL = "https://api.upstox.com/v3/user/get-funds-and-margin"
 
+# Upstox's API sits behind Cloudflare, which blocks requests without a
+# browser-like User-Agent - this bit us on the candle-fetching code earlier,
+# so every Upstox call here uses the same header to avoid it happening again.
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+_funds_debug: dict = {"ok": None, "error": None, "raw": None}
+
 
 def get_upstox_available_funds(access_token: str) -> float | None:
     """Fetches the user's actual available-to-trade balance from Upstox, so
     live order quantity is sized off real account funds rather than the
     paper-trading capital setting. Returns None (never raises) if the call
     fails for any reason - callers must treat that as 'funds unknown' and
-    skip placing the live order rather than guessing."""
+    skip placing the live order rather than guessing. The failure reason is
+    saved to _funds_debug (see /api/paper-trading/debug-funds) instead of
+    just disappearing, since a silent '-' on the page isn't debuggable."""
+    global _funds_debug
     req = urllib.request.Request(
         UPSTOX_FUNDS_URL,
         headers={
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
         },
     )
     try:
@@ -849,8 +864,20 @@ def get_upstox_available_funds(access_token: str) -> float | None:
         if total is None:
             # fall back to the cash-only breakdown if 'total' isn't present
             total = (available.get("cash_available_to_trade") or {}).get("total")
-        return float(total) if total is not None else None
-    except Exception:
+        if total is None:
+            _funds_debug = {"ok": False, "error": f"No 'total' field in response: {payload}", "raw": payload}
+            return None
+        _funds_debug = {"ok": True, "error": None, "raw": payload}
+        return float(total)
+    except urllib.error.HTTPError as e:
+        try:
+            body_text = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            body_text = ""
+        _funds_debug = {"ok": False, "error": f"HTTP {e.code}: {body_text}", "raw": None}
+        return None
+    except Exception as e:
+        _funds_debug = {"ok": False, "error": str(e), "raw": None}
         return None
 
 
@@ -930,6 +957,7 @@ def place_live_order(instrument_key: str, transaction_type: str, quantity: int, 
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
         },
     )
     try:
@@ -1428,6 +1456,18 @@ def debug_instruments():
     and fixed precisely."""
     _load_instrument_master()
     return jsonify(_instrument_debug)
+
+
+@app.route("/api/paper-trading/debug-funds")
+def debug_funds():
+    """Diagnostic-only: forces a fresh call to Upstox's funds-and-margin
+    API and shows the real response or error - so a failed fetch (shown as
+    just '-' on the page) can be diagnosed precisely."""
+    access_token = get_setting("upstox_access_token")
+    if not access_token:
+        return jsonify({"ok": False, "error": "No Upstox access token saved"})
+    value = get_upstox_available_funds(access_token)
+    return jsonify({"value": value, **_funds_debug})
 
 
 init_db()  # runs on import too, so gunicorn (used in production) creates the table
