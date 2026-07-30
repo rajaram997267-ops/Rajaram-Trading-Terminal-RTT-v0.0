@@ -944,6 +944,17 @@ def attach_unrealized_pnl(open_trades: list[dict]) -> None:
         t["unrealized_pnl_pct"] = round((pnl / capital_used) * 100, 2) if capital_used else 0
 
 
+def attach_running_balance(closed_trades_desc: list[dict], starting_capital: float) -> None:
+    """closed_trades_desc: newest first (as queried). Adds 'balance_after'
+    to each trade - the account balance right after that trade closed,
+    computed by walking the trades oldest-to-newest and accumulating P&L.
+    This is what actually shows the compounding progression over time."""
+    running = starting_capital
+    for t in reversed(closed_trades_desc):  # oldest first for the running sum
+        running += t["pnl"] or 0
+        t["balance_after"] = round(running, 2)
+
+
 @app.route("/paper-trading")
 def paper_trading():
     with get_db() as conn:
@@ -965,6 +976,7 @@ def paper_trading():
 
     token_saved = bool(get_setting("upstox_access_token"))
     capital = get_capital()
+    attach_running_balance(closed_trades, capital)
     current_capital = get_current_capital()
 
     html = render_template(
@@ -996,10 +1008,12 @@ def paper_trading_data():
             "SELECT * FROM paper_trades WHERE status = 'CLOSED' ORDER BY id DESC LIMIT 200"
         ).fetchall()
     open_trades = [dict(t) for t in open_trades]
+    closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
+    attach_running_balance(closed_trades, get_capital())
     return jsonify({
         "open": open_trades,
-        "closed": [dict(t) for t in closed_trades],
+        "closed": closed_trades,
         "current_capital": round(get_current_capital(), 2),
     })
 
