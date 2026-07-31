@@ -479,10 +479,10 @@
       });
     }
 
-    // Fetches each sector's today's % change and fills in the sidebar -
-    // independent of the 5s alert refresh, since this covers the app's
-    // whole stock universe in one batched call and doesn't need to be
-    // nearly as frequent.
+    // Fetches each sector's today's % change and fills in the sidebar,
+    // polled on the same 5s cadence as alerts - the previous-close half of
+    // this is cached server-side for the whole day, so this call is just
+    // one cheap batched LTP lookup, safe to refresh this often.
     async function refreshSectorPerf() {
       try {
         const res = await fetch("/api/sectors");
@@ -504,7 +504,7 @@
       }
     }
     refreshSectorPerf();
-    setInterval(refreshSectorPerf, 60000);
+    setInterval(refreshSectorPerf, 5000);
 
     // Apply any filter already set as soon as the page loads.
     applyGlobalFilter();
