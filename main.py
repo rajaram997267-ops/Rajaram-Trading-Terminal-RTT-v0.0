@@ -420,6 +420,15 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sector_prev_close (
+                symbol TEXT PRIMARY KEY,
+                close DOUBLE PRECISION,
+                date TEXT
+            )
+            """
+        )
         # ADD COLUMN IF NOT EXISTS so existing Render/Neon databases (created
         # before live trading existed) pick up the new columns without
         # needing a manual migration.
@@ -814,12 +823,17 @@ def _load_prev_closes_background(access_token: str) -> None:
     its most recent completed daily candle's close via the Historical
     Candle Data API. This is ~180 sequential calls, so it's kept off the
     request/response path entirely - callers just see stale/partial data
-    in _prev_close_cache until this finishes."""
+    in _prev_close_cache until this finishes. Each symbol's close is
+    written to the DB as soon as it's fetched (not just at the end), so a
+    Render cold-start or redeploy mid-load never throws away progress
+    already made today."""
     global _prev_close_cache, _prev_close_loading
     today = _ist_today_str()
     from_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=10)).strftime("%Y-%m-%d")
-    closes: dict[str, float] = {}
+    closes: dict[str, float] = dict(_prev_close_cache["closes"])  # keep anything already loaded today
     for symbol in SECTOR_MAP:
+        if symbol in closes:
+            continue  # already have it (from DB or an earlier partial run today)
         key = get_instrument_key(symbol)
         if not key:
             continue
@@ -843,22 +857,49 @@ def _load_prev_closes_background(access_token: str) -> None:
             # recent COMPLETED trading day (today's still-open session
             # isn't included here), so its close is what we want.
             if candles:
-                closes[symbol] = candles[0][4]
+                close = candles[0][4]
+                closes[symbol] = close
+                _prev_close_cache = {"date": today, "closes": dict(closes)}
+                with get_db() as conn:
+                    conn.execute(
+                        "INSERT INTO sector_prev_close (symbol, close, date) VALUES (?, ?, ?) "
+                        "ON CONFLICT(symbol) DO UPDATE SET close = excluded.close, date = excluded.date",
+                        (symbol, close, today),
+                    )
+                    conn.commit()
         except Exception:
             continue
     _prev_close_cache = {"date": today, "closes": closes}
     _prev_close_loading = False
 
 
-def _get_prev_closes(access_token: str) -> dict[str, float]:
-    """Returns today's cached previous-close map, kicking off a background
-    refresh (non-blocking) if today's data hasn't been loaded yet."""
-    global _prev_close_loading
+def _load_prev_closes_from_db() -> dict[str, float]:
+    """Loads today's already-persisted previous closes from Postgres - this
+    is what makes the data survive a Render cold-start or redeploy, since
+    it doesn't depend on any process having stayed alive since the load."""
     today = _ist_today_str()
-    if _prev_close_cache["date"] != today and not _prev_close_loading:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT symbol, close FROM sector_prev_close WHERE date = ?", (today,)
+        ).fetchall()
+    return {row["symbol"]: row["close"] for row in rows}
+
+
+def _get_prev_closes(access_token: str) -> dict[str, float]:
+    """Returns today's previous-close map. Checks the DB first (covers a
+    fresh process picking up progress an earlier process already made
+    today), then kicks off a background refresh (non-blocking) for
+    whatever's still missing."""
+    global _prev_close_loading, _prev_close_cache
+    today = _ist_today_str()
+    if _prev_close_cache["date"] != today:
+        # New process, or a new day - seed from whatever's already in the
+        # DB from today before deciding whether a background load is needed.
+        _prev_close_cache = {"date": today, "closes": _load_prev_closes_from_db()}
+    if len(_prev_close_cache["closes"]) < len(SECTOR_MAP) and not _prev_close_loading:
         _prev_close_loading = True
         threading.Thread(target=_load_prev_closes_background, args=(access_token,), daemon=True).start()
-    return _prev_close_cache["closes"] if _prev_close_cache["date"] == today else {}
+    return _prev_close_cache["closes"]
 
 
 def _fetch_sector_performance(access_token: str) -> dict | None:
