@@ -416,7 +416,9 @@ def init_db():
                 live_entry_order_id TEXT,
                 live_exit_order_id TEXT,
                 live_error TEXT,
-                live_quantity INTEGER
+                live_quantity INTEGER,
+                live_instrument_key TEXT,
+                live_option_label TEXT
             )
             """
         )
@@ -438,6 +440,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_order_id TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_error TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_quantity INTEGER",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_instrument_key TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_option_label TEXT",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -536,6 +540,16 @@ def get_current_capital() -> float:
     return base + (row["total"] or 0)
 
 
+def _mark_live_failed(trade_id: int, error: str, live_quantity: int | None = None) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE paper_trades SET live_status = 'FAILED', live_error = ?, "
+            "live_quantity = COALESCE(?, live_quantity) WHERE id = ?",
+            (error, live_quantity, trade_id),
+        )
+        conn.commit()
+
+
 def create_paper_trades_for_batch(data: dict) -> None:
     """Single-position paper trading: only one trade is ever open at a
     time, using the full current account balance. A new alert only starts
@@ -594,82 +608,65 @@ def create_paper_trades_for_batch(data: dict) -> None:
         ).fetchone()
         conn.commit()
 
-    # Live trading only ever goes long via CNC (Delivery) - CNC can't open a
-    # fresh short, so Sell-direction alerts stay paper-trade only, same as
-    # before. Buy alerts also go live, but only when the safety switch is on
-    # and a token is saved; any failure here is recorded on the trade and
-    # never blocks the paper trade itself.
-    if category == "Buy" and get_live_trading_enabled():
+    # Live trading buys ATM OPTIONS, never the underlying equity: a Buy
+    # alert buys the ATM Call, a Sell alert buys the ATM Put - both are
+    # always a BUY transaction (never writes/shorts an option), only the
+    # option TYPE differs by alert direction. Any failure here is recorded
+    # on the trade and never blocks the paper trade itself.
+    if get_live_trading_enabled():
+        opt_type = "CE" if category == "Buy" else "PE"
         trade_id = row["id"]
         access_token = get_setting("upstox_access_token")
         if not access_token:
-            with get_db() as conn:
-                conn.execute(
-                    "UPDATE paper_trades SET live_status = 'FAILED', live_error = ? WHERE id = ?",
-                    ("Live trading is on but no Upstox access token is saved", trade_id),
-                )
-                conn.commit()
+            _mark_live_failed(trade_id, "Live trading is on but no Upstox access token is saved")
         else:
-            try:
-                instrument_key = get_instrument_key(symbol)
-            except Exception:
-                instrument_key = None
-            if not instrument_key:
-                with get_db() as conn:
-                    conn.execute(
-                        "UPDATE paper_trades SET live_status = 'FAILED', live_error = ? WHERE id = ?",
-                        (f"No instrument_key found for {symbol}", trade_id),
-                    )
-                    conn.commit()
+            option = get_atm_option(symbol, opt_type, price_val)
+            if not option:
+                _mark_live_failed(trade_id, f"No {opt_type} option chain data found for {symbol} (nearest monthly expiry)")
             else:
-                available_funds = get_upstox_available_funds(access_token)
-                if available_funds is None:
-                    with get_db() as conn:
-                        conn.execute(
-                            "UPDATE paper_trades SET live_status = 'FAILED', live_error = ? WHERE id = ?",
-                            ("Could not fetch available Upstox funds - live order skipped", trade_id),
-                        )
-                        conn.commit()
+                premium = get_ltp(option["instrument_key"], access_token)
+                if not premium or premium <= 0:
+                    _mark_live_failed(trade_id, f"Could not fetch option premium for {symbol} {opt_type}")
                 else:
-                    live_quantity = int(available_funds // price_val)
-                    if live_quantity < 1:
-                        with get_db() as conn:
-                            conn.execute(
-                                """
-                                UPDATE paper_trades
-                                SET live_status = 'FAILED', live_error = ?, live_quantity = ?
-                                WHERE id = ?
-                                """,
-                                (
-                                    f"Available funds (Rs {available_funds:.2f}) not enough for "
-                                    f"1 share at Rs {price_val}",
-                                    live_quantity,
-                                    trade_id,
-                                ),
-                            )
-                            conn.commit()
+                    available_funds = get_upstox_available_funds(access_token)
+                    if available_funds is None:
+                        _mark_live_failed(trade_id, "Could not fetch available Upstox funds - live order skipped")
                     else:
-                        result = place_live_order(instrument_key, "BUY", live_quantity, access_token)
-                        with get_db() as conn:
-                            if result["ok"]:
-                                conn.execute(
-                                    """
-                                    UPDATE paper_trades
-                                    SET live_status = 'OPEN', live_entry_order_id = ?, live_quantity = ?
-                                    WHERE id = ?
-                                    """,
-                                    (result["order_id"], live_quantity, trade_id),
-                                )
-                            else:
-                                conn.execute(
-                                    """
-                                    UPDATE paper_trades
-                                    SET live_status = 'FAILED', live_error = ?, live_quantity = ?
-                                    WHERE id = ?
-                                    """,
-                                    (result["error"], live_quantity, trade_id),
-                                )
-                            conn.commit()
+                        lot_size = option["lot_size"]
+                        lots = int(available_funds // (premium * lot_size))
+                        label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
+                        if lots < 1:
+                            _mark_live_failed(
+                                trade_id,
+                                f"Available funds (Rs {available_funds:.2f}) not enough for 1 lot "
+                                f"({lot_size} qty) of {label} at premium Rs {premium}",
+                                live_quantity=0,
+                            )
+                        else:
+                            live_quantity = lots * lot_size
+                            result = place_live_order(option["instrument_key"], "BUY", live_quantity, access_token)
+                            with get_db() as conn:
+                                if result["ok"]:
+                                    conn.execute(
+                                        """
+                                        UPDATE paper_trades
+                                        SET live_status = 'OPEN', live_entry_order_id = ?, live_quantity = ?,
+                                            live_instrument_key = ?, live_option_label = ?
+                                        WHERE id = ?
+                                        """,
+                                        (result["order_id"], live_quantity, option["instrument_key"], label, trade_id),
+                                    )
+                                else:
+                                    conn.execute(
+                                        """
+                                        UPDATE paper_trades
+                                        SET live_status = 'FAILED', live_error = ?, live_quantity = ?,
+                                            live_option_label = ?
+                                        WHERE id = ?
+                                        """,
+                                        (result["error"], live_quantity, label, trade_id),
+                                    )
+                                conn.commit()
 
 
 def calculate_ema(values: list[float], period: int = 5) -> list[float | None]:
@@ -725,19 +722,48 @@ _instrument_cache: dict[str, str] = {}
 _instrument_cache_date: str | None = None
 _instrument_debug: dict = {}
 
+# underlying symbol -> list of {"strike", "opt_type", "expiry" (YYYY-MM-DD),
+# "instrument_key", "lot_size"} for every CE/PE contract on that underlying.
+_option_chain_cache: dict[str, list[dict]] = {}
+_option_debug: dict = {}
+
 UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
 
 
-def _load_instrument_master() -> None:
-    """Downloads Upstox's public instrument master file and builds a
-    trading-symbol -> instrument_key lookup for NSE equities. Cached for
-    the day since it's a large file and doesn't change intraday.
+def _parse_expiry(raw) -> str | None:
+    """Upstox's CSV has been seen to store expiry either as an epoch-ms
+    timestamp or as a plain date string, depending on export version -
+    handle both rather than assuming one."""
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        try:
+            ms = int(raw)
+            # heuristic: 13-digit numbers are ms, 10-digit are seconds
+            seconds = ms / 1000 if len(raw) >= 13 else ms
+            return datetime.utcfromtimestamp(seconds).strftime("%Y-%m-%d")
+        except Exception:
+            return None
+    # already a date-like string, e.g. "2026-08-27"
+    return raw[:10]
 
-    NOTE: this was written from Upstox's documented CSV format but could
-    not be tested against the live file (no internet access in the build
-    sandbox) - if this fails, the actual column names may differ slightly
-    and will need a small fix once you see the real error."""
+
+def _load_instrument_master() -> None:
+    """Downloads Upstox's public instrument master file and builds two
+    lookups in a single pass: a trading-symbol -> instrument_key map for
+    NSE equities, and an underlying-symbol -> option-contract-list map for
+    NSE F&O options (CE/PE). Cached for the day since it's a large file and
+    doesn't change intraday.
+
+    NOTE: the F&O column names (name/strike/expiry/lot_size) are Upstox's
+    documented ones but haven't been confirmed against the live file yet -
+    check /api/paper-trading/debug-instruments after the first real fetch
+    and fix the column names there if option_matched_count is 0."""
     global _instrument_cache, _instrument_cache_date, _instrument_debug
+    global _option_chain_cache, _option_debug
     try:
         req = urllib.request.Request(UPSTOX_INSTRUMENTS_URL, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -755,8 +781,11 @@ def _load_instrument_master() -> None:
         reader = csv.DictReader(io.StringIO(text))
         fieldnames = reader.fieldnames or []
         sample_rows = []
+        fo_sample_rows = []
         mapping = {}
+        option_chains: dict[str, list[dict]] = {}
         row_count = 0
+        option_row_count = 0
         for i, row in enumerate(reader):
             row_count = i + 1
             if i < 3:
@@ -767,8 +796,33 @@ def _load_instrument_master() -> None:
             ikey = row.get("instrument_key") or ""
             if exch == "NSE_EQ" and itype == "EQUITY" and tsym and ikey:
                 mapping[tsym] = ikey
+            elif exch == "NSE_FO" and itype in ("CE", "PE") and ikey:
+                if len(fo_sample_rows) < 3:
+                    fo_sample_rows.append(dict(row))
+                underlying = (row.get("name") or row.get("asset_symbol") or "").upper()
+                strike_raw = row.get("strike") or row.get("strike_price")
+                lot_raw = row.get("lot_size")
+                expiry = _parse_expiry(row.get("expiry"))
+                try:
+                    strike = float(strike_raw) if strike_raw not in (None, "") else None
+                except (TypeError, ValueError):
+                    strike = None
+                try:
+                    lot_size = int(float(lot_raw)) if lot_raw not in (None, "") else None
+                except (TypeError, ValueError):
+                    lot_size = None
+                if underlying and strike and expiry and lot_size and ikey:
+                    option_row_count += 1
+                    option_chains.setdefault(underlying, []).append({
+                        "strike": strike,
+                        "opt_type": itype,
+                        "expiry": expiry,
+                        "instrument_key": ikey,
+                        "lot_size": lot_size,
+                    })
 
         _instrument_cache = mapping
+        _option_chain_cache = option_chains
         _instrument_cache_date = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
         _instrument_debug = {
             "ok": True,
@@ -781,14 +835,23 @@ def _load_instrument_master() -> None:
             "matched_count": len(mapping),
             "error": None,
         }
+        _option_debug = {
+            "ok": True,
+            "fo_sample_rows": fo_sample_rows,
+            "option_rows_matched": option_row_count,
+            "underlyings_with_options": len(option_chains),
+            "sample_underlyings": list(option_chains.keys())[:5],
+        }
     except Exception as e:
         import traceback
         _instrument_cache = {}
+        _option_chain_cache = {}
         _instrument_debug = {
             "ok": False,
             "error": str(e),
             "traceback": traceback.format_exc(),
         }
+        _option_debug = {"ok": False, "error": str(e)}
 
 
 def get_instrument_key(symbol: str) -> str | None:
@@ -796,6 +859,37 @@ def get_instrument_key(symbol: str) -> str | None:
     if _instrument_cache_date != today or not _instrument_cache:
         _load_instrument_master()
     return _instrument_cache.get((symbol or "").upper())
+
+
+def get_atm_option(symbol: str, opt_type: str, reference_price: float) -> dict | None:
+    """Finds the ATM (closest-strike) contract for this underlying's
+    nearest MONTHLY expiry. A monthly expiry is identified as the latest
+    expiry date that falls within a given calendar month among all this
+    underlying's expiries (matches how NSE's monthly contracts work: the
+    last expiry of the month is the monthly one, the rest are weeklies).
+    Returns None if no option chain data is available for this symbol."""
+    today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    if _instrument_cache_date != today or not _option_chain_cache:
+        _load_instrument_master()
+    contracts = _option_chain_cache.get((symbol or "").upper())
+    if not contracts:
+        return None
+
+    all_expiries = sorted({c["expiry"] for c in contracts if c["expiry"] >= today})
+    if not all_expiries:
+        return None
+    monthly_by_month: dict[str, str] = {}
+    for exp in all_expiries:
+        month_key = exp[:7]  # "YYYY-MM"
+        if month_key not in monthly_by_month or exp > monthly_by_month[month_key]:
+            monthly_by_month[month_key] = exp
+    nearest_monthly = min(monthly_by_month.values())
+
+    candidates = [c for c in contracts if c["expiry"] == nearest_monthly and c["opt_type"] == opt_type]
+    if not candidates:
+        return None
+    best = min(candidates, key=lambda c: abs(c["strike"] - reference_price))
+    return best
 
 
 _sector_perf_cache: dict = {"data": None, "fetched_at": None}
@@ -1148,6 +1242,31 @@ def compute_live_stats(open_trades: list[dict], closed_trades: list[dict]) -> di
 UPSTOX_ORDER_URL = "https://api.upstox.com/v3/order/place"
 
 
+def get_ltp(instrument_key: str, access_token: str) -> float | None:
+    """Fetches the current last-traded price for a single instrument (used
+    to price an option's premium before sizing lots). Returns None (never
+    raises) on any failure."""
+    url = "https://api.upstox.com/v2/market-quote/ltp?instrument_key=" + urllib.parse.quote(instrument_key, safe="|")
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+        data = payload.get("data") or {}
+        for entry in data.values():
+            if entry.get("instrument_token") == instrument_key:
+                return entry.get("last_price")
+        return None
+    except Exception:
+        return None
+
+
 def place_live_order(instrument_key: str, transaction_type: str, quantity: int, access_token: str) -> dict:
     """Places a real order on Upstox: CNC (Delivery) product, Market order,
     DAY validity - matching the decisions for this app (live trading only
@@ -1205,23 +1324,23 @@ def place_live_order(instrument_key: str, transaction_type: str, quantity: int, 
 
 def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[str | None, str | None]:
     """If this paper trade has a live position open (live_status == 'OPEN'),
-    places the closing SELL order on Upstox. Returns (order_id, error) - both
-    None if there was no live position to close, since that's the normal
-    case for Sell-direction trades and for any trade from before live
-    trading was turned on."""
+    places the closing SELL order on Upstox for the EXACT option contract
+    that was bought at entry (live_instrument_key) - not a freshly
+    recomputed ATM strike, since the ATM strike at entry time is what's
+    actually held, regardless of where the underlying has moved since.
+    Returns (order_id, error) - both None if there was no live position to
+    close, which is the normal case for any trade from before live trading
+    was turned on."""
     if trade.get("live_status") != "OPEN":
         return None, None
     if not access_token:
         return None, "Live position open but no Upstox access token saved - could not close it"
 
-    try:
-        instrument_key = get_instrument_key(trade["symbol"])
-    except Exception as e:
-        return None, f"Could not look up instrument_key to close live position: {e}"
+    instrument_key = trade.get("live_instrument_key")
     if not instrument_key:
-        return None, f"No instrument_key found for {trade['symbol']} - could not close live position"
+        return None, "No live_instrument_key recorded on this trade - could not close live position"
 
-    qty = trade.get("live_quantity") or trade["quantity"] or 1
+    qty = trade.get("live_quantity") or 1
     result = place_live_order(instrument_key, "SELL", qty, access_token)
     if result["ok"]:
         return result["order_id"], None
@@ -1720,9 +1839,29 @@ def debug_instruments():
     """Diagnostic-only: forces a fresh download of Upstox's instrument
     master and shows exactly what came back - real column names, sample
     rows, and any error - so a mismatch in the parsing code can be spotted
-    and fixed precisely."""
+    and fixed precisely. Includes the option-chain parsing results too."""
     _load_instrument_master()
-    return jsonify(_instrument_debug)
+    return jsonify({"equities": _instrument_debug, "options": _option_debug})
+
+
+@app.route("/api/paper-trading/debug-atm")
+def debug_atm():
+    """Diagnostic-only: looks up the ATM CE and PE for a given symbol and
+    reference price, e.g. /api/paper-trading/debug-atm?symbol=RELIANCE&price=1400
+    - shows the resolved contract or explains why none was found."""
+    symbol = request.args.get("symbol", "")
+    try:
+        price = float(request.args.get("price", ""))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Pass ?symbol=X&price=Y in the URL"})
+    _load_instrument_master()
+    return jsonify({
+        "symbol": symbol.upper(),
+        "reference_price": price,
+        "chain_length": len(_option_chain_cache.get(symbol.upper(), [])),
+        "atm_call": get_atm_option(symbol, "CE", price),
+        "atm_put": get_atm_option(symbol, "PE", price),
+    })
 
 
 @app.route("/api/paper-trading/debug-funds")

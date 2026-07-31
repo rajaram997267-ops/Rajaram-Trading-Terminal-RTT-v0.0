@@ -212,7 +212,7 @@
     </label>
     <span>Live trading (real Upstox orders)</span>
     <span class="token-status" id="liveStatus" style="{% if live_trading_enabled %}color: var(--red);{% endif %}">
-      {% if live_trading_enabled %}ON - Buy alerts place real CNC market orders, sized off your Upstox available funds{% else %}OFF - paper trading only{% endif %}
+      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds{% else %}OFF - paper trading only{% endif %}
     </span>
   </div>
 
@@ -280,7 +280,7 @@
         <td class="error-note">{{ t.last_error or "" }}</td>
         <td>
           <span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span>
-          {% if t.live_quantity %}<div class="sub" style="font-size:11px;">{{ t.live_quantity }} sh</div>{% endif %}
+          {% if t.live_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.live_option_label }}">{{ t.live_option_label }} &middot; {{ t.live_quantity }} qty</div>{% elif t.live_quantity %}<div class="sub" style="font-size:11px;">{{ t.live_quantity }} qty</div>{% endif %}
           {% if t.live_error %}<div class="error-note" title="{{ t.live_error }}">{{ t.live_error[:30] }}{% if t.live_error|length > 30 %}...{% endif %}</div>{% endif %}
         </td>
         <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit({{ t.id }})">Exit Now</button></td>
@@ -314,7 +314,7 @@
         <td>{{ (t.exit_time or "")[:19] }}</td>
         <td>
           <span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span>
-          {% if t.live_quantity %}<div class="sub" style="font-size:11px;">{{ t.live_quantity }} sh</div>{% endif %}
+          {% if t.live_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.live_option_label }}">{{ t.live_option_label }} &middot; {{ t.live_quantity }} qty</div>{% elif t.live_quantity %}<div class="sub" style="font-size:11px;">{{ t.live_quantity }} qty</div>{% endif %}
         </td>
       </tr>
       {% endfor %}
@@ -350,7 +350,7 @@
       const enabled = checkbox.checked;
       if (enabled && !confirm(
         "This turns ON live trading. The NEXT Buy alert will place a real " +
-        "CNC market order on Upstox, sized off your actual available funds. Continue?"
+        "ATM option order on Upstox (Call for Buy alerts, Put for Sell alerts), sized off your actual available funds. Continue?"
       )) {
         checkbox.checked = false;
         return;
@@ -363,7 +363,7 @@
         });
         const result = await res.json();
         statusEl.textContent = result.live_trading_enabled
-          ? "ON - Buy alerts place real CNC market orders, sized off your Upstox available funds"
+          ? "ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds"
           : "OFF - paper trading only";
         statusEl.style.color = result.live_trading_enabled ? "var(--red)" : "";
       } catch (err) {
@@ -469,7 +469,7 @@
           <td class="error-note">${escapeHtml(t.last_error || "")}</td>
           <td>
             <span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span>
-            ${t.live_quantity ? `<div class="sub" style="font-size:11px;">${t.live_quantity} sh</div>` : ""}
+            ${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)} &middot; ${t.live_quantity} qty</div>` : (t.live_quantity ? `<div class="sub" style="font-size:11px;">${t.live_quantity} qty</div>` : "")}
             ${t.live_error ? `<div class="error-note" title="${escapeHtml(t.live_error)}">${escapeHtml(t.live_error.slice(0, 30))}${t.live_error.length > 30 ? "..." : ""}</div>` : ""}
           </td>
           <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit(${t.id})">Exit Now</button></td>
@@ -508,7 +508,7 @@
             <td>${(t.exit_time || "").slice(0, 19)}</td>
             <td>
               <span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span>
-              ${t.live_quantity ? `<div class="sub" style="font-size:11px;">${t.live_quantity} sh</div>` : ""}
+              ${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)} &middot; ${t.live_quantity} qty</div>` : (t.live_quantity ? `<div class="sub" style="font-size:11px;">${t.live_quantity} qty</div>` : "")}
             </td>
           </tr>
         `;
