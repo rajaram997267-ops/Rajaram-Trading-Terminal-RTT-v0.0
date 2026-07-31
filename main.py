@@ -842,10 +842,13 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
 
     data = payload.get("data") or {}
     sector_changes: dict[str, list[float]] = {}
+    unmatched_tokens = []
     for entry in data.values():
         instrument_token = entry.get("instrument_token")
         symbol = instrument_key_to_symbol.get(instrument_token)
         if not symbol:
+            if len(unmatched_tokens) < 3:
+                unmatched_tokens.append(instrument_token)
             continue
         last_price = entry.get("last_price")
         prev_close = (entry.get("prev_ohlc") or {}).get("close")
@@ -859,7 +862,17 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
         sector: {"pct_change": round(sum(vals) / len(vals), 2), "count": len(vals)}
         for sector, vals in sector_changes.items()
     }
-    _sector_perf_debug = {"ok": True, "error": None}
+    _sector_perf_debug = {
+        "ok": True,
+        "error": None,
+        "instrument_keys_sent": len(instrument_keys),
+        "data_entries_received": len(data),
+        "sample_data_keys": list(data.keys())[:3],
+        "sample_raw_entry": next(iter(data.values()), None),
+        "sample_sent_instrument_key": instrument_keys[0] if instrument_keys else None,
+        "unmatched_instrument_tokens_sample": unmatched_tokens,
+        "sectors_matched": len(result),
+    }
     return result
 
 

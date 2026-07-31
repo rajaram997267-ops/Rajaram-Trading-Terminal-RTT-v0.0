@@ -340,7 +340,7 @@
           <span class="name">All sectors</span>
         </div>
         {% for s in all_sector_names %}
-        <div class="sector-row" data-sector="{{ s }}" onclick="selectSector({{ s|tojson }})">
+        <div class="sector-row" data-sector="{{ s }}" onclick='selectSector({{ s|tojson }})'>
           <span class="name">{{ s }}</span>
           <span class="pct na" data-sector-pct="{{ s }}">-</span>
         </div>
