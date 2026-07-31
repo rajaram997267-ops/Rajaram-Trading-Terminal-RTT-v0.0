@@ -6,6 +6,7 @@ import io
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timedelta
@@ -244,6 +245,12 @@ def get_sector(symbol: str) -> str:
     Any symbol not in the list (new listings, non-F&O stocks, test data)
     falls back to 'Unclassified' rather than breaking the page."""
     return SECTOR_MAP.get((symbol or "").strip().upper(), "Unclassified")
+
+
+# The full, static universe of sectors this app knows about - independent of
+# which sectors happen to have an alert today. Used to show every sector in
+# the sidebar (with today's % change) rather than only sectors that alerted.
+ALL_SECTOR_NAMES = sorted(set(SECTOR_MAP.values()))
 
 
 def ist_date_str(created_at_iso: str) -> str:
@@ -781,6 +788,97 @@ def get_instrument_key(symbol: str) -> str | None:
     return _instrument_cache.get((symbol or "").upper())
 
 
+_sector_perf_cache: dict = {"data": None, "fetched_at": None}
+_sector_perf_debug: dict = {"ok": None, "error": None}
+SECTOR_PERF_CACHE_SECONDS = 45
+
+
+def _fetch_sector_performance(access_token: str) -> dict | None:
+    """Computes each sector's today's % change as the average % change of
+    its own constituent stocks (from SECTOR_MAP), using one batched Upstox
+    v3 OHLC quote call for every mapped symbol. Returns
+    {sector: {"pct_change": float, "count": int}} or None on failure -
+    callers must treat None as 'unknown for now', not zero."""
+    global _sector_perf_debug
+    symbol_to_sector = SECTOR_MAP
+    instrument_key_to_symbol: dict[str, str] = {}
+    for symbol in symbol_to_sector:
+        key = get_instrument_key(symbol)
+        if key:
+            instrument_key_to_symbol[key] = symbol
+    if not instrument_key_to_symbol:
+        _sector_perf_debug = {"ok": False, "error": "No instrument keys resolved for any mapped symbol"}
+        return None
+
+    instrument_keys = list(instrument_key_to_symbol.keys())
+    # v3 OHLC quotes supports up to 500 instruments in a single call - our
+    # whole F&O universe (~180 symbols) fits in one request.
+    url = (
+        "https://api.upstox.com/v3/market-quote/ohlc?interval=1d&instrument_key="
+        + urllib.parse.quote(",".join(instrument_keys), safe=",|")
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "Api-Version": "3.0",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            body_text = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            body_text = ""
+        _sector_perf_debug = {"ok": False, "error": f"HTTP {e.code}: {body_text}"}
+        return None
+    except Exception as e:
+        _sector_perf_debug = {"ok": False, "error": str(e)}
+        return None
+
+    data = payload.get("data") or {}
+    sector_changes: dict[str, list[float]] = {}
+    for entry in data.values():
+        instrument_token = entry.get("instrument_token")
+        symbol = instrument_key_to_symbol.get(instrument_token)
+        if not symbol:
+            continue
+        last_price = entry.get("last_price")
+        prev_close = (entry.get("prev_ohlc") or {}).get("close")
+        if not last_price or not prev_close:
+            continue
+        pct = (last_price - prev_close) / prev_close * 100
+        sector = symbol_to_sector.get(symbol, "Unclassified")
+        sector_changes.setdefault(sector, []).append(pct)
+
+    result = {
+        sector: {"pct_change": round(sum(vals) / len(vals), 2), "count": len(vals)}
+        for sector, vals in sector_changes.items()
+    }
+    _sector_perf_debug = {"ok": True, "error": None}
+    return result
+
+
+def get_sector_performance_cached(access_token: str | None) -> dict | None:
+    """Same data as _fetch_sector_performance(), cached for a short window
+    since this covers the app's whole ~180-symbol universe in one call and
+    the sidebar polls independently of the 5s alert refresh."""
+    global _sector_perf_cache
+    if not access_token:
+        return None
+    now = datetime.utcnow()
+    fetched_at = _sector_perf_cache["fetched_at"]
+    if fetched_at and (now - fetched_at).total_seconds() < SECTOR_PERF_CACHE_SECONDS:
+        return _sector_perf_cache["data"]
+    value = _fetch_sector_performance(access_token)
+    _sector_perf_cache = {"data": value, "fetched_at": now}
+    return value
+
+
 def resample_1min_to_5min(candles_1min: list) -> list[tuple[float, float, float, float]]:
     """candles_1min: list of (timestamp_str, open, high, low, close, volume, oi),
     oldest first. Groups consecutive 1-min candles into 5-min buckets aligned
@@ -1106,6 +1204,38 @@ def run_paper_trade_check() -> dict:
     return {"checked": checked, "closed": closed, "errors": errors}
 
 
+@app.route("/api/sectors")
+def api_sectors():
+    """Full sector list with today's % change (average of that sector's own
+    constituent stocks). % change is null for any sector where it couldn't
+    be computed (no token saved, or the batch quote call failed) - the
+    sidebar still shows every sector name in that case, just without a
+    number yet."""
+    access_token = get_setting("upstox_access_token")
+    perf = get_sector_performance_cached(access_token)
+    result = [
+        {
+            "sector": sector,
+            "pct_change": (perf or {}).get(sector, {}).get("pct_change"),
+        }
+        for sector in ALL_SECTOR_NAMES
+    ]
+    return jsonify(result)
+
+
+@app.route("/api/paper-trading/debug-sector-perf")
+def debug_sector_perf():
+    """Diagnostic-only: forces a fresh sector performance fetch and shows
+    the real error if it fails, instead of the sidebar just showing '-'."""
+    access_token = get_setting("upstox_access_token")
+    if not access_token:
+        return jsonify({"ok": False, "error": "No Upstox access token saved"})
+    global _sector_perf_cache
+    _sector_perf_cache = {"data": None, "fetched_at": None}  # force a fresh fetch
+    value = get_sector_performance_cached(access_token)
+    return jsonify({"value": value, **_sector_perf_debug})
+
+
 @app.route("/")
 def index():
     try:
@@ -1143,6 +1273,7 @@ def index():
             alerts_count=merged_count,
             grouped=grouped,
             all_sectors=all_sectors,
+            all_sector_names=ALL_SECTOR_NAMES,
             available_dates=available_dates,
             selected_date=selected_date,
             today_str=today_str,
