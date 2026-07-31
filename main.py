@@ -800,7 +800,7 @@ def get_instrument_key(symbol: str) -> str | None:
 
 _sector_perf_cache: dict = {"data": None, "fetched_at": None}
 _sector_perf_debug: dict = {"ok": None, "error": None}
-SECTOR_PERF_CACHE_SECONDS = 45
+SECTOR_PERF_CACHE_SECONDS = 5
 
 # Upstox's live quote/OHLC endpoints only return TODAY's still-in-progress
 # OHLC for a 1d interval (confirmed in their own docs: "For a time interval
