@@ -796,9 +796,12 @@ SECTOR_PERF_CACHE_SECONDS = 45
 def _fetch_sector_performance(access_token: str) -> dict | None:
     """Computes each sector's today's % change as the average % change of
     its own constituent stocks (from SECTOR_MAP), using one batched Upstox
-    v3 OHLC quote call for every mapped symbol. Returns
-    {sector: {"pct_change": float, "count": int}} or None on failure -
-    callers must treat None as 'unknown for now', not zero."""
+    v2 Full Market Quote call for every mapped symbol. Uses v2 (not the v3
+    OHLC endpoint) because v3 OHLC returned prev_ohlc: null for regular
+    equities in testing - v2's ohlc.close reliably gives the previous day's
+    close for a live quote. Returns {sector: {"pct_change": float, "count":
+    int}} or None on failure - callers must treat None as 'unknown for
+    now', not zero."""
     global _sector_perf_debug
     symbol_to_sector = SECTOR_MAP
     instrument_key_to_symbol: dict[str, str] = {}
@@ -811,10 +814,10 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
         return None
 
     instrument_keys = list(instrument_key_to_symbol.keys())
-    # v3 OHLC quotes supports up to 500 instruments in a single call - our
-    # whole F&O universe (~180 symbols) fits in one request.
+    # v2 Full Market Quote supports up to 500 instruments in a single call -
+    # our whole F&O universe (~180 symbols) fits in one request.
     url = (
-        "https://api.upstox.com/v3/market-quote/ohlc?interval=1d&instrument_key="
+        "https://api.upstox.com/v2/market-quote/quotes?instrument_key="
         + urllib.parse.quote(",".join(instrument_keys), safe=",|")
     )
     req = urllib.request.Request(
@@ -822,7 +825,6 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
         headers={
             "Authorization": f"Bearer {access_token}",
             "Accept": "application/json",
-            "Api-Version": "3.0",
             "User-Agent": BROWSER_USER_AGENT,
         },
     )
@@ -843,6 +845,7 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
     data = payload.get("data") or {}
     sector_changes: dict[str, list[float]] = {}
     unmatched_tokens = []
+    skipped_no_close = 0
     for entry in data.values():
         instrument_token = entry.get("instrument_token")
         symbol = instrument_key_to_symbol.get(instrument_token)
@@ -851,8 +854,9 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
                 unmatched_tokens.append(instrument_token)
             continue
         last_price = entry.get("last_price")
-        prev_close = (entry.get("prev_ohlc") or {}).get("close")
+        prev_close = (entry.get("ohlc") or {}).get("close")
         if not last_price or not prev_close:
+            skipped_no_close += 1
             continue
         pct = (last_price - prev_close) / prev_close * 100
         sector = symbol_to_sector.get(symbol, "Unclassified")
@@ -871,6 +875,7 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
         "sample_raw_entry": next(iter(data.values()), None),
         "sample_sent_instrument_key": instrument_keys[0] if instrument_keys else None,
         "unmatched_instrument_tokens_sample": unmatched_tokens,
+        "skipped_no_close": skipped_no_close,
         "sectors_matched": len(result),
     }
     return result
