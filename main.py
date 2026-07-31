@@ -1472,6 +1472,37 @@ def debug_funds():
     return jsonify({"value": value, **_funds_debug})
 
 
+@app.route("/api/paper-trading/debug-profile")
+def debug_profile():
+    """Diagnostic-only: calls Upstox's basic v2 user profile endpoint, which
+    needs only the Authorization header (no Api-Version, no static IP
+    requirement). If THIS also 401s with the saved token, the token itself
+    is the problem, not anything specific to the v3 funds/order code."""
+    access_token = get_setting("upstox_access_token")
+    if not access_token:
+        return jsonify({"ok": False, "error": "No Upstox access token saved"})
+    req = urllib.request.Request(
+        "https://api.upstox.com/v2/user/profile",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode())
+        return jsonify({"ok": True, "raw": payload})
+    except urllib.error.HTTPError as e:
+        try:
+            body_text = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            body_text = ""
+        return jsonify({"ok": False, "error": f"HTTP {e.code}: {body_text}"})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
 init_db()  # runs on import too, so gunicorn (used in production) creates the table
 
 if __name__ == "__main__":
