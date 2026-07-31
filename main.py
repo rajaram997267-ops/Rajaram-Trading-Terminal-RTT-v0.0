@@ -5,6 +5,7 @@ import gzip
 import io
 import json
 import os
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -792,32 +793,102 @@ _sector_perf_cache: dict = {"data": None, "fetched_at": None}
 _sector_perf_debug: dict = {"ok": None, "error": None}
 SECTOR_PERF_CACHE_SECONDS = 45
 
+# Upstox's live quote/OHLC endpoints only return TODAY's still-in-progress
+# OHLC for a 1d interval (confirmed in their own docs: "For a time interval
+# of 1d, the API returns only the live_ohlc... Previous day OHLC data is
+# available in Historical Candle Data"). So previous close has to come from
+# the separate historical-candle endpoint instead - and since that's one
+# call per instrument (not batchable), it's fetched once per calendar day
+# in a background thread and cached, not on every poll.
+_prev_close_cache: dict = {"date": None, "closes": {}}
+_prev_close_loading = False
+IST_OFFSET = timedelta(hours=5, minutes=30)
+
+
+def _ist_today_str() -> str:
+    return (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+
+
+def _load_prev_closes_background(access_token: str) -> None:
+    """Runs in a background thread: loops every mapped symbol and fetches
+    its most recent completed daily candle's close via the Historical
+    Candle Data API. This is ~180 sequential calls, so it's kept off the
+    request/response path entirely - callers just see stale/partial data
+    in _prev_close_cache until this finishes."""
+    global _prev_close_cache, _prev_close_loading
+    today = _ist_today_str()
+    from_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=10)).strftime("%Y-%m-%d")
+    closes: dict[str, float] = {}
+    for symbol in SECTOR_MAP:
+        key = get_instrument_key(symbol)
+        if not key:
+            continue
+        url = (
+            f"https://api.upstox.com/v2/historical-candle/"
+            f"{urllib.parse.quote(key, safe='|')}/day/{today}/{from_date}"
+        )
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+                "User-Agent": BROWSER_USER_AGENT,
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode())
+            candles = (payload.get("data") or {}).get("candles") or []
+            # Candles come back newest-first; the first entry is the most
+            # recent COMPLETED trading day (today's still-open session
+            # isn't included here), so its close is what we want.
+            if candles:
+                closes[symbol] = candles[0][4]
+        except Exception:
+            continue
+    _prev_close_cache = {"date": today, "closes": closes}
+    _prev_close_loading = False
+
+
+def _get_prev_closes(access_token: str) -> dict[str, float]:
+    """Returns today's cached previous-close map, kicking off a background
+    refresh (non-blocking) if today's data hasn't been loaded yet."""
+    global _prev_close_loading
+    today = _ist_today_str()
+    if _prev_close_cache["date"] != today and not _prev_close_loading:
+        _prev_close_loading = True
+        threading.Thread(target=_load_prev_closes_background, args=(access_token,), daemon=True).start()
+    return _prev_close_cache["closes"] if _prev_close_cache["date"] == today else {}
+
 
 def _fetch_sector_performance(access_token: str) -> dict | None:
     """Computes each sector's today's % change as the average % change of
-    its own constituent stocks (from SECTOR_MAP), using one batched Upstox
-    v2 Full Market Quote call for every mapped symbol. Uses v2 (not the v3
-    OHLC endpoint) because v3 OHLC returned prev_ohlc: null for regular
-    equities in testing - v2's ohlc.close reliably gives the previous day's
-    close for a live quote. Returns {sector: {"pct_change": float, "count":
-    int}} or None on failure - callers must treat None as 'unknown for
-    now', not zero."""
+    its own constituent stocks (from SECTOR_MAP): previous close comes from
+    the cached once-daily historical-candle load, current price from one
+    batched LTP call. Returns {sector: {"pct_change": float, "count": int}}
+    or None on failure/still-loading - callers must treat None as 'unknown
+    for now', not zero."""
     global _sector_perf_debug
+    prev_closes = _get_prev_closes(access_token)
+    if not prev_closes:
+        _sector_perf_debug = {"ok": False, "error": "Previous closes still loading in the background - try again shortly"}
+        return None
+
     symbol_to_sector = SECTOR_MAP
     instrument_key_to_symbol: dict[str, str] = {}
-    for symbol in symbol_to_sector:
+    for symbol in prev_closes:
         key = get_instrument_key(symbol)
         if key:
             instrument_key_to_symbol[key] = symbol
     if not instrument_key_to_symbol:
-        _sector_perf_debug = {"ok": False, "error": "No instrument keys resolved for any mapped symbol"}
+        _sector_perf_debug = {"ok": False, "error": "No instrument keys resolved for symbols with a cached previous close"}
         return None
 
     instrument_keys = list(instrument_key_to_symbol.keys())
-    # v2 Full Market Quote supports up to 500 instruments in a single call -
-    # our whole F&O universe (~180 symbols) fits in one request.
+    # v2 LTP supports up to 500 instruments in a single call - our whole
+    # F&O universe (~180 symbols) fits in one request.
     url = (
-        "https://api.upstox.com/v2/market-quote/quotes?instrument_key="
+        "https://api.upstox.com/v2/market-quote/ltp?instrument_key="
         + urllib.parse.quote(",".join(instrument_keys), safe=",|")
     )
     req = urllib.request.Request(
@@ -845,7 +916,6 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
     data = payload.get("data") or {}
     sector_changes: dict[str, list[float]] = {}
     unmatched_tokens = []
-    skipped_no_close = 0
     for entry in data.values():
         instrument_token = entry.get("instrument_token")
         symbol = instrument_key_to_symbol.get(instrument_token)
@@ -854,9 +924,8 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
                 unmatched_tokens.append(instrument_token)
             continue
         last_price = entry.get("last_price")
-        prev_close = (entry.get("ohlc") or {}).get("close")
+        prev_close = prev_closes.get(symbol)
         if not last_price or not prev_close:
-            skipped_no_close += 1
             continue
         pct = (last_price - prev_close) / prev_close * 100
         sector = symbol_to_sector.get(symbol, "Unclassified")
@@ -869,13 +938,10 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
     _sector_perf_debug = {
         "ok": True,
         "error": None,
+        "prev_closes_cached": len(prev_closes),
         "instrument_keys_sent": len(instrument_keys),
         "data_entries_received": len(data),
-        "sample_data_keys": list(data.keys())[:3],
-        "sample_raw_entry": next(iter(data.values()), None),
-        "sample_sent_instrument_key": instrument_keys[0] if instrument_keys else None,
         "unmatched_instrument_tokens_sample": unmatched_tokens,
-        "skipped_no_close": skipped_no_close,
         "sectors_matched": len(result),
     }
     return result
@@ -1244,14 +1310,23 @@ def api_sectors():
 @app.route("/api/paper-trading/debug-sector-perf")
 def debug_sector_perf():
     """Diagnostic-only: forces a fresh sector performance fetch and shows
-    the real error if it fails, instead of the sidebar just showing '-'."""
+    the real error if it fails, instead of the sidebar just showing '-'.
+    Note: previous closes load once per day in the background (~180 calls),
+    so right after a redeploy or at the start of a new day this may show
+    'still loading' for up to a minute or two before real numbers appear."""
     access_token = get_setting("upstox_access_token")
     if not access_token:
         return jsonify({"ok": False, "error": "No Upstox access token saved"})
     global _sector_perf_cache
     _sector_perf_cache = {"data": None, "fetched_at": None}  # force a fresh fetch
     value = get_sector_performance_cached(access_token)
-    return jsonify({"value": value, **_sector_perf_debug})
+    return jsonify({
+        "value": value,
+        "prev_close_cache_date": _prev_close_cache["date"],
+        "prev_closes_loaded": len(_prev_close_cache["closes"]),
+        "prev_close_still_loading": _prev_close_loading,
+        **_sector_perf_debug,
+    })
 
 
 @app.route("/")
