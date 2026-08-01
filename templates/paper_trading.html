@@ -268,7 +268,7 @@
       </tr>
       {% for t in open_trades %}
       <tr>
-        <td>{{ t.symbol }}</td>
+        <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
         <td>{{ t.quantity }}</td>
         <td>{{ t.entry_price }}</td>
@@ -302,7 +302,7 @@
       </tr>
       {% for t in closed_trades %}
       <tr>
-        <td>{{ t.symbol }}</td>
+        <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
         <td>{{ t.quantity }}</td>
         <td>{{ t.entry_price }}</td>
@@ -457,7 +457,7 @@
         const pctText = (t.unrealized_pnl_pct === null || t.unrealized_pnl_pct === undefined) ? "-" : t.unrealized_pnl_pct + "%";
         return `
         <tr>
-          <td>${escapeHtml(t.symbol)}</td>
+          <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
           <td>${t.quantity}</td>
           <td>${t.entry_price}</td>
@@ -496,7 +496,7 @@
         const pctText = (t.pnl_pct === null || t.pnl_pct === undefined) ? "-" : t.pnl_pct + "%";
         return `
           <tr>
-            <td>${escapeHtml(t.symbol)}</td>
+            <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}</td>
             <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
             <td>${t.quantity}</td>
             <td>${t.entry_price}</td>
