@@ -783,9 +783,9 @@ def _load_instrument_master() -> None:
         sample_rows = []
         fo_sample_rows = []
         mapping = {}
-        option_chains: dict[str, list[dict]] = {}
+        name_to_ticker: dict[str, str] = {}
+        pending_options = []
         row_count = 0
-        option_row_count = 0
         for i, row in enumerate(reader):
             row_count = i + 1
             if i < 3:
@@ -797,30 +797,53 @@ def _load_instrument_master() -> None:
             ikey = row.get("instrument_key") or ""
             if exch == "NSE_EQ" and itype == "EQUITY" and tsym and ikey:
                 mapping[tsym] = ikey
+                name = (row.get("name") or "").upper()
+                if name:
+                    name_to_ticker[name] = tsym
             elif exch == "NSE_FO" and opt_type in ("CE", "PE") and ikey:
                 if len(fo_sample_rows) < 3:
                     fo_sample_rows.append(dict(row))
-                underlying = (row.get("name") or row.get("asset_symbol") or "").upper()
-                strike_raw = row.get("strike") or row.get("strike_price")
-                lot_raw = row.get("lot_size")
-                expiry = _parse_expiry(row.get("expiry"))
-                try:
-                    strike = float(strike_raw) if strike_raw not in (None, "") else None
-                except (TypeError, ValueError):
-                    strike = None
-                try:
-                    lot_size = int(float(lot_raw)) if lot_raw not in (None, "") else None
-                except (TypeError, ValueError):
-                    lot_size = None
-                if underlying and strike and expiry and lot_size and ikey:
-                    option_row_count += 1
-                    option_chains.setdefault(underlying, []).append({
-                        "strike": strike,
-                        "opt_type": opt_type,
-                        "expiry": expiry,
-                        "instrument_key": ikey,
-                        "lot_size": lot_size,
-                    })
+                pending_options.append({
+                    "name": (row.get("name") or row.get("asset_symbol") or "").upper(),
+                    "strike_raw": row.get("strike") or row.get("strike_price"),
+                    "expiry_raw": row.get("expiry"),
+                    "lot_raw": row.get("lot_size"),
+                    "opt_type": opt_type,
+                    "instrument_key": ikey,
+                })
+
+        # Option rows store the underlying under its descriptive company
+        # name (e.g. "ORACLE FIN SERV SOFT LTD."), not its trading symbol -
+        # so resolve each one against the name->ticker map just built from
+        # the equity rows. Index options (e.g. "MIDCPNIFTY") won't have a
+        # matching equity name, so those fall back to using the raw name
+        # as-is, which works as long as it matches how that index is keyed
+        # elsewhere (e.g. in SECTOR_MAP).
+        option_chains: dict[str, list[dict]] = {}
+        option_row_count = 0
+        unresolved_names_sample = []
+        for opt in pending_options:
+            underlying = name_to_ticker.get(opt["name"], opt["name"])
+            if opt["name"] and opt["name"] not in name_to_ticker and len(unresolved_names_sample) < 5:
+                unresolved_names_sample.append(opt["name"])
+            try:
+                strike = float(opt["strike_raw"]) if opt["strike_raw"] not in (None, "") else None
+            except (TypeError, ValueError):
+                strike = None
+            try:
+                lot_size = int(float(opt["lot_raw"])) if opt["lot_raw"] not in (None, "") else None
+            except (TypeError, ValueError):
+                lot_size = None
+            expiry = _parse_expiry(opt["expiry_raw"])
+            if underlying and strike and expiry and lot_size and opt["instrument_key"]:
+                option_row_count += 1
+                option_chains.setdefault(underlying, []).append({
+                    "strike": strike,
+                    "opt_type": opt["opt_type"],
+                    "expiry": expiry,
+                    "instrument_key": opt["instrument_key"],
+                    "lot_size": lot_size,
+                })
 
         _instrument_cache = mapping
         _option_chain_cache = option_chains
@@ -842,6 +865,9 @@ def _load_instrument_master() -> None:
             "option_rows_matched": option_row_count,
             "underlyings_with_options": len(option_chains),
             "sample_underlyings": list(option_chains.keys())[:5],
+            "name_to_ticker_size": len(name_to_ticker),
+            "unresolved_names_sample": unresolved_names_sample,
+            "reliance_resolved": "RELIANCE" in option_chains,
         }
     except Exception as e:
         import traceback
