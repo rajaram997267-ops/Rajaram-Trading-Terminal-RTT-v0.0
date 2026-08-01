@@ -418,7 +418,9 @@ def init_db():
                 live_error TEXT,
                 live_quantity INTEGER,
                 live_instrument_key TEXT,
-                live_option_label TEXT
+                live_option_label TEXT,
+                paper_instrument_key TEXT,
+                paper_option_label TEXT
             )
             """
         )
@@ -442,6 +444,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_quantity INTEGER",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_instrument_key TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_option_label TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS paper_instrument_key TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS paper_option_label TEXT",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -590,21 +594,51 @@ def create_paper_trades_for_batch(data: dict) -> None:
     if symbol is None:
         return
 
-    capital = get_current_capital()
-    quantity = int(capital // price_val)
-    if quantity < 1:
-        quantity = 1
+    # Paper trading now simulates the actual ATM OPTION this alert would
+    # buy live (Call for Buy, Put for Sell) - not the equity - so it's a
+    # true preview of the live strategy: premium as entry price, quantity
+    # in whole lots sized off the paper capital pool. Falls back to the
+    # old equity-based simulation only if option data genuinely isn't
+    # available (no token, no chain, no premium), so paper trading never
+    # just silently does nothing.
+    opt_type = "CE" if category == "Buy" else "PE"
+    access_token = get_setting("upstox_access_token")
+    option = get_atm_option(symbol, opt_type, price_val) if access_token else None
+    premium = get_ltp(option["instrument_key"], access_token) if option else None
+
+    paper_instrument_key = None
+    paper_option_label = None
+    fallback_note = None
+    if option and premium and premium > 0:
+        capital = get_current_capital()
+        lot_size = option["lot_size"]
+        lots = max(1, int(capital // (premium * lot_size)))
+        quantity = lots * lot_size
+        entry_price = premium
+        paper_instrument_key = option["instrument_key"]
+        paper_option_label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
+    else:
+        capital = get_current_capital()
+        quantity = int(capital // price_val) or 1
+        entry_price = price_val
+        if not access_token:
+            fallback_note = "No Upstox token saved - fell back to equity paper trading"
+        elif not option:
+            fallback_note = f"No {opt_type} option chain data for {symbol} - fell back to equity paper trading"
+        else:
+            fallback_note = f"Could not fetch option premium for {symbol} {opt_type} - fell back to equity paper trading"
 
     now = datetime.utcnow().isoformat()
     with get_db() as conn:
         row = conn.execute(
             """
             INSERT INTO paper_trades
-                (symbol, direction, entry_price, entry_time, status, quantity)
-            VALUES (?, ?, ?, ?, 'OPEN', ?)
+                (symbol, direction, entry_price, entry_time, status, quantity,
+                 paper_instrument_key, paper_option_label, last_error)
+            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
             RETURNING id
             """,
-            (symbol, category, price_val, now, quantity),
+            (symbol, category, entry_price, now, quantity, paper_instrument_key, paper_option_label, fallback_note),
         ).fetchone()
         conn.commit()
 
@@ -1395,7 +1429,7 @@ def run_paper_trade_check() -> dict:
         checked += 1
         symbol = trade["symbol"]
         try:
-            instrument_key = get_instrument_key(symbol)
+            instrument_key = trade["paper_instrument_key"] or get_instrument_key(symbol)
             if not instrument_key:
                 with get_db() as conn:
                     conn.execute(
@@ -1805,7 +1839,7 @@ def paper_trading_manual_exit(trade_id):
     access_token = get_setting("upstox_access_token")
     if access_token:
         try:
-            instrument_key = get_instrument_key(trade["symbol"])
+            instrument_key = trade["paper_instrument_key"] or get_instrument_key(trade["symbol"])
             if instrument_key:
                 candles = fetch_5min_candles(instrument_key, access_token)
                 if candles:
