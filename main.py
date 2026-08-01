@@ -792,11 +792,12 @@ def _load_instrument_master() -> None:
                 sample_rows.append(dict(row))
             exch = (row.get("exchange") or "").upper()
             itype = (row.get("instrument_type") or "").upper()
+            opt_type = (row.get("option_type") or "").upper()
             tsym = (row.get("tradingsymbol") or row.get("trading_symbol") or "").upper()
             ikey = row.get("instrument_key") or ""
             if exch == "NSE_EQ" and itype == "EQUITY" and tsym and ikey:
                 mapping[tsym] = ikey
-            elif exch == "NSE_FO" and itype in ("CE", "PE") and ikey:
+            elif exch == "NSE_FO" and opt_type in ("CE", "PE") and ikey:
                 if len(fo_sample_rows) < 3:
                     fo_sample_rows.append(dict(row))
                 underlying = (row.get("name") or row.get("asset_symbol") or "").upper()
@@ -815,7 +816,7 @@ def _load_instrument_master() -> None:
                     option_row_count += 1
                     option_chains.setdefault(underlying, []).append({
                         "strike": strike,
-                        "opt_type": itype,
+                        "opt_type": opt_type,
                         "expiry": expiry,
                         "instrument_key": ikey,
                         "lot_size": lot_size,
