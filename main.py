@@ -420,7 +420,13 @@ def init_db():
                 live_instrument_key TEXT,
                 live_option_label TEXT,
                 paper_instrument_key TEXT,
-                paper_option_label TEXT
+                paper_option_label TEXT,
+                strategy TEXT DEFAULT 'EMA',
+                original_quantity INTEGER,
+                target1_hit_time TEXT,
+                target1_exit_price DOUBLE PRECISION,
+                target1_qty INTEGER,
+                target1_pnl DOUBLE PRECISION
             )
             """
         )
@@ -446,6 +452,12 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_option_label TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS paper_instrument_key TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS paper_option_label TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'EMA'",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS original_quantity INTEGER",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_hit_time TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_exit_price DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_qty INTEGER",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_pnl DOUBLE PRECISION",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -468,6 +480,15 @@ def get_live_trading_enabled() -> bool:
     /api/paper-trading/live-toggle, so the app can never start placing real
     trades just because the code was deployed."""
     return get_setting("live_trading_enabled", "false") == "true"
+
+
+def get_exit_strategy() -> str:
+    """Which exit strategy new trades use: 'EMA' (the original 5-EMA-only
+    rule) or 'TARGETS' (book half at +2%, protect the rest at breakeven,
+    take the remaining half at +4% - falling back to the 5-EMA rule only
+    for protection before Target-1 is ever hit). Defaults to EMA so
+    deploying this code doesn't silently change existing behavior."""
+    return get_setting("exit_strategy", "EMA")
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:
@@ -629,16 +650,19 @@ def create_paper_trades_for_batch(data: dict) -> None:
             fallback_note = f"Could not fetch option premium for {symbol} {opt_type} - fell back to equity paper trading"
 
     now = datetime.utcnow().isoformat()
+    entry_strategy = get_exit_strategy()
     with get_db() as conn:
         row = conn.execute(
             """
             INSERT INTO paper_trades
                 (symbol, direction, entry_price, entry_time, status, quantity,
-                 paper_instrument_key, paper_option_label, last_error)
-            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?)
+                 paper_instrument_key, paper_option_label, last_error,
+                 strategy, original_quantity)
+            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
-            (symbol, category, entry_price, now, quantity, paper_instrument_key, paper_option_label, fallback_note),
+            (symbol, category, entry_price, now, quantity, paper_instrument_key, paper_option_label,
+             fallback_note, entry_strategy, quantity),
         ).fetchone()
         conn.commit()
 
@@ -1440,23 +1464,85 @@ def run_paper_trade_check() -> dict:
                 continue
 
             candles = fetch_5min_candles(instrument_key, access_token)
-            exited, exit_price = check_exit(trade["direction"], candles)
             last_price = candles[-1][3] if candles else None
+            entry_price = trade["entry_price"]
+            strategy = trade["strategy"] or "EMA"
 
+            exited = False
+            exit_price = None
+            exit_reason = None
+            partial = None  # set if Target-1 books this pass, without fully closing
+
+            if strategy == "TARGETS" and last_price is not None and entry_price:
+                pct_change = (last_price - entry_price) / entry_price * 100
+                if trade["target1_hit_time"] is None:
+                    if pct_change >= 2.0:
+                        original_qty = trade["original_quantity"] or trade["quantity"] or 1
+                        half_qty = max(1, original_qty // 2)
+                        remaining_qty = max(0, original_qty - half_qty)
+                        partial = {
+                            "exit_price": last_price,
+                            "qty": half_qty,
+                            "pnl": round((last_price - entry_price) * half_qty, 2),
+                            "remaining_qty": remaining_qty,
+                        }
+                    else:
+                        # Below Target-1 - the 5-EMA rule is the only thing
+                        # protecting the downside so far.
+                        exited, exit_price = check_exit("Buy", candles)
+                        if exited:
+                            exit_reason = "5-EMA exit (before Target-1)"
+                else:
+                    # Target-1 already booked - the stop moves to breakeven
+                    # for the remaining half (5-EMA no longer applies), and
+                    # Target-2 takes the rest.
+                    if pct_change >= 4.0:
+                        exited, exit_price = True, last_price
+                        exit_reason = "Target-2 (4%)"
+                    elif last_price <= entry_price:
+                        exited, exit_price = True, last_price
+                        exit_reason = "Breakeven stop after Target-1"
+            else:
+                # Both Buy and Sell alerts result in BUYING an option (Call
+                # or Put respectively) - the position is always long the
+                # premium, so the exit rule always uses the "Buy" (long)
+                # logic here, regardless of trade["direction"] (which only
+                # reflects which alert category triggered entry, not the
+                # position's own side).
+                exited, exit_price = check_exit("Buy", candles)
+                if exited:
+                    exit_reason = "5-EMA exit rule"
+
+            # Partial exits don't touch the live position - live-order
+            # support for partial (multi-leg) exits isn't built yet, so
+            # for now the live leg only closes on the FINAL full exit.
             if exited:
                 live_exit_order_id, live_exit_error = _close_live_position_if_any(trade, access_token)
 
             with get_db() as conn:
-                if exited:
-                    entry_price = trade["entry_price"]
+                if partial:
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET target1_hit_time = ?, target1_exit_price = ?, target1_qty = ?,
+                            target1_pnl = ?, quantity = ?, last_checked_price = ?,
+                            last_checked_time = ?, last_error = NULL
+                        WHERE id = ?
+                        """,
+                        (now, partial["exit_price"], partial["qty"], partial["pnl"],
+                         partial["remaining_qty"], last_price, now, trade["id"]),
+                    )
+                elif exited:
                     qty = trade["quantity"] or 1
-                    if trade["direction"] == "Buy":
-                        pnl = (exit_price - entry_price) * qty
-                    else:
-                        pnl = (entry_price - exit_price) * qty
-                    pnl = round(pnl, 2)
-                    capital_used = entry_price * qty
-                    pnl_pct = round((pnl / capital_used) * 100, 2) if capital_used else 0
+                    # Always a long option position (Call or Put bought,
+                    # never written) - profit is always exit minus entry,
+                    # regardless of alert direction. Combines this final
+                    # leg with whatever Target-1 already booked, if any.
+                    leg_pnl = round((exit_price - entry_price) * qty, 2)
+                    total_pnl = round(leg_pnl + (trade["target1_pnl"] or 0), 2)
+                    original_qty = trade["original_quantity"] or qty
+                    capital_used = entry_price * original_qty
+                    pnl_pct = round((total_pnl / capital_used) * 100, 2) if capital_used else 0
                     conn.execute(
                         """
                         UPDATE paper_trades
@@ -1469,7 +1555,7 @@ def run_paper_trade_check() -> dict:
                         WHERE id = ?
                         """,
                         (
-                            exit_price, now, pnl, pnl_pct, "5-EMA exit rule", last_price, now,
+                            exit_price, now, total_pnl, pnl_pct, exit_reason, last_price, now,
                             live_exit_order_id,
                             live_exit_order_id is not None,
                             live_exit_error,
@@ -1675,10 +1761,10 @@ def attach_unrealized_pnl(open_trades: list[dict]) -> None:
             t["unrealized_pnl"] = None
             t["unrealized_pnl_pct"] = None
             continue
-        if t["direction"] == "Buy":
-            pnl = (last_price - entry) * qty
-        else:
-            pnl = (entry - last_price) * qty
+        # Always a long option position (Call or Put bought, never
+        # written) - profit is always current price minus entry,
+        # regardless of alert direction.
+        pnl = (last_price - entry) * qty
         t["unrealized_pnl"] = round(pnl, 2)
         t["unrealized_pnl_pct"] = round((pnl / capital_used) * 100, 2) if capital_used else 0
 
@@ -1718,6 +1804,7 @@ def paper_trading():
     attach_running_balance(closed_trades, capital)
     current_capital = get_current_capital()
     live_trading_enabled = get_live_trading_enabled()
+    exit_strategy = get_exit_strategy()
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     live_available_funds = None
@@ -1736,6 +1823,7 @@ def paper_trading():
         capital=capital,
         current_capital=round(current_capital, 2),
         live_trading_enabled=live_trading_enabled,
+        exit_strategy=exit_strategy,
         live_open=live_stats["live_open"],
         live_closed=live_stats["live_closed"],
         live_pnl=live_stats["live_pnl"],
@@ -1771,6 +1859,7 @@ def paper_trading_data():
         "closed": closed_trades,
         "current_capital": round(get_current_capital(), 2),
         "live_trading_enabled": get_live_trading_enabled(),
+        "exit_strategy": get_exit_strategy(),
         "live_open": live_stats["live_open"],
         "live_closed": live_stats["live_closed"],
         "live_pnl": live_stats["live_pnl"],
@@ -1810,6 +1899,20 @@ def paper_trading_live_toggle():
     enabled = bool(data.get("enabled"))
     set_setting("live_trading_enabled", "true" if enabled else "false")
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
+
+
+@app.route("/api/paper-trading/strategy-toggle", methods=["POST"])
+def paper_trading_strategy_toggle():
+    """Switches which exit strategy the NEXT new trade uses. Trades already
+    open keep whatever strategy was active when they opened (stored per
+    trade), so switching mid-day never changes the rules for a position
+    already in flight."""
+    data = request.get_json(silent=True) or {}
+    strategy = data.get("strategy")
+    if strategy not in ("EMA", "TARGETS"):
+        return jsonify({"status": "error", "message": "strategy must be 'EMA' or 'TARGETS'"}), 400
+    set_setting("exit_strategy", strategy)
+    return jsonify({"status": "ok", "exit_strategy": strategy})
 
 
 @app.route("/api/paper-trading/reset", methods=["POST"])
@@ -1854,12 +1957,13 @@ def paper_trading_manual_exit(trade_id):
 
     entry_price = trade["entry_price"]
     qty = trade["quantity"] or 1
-    if trade["direction"] == "Buy":
-        pnl = (exit_price - entry_price) * qty
-    else:
-        pnl = (entry_price - exit_price) * qty
-    pnl = round(pnl, 2)
-    capital_used = entry_price * qty
+    # Always a long option position (Call or Put bought, never written) -
+    # profit is always exit minus entry, regardless of alert direction.
+    # Combines this leg with whatever Target-1 already booked, if any.
+    leg_pnl = round((exit_price - entry_price) * qty, 2)
+    pnl = round(leg_pnl + (trade["target1_pnl"] or 0), 2)
+    original_qty = trade["original_quantity"] or qty
+    capital_used = entry_price * original_qty
     pnl_pct = round((pnl / capital_used) * 100, 2) if capital_used else 0
     now = datetime.utcnow().isoformat()
 
