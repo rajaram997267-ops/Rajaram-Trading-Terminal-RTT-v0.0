@@ -491,6 +491,43 @@ def get_exit_strategy() -> str:
     return get_setting("exit_strategy", "EMA")
 
 
+def get_sector_filter_enabled() -> bool:
+    """Off by default - when on, an alert only opens a trade if its sector
+    is currently among the top/bottom N performing sectors (Buy needs a
+    top-performing sector, Sell needs a bottom-performing one)."""
+    return get_setting("sector_filter_enabled", "false") == "true"
+
+
+def get_sector_filter_top_n() -> int:
+    try:
+        return int(get_setting("sector_filter_top_n", "5"))
+    except (TypeError, ValueError):
+        return 5
+
+
+def sector_qualifies(symbol: str, category: str, access_token: str | None) -> bool:
+    """True if this alert's sector currently ranks strongly enough to take
+    the trade: a Buy alert needs its sector in the top N by % change, a
+    Sell alert needs its sector in the bottom N (most negative). Returns
+    False (skip the alert) if sector performance data isn't available yet
+    or ranks aren't computable - never opens a trade blind when the filter
+    is on but the data isn't ready."""
+    if not access_token:
+        return False
+    perf = get_sector_performance_cached(access_token)
+    if not perf:
+        return False
+    sector = get_sector(symbol)
+    ranked = sorted(perf.items(), key=lambda kv: kv[1]["pct_change"], reverse=True)
+    top_n = get_sector_filter_top_n()
+    top_sectors = {name for name, _ in ranked[:top_n]}
+    bottom_sectors = {name for name, _ in ranked[-top_n:]}
+    if category == "Buy":
+        return sector in top_sectors
+    else:
+        return sector in bottom_sectors
+
+
 def get_setting(key: str, default: str | None = None) -> str | None:
     with get_db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
@@ -624,6 +661,14 @@ def create_paper_trades_for_batch(data: dict) -> None:
     # just silently does nothing.
     opt_type = "CE" if category == "Buy" else "PE"
     access_token = get_setting("upstox_access_token")
+
+    # Optional sector-momentum filter: only take this alert if its sector
+    # currently ranks strongly enough (Buy needs a top-N sector, Sell needs
+    # a bottom-N one). Off by default; when on, a non-qualifying alert is
+    # skipped entirely - no paper trade opens, next alert gets a chance.
+    if get_sector_filter_enabled() and not sector_qualifies(symbol, category, access_token):
+        return
+
     option = get_atm_option(symbol, opt_type, price_val) if access_token else None
     premium = get_ltp(option["instrument_key"], access_token) if option else None
 
@@ -1805,6 +1850,8 @@ def paper_trading():
     current_capital = get_current_capital()
     live_trading_enabled = get_live_trading_enabled()
     exit_strategy = get_exit_strategy()
+    sector_filter_enabled = get_sector_filter_enabled()
+    sector_filter_top_n = get_sector_filter_top_n()
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     live_available_funds = None
@@ -1824,6 +1871,8 @@ def paper_trading():
         current_capital=round(current_capital, 2),
         live_trading_enabled=live_trading_enabled,
         exit_strategy=exit_strategy,
+        sector_filter_enabled=sector_filter_enabled,
+        sector_filter_top_n=sector_filter_top_n,
         live_open=live_stats["live_open"],
         live_closed=live_stats["live_closed"],
         live_pnl=live_stats["live_pnl"],
@@ -1913,6 +1962,28 @@ def paper_trading_strategy_toggle():
         return jsonify({"status": "error", "message": "strategy must be 'EMA' or 'TARGETS'"}), 400
     set_setting("exit_strategy", strategy)
     return jsonify({"status": "ok", "exit_strategy": strategy})
+
+
+@app.route("/api/paper-trading/sector-filter-toggle", methods=["POST"])
+def paper_trading_sector_filter_toggle():
+    """Turns the sector-momentum filter on/off and sets the top-N cutoff.
+    When on, an alert only opens a trade if its sector currently ranks
+    among the top N (Buy) or bottom N (Sell) by today's % change."""
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    top_n = data.get("top_n")
+    set_setting("sector_filter_enabled", "true" if enabled else "false")
+    if top_n is not None:
+        try:
+            top_n = max(1, int(top_n))
+            set_setting("sector_filter_top_n", str(top_n))
+        except (TypeError, ValueError):
+            pass
+    return jsonify({
+        "status": "ok",
+        "sector_filter_enabled": enabled,
+        "sector_filter_top_n": get_sector_filter_top_n(),
+    })
 
 
 @app.route("/api/paper-trading/reset", methods=["POST"])

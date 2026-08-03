@@ -227,6 +227,19 @@
     </span>
   </div>
 
+  <div class="settings-box">
+    <label class="switch">
+      <input type="checkbox" id="sectorFilterToggle" {% if sector_filter_enabled %}checked{% endif %} onchange="toggleSectorFilter()">
+      <span class="slider"></span>
+    </label>
+    <span>Sector momentum filter</span>
+    <span>Top</span>
+    <input type="text" id="sectorFilterTopN" value="{{ sector_filter_top_n }}" style="width: 40px; text-align: center;" onchange="toggleSectorFilter()">
+    <span class="token-status" id="sectorFilterStatus">
+      {% if sector_filter_enabled %}ON - Buy needs a top-{{ sector_filter_top_n }} sector, Sell needs a bottom-{{ sector_filter_top_n }} sector; everything else is skipped{% else %}OFF - every alert can open a trade, regardless of its sector's performance{% endif %}
+    </span>
+  </div>
+
   <div class="stats">
     <div class="stat-card">
       <div class="label">Current capital (Rs)</div>
@@ -396,6 +409,29 @@
         statusEl.textContent = result.exit_strategy === "TARGETS"
           ? "Books half the qty at +2% (breakeven stop after), rest at +4%. 5-EMA only protects before Target-1."
           : "Full quantity exits on the 5-EMA reversal rule, same as before.";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function toggleSectorFilter() {
+      const checkbox = document.getElementById("sectorFilterToggle");
+      const topNInput = document.getElementById("sectorFilterTopN");
+      const statusEl = document.getElementById("sectorFilterStatus");
+      const enabled = checkbox.checked;
+      const topN = parseInt(topNInput.value, 10) || 5;
+      try {
+        const res = await fetch("/api/paper-trading/sector-filter-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled, top_n: topN }),
+        });
+        const result = await res.json();
+        topNInput.value = result.sector_filter_top_n;
+        statusEl.textContent = result.sector_filter_enabled
+          ? `ON - Buy needs a top-${result.sector_filter_top_n} sector, Sell needs a bottom-${result.sector_filter_top_n} sector; everything else is skipped`
+          : "OFF - every alert can open a trade, regardless of its sector's performance";
       } catch (err) {
         statusEl.textContent = "Failed to update - see console";
         console.error(err);
