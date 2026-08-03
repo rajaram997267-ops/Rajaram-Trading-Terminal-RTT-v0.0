@@ -216,6 +216,17 @@
     </span>
   </div>
 
+  <div class="settings-box">
+    <span>Exit strategy for new trades:</span>
+    <select id="strategySelect" onchange="setStrategy(this.value)">
+      <option value="EMA" {% if exit_strategy == "EMA" %}selected{% endif %}>5-EMA only</option>
+      <option value="TARGETS" {% if exit_strategy == "TARGETS" %}selected{% endif %}>2% / 4% targets (half + half)</option>
+    </select>
+    <span class="token-status" id="strategyStatus">
+      {% if exit_strategy == "TARGETS" %}Books half the qty at +2% (breakeven stop after), rest at +4%. 5-EMA only protects before Target-1.{% else %}Full quantity exits on the 5-EMA reversal rule, same as before.{% endif %}
+    </span>
+  </div>
+
   <div class="stats">
     <div class="stat-card">
       <div class="label">Current capital (Rs)</div>
@@ -270,7 +281,7 @@
       <tr>
         <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
-        <td>{{ t.quantity }}</td>
+        <td>{{ t.quantity }}{% if t.target1_hit_time %}<div class="sub" style="font-size:11px; color: var(--gold);">T1: {{ t.target1_qty }} @ {{ t.target1_exit_price }}</div>{% endif %}</td>
         <td>{{ t.entry_price }}</td>
         <td>{{ t.entry_time[:19] }}</td>
         <td>{{ t.last_checked_price or "-" }}</td>
@@ -373,6 +384,24 @@
       }
     }
 
+    async function setStrategy(strategy) {
+      const statusEl = document.getElementById("strategyStatus");
+      try {
+        const res = await fetch("/api/paper-trading/strategy-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ strategy }),
+        });
+        const result = await res.json();
+        statusEl.textContent = result.exit_strategy === "TARGETS"
+          ? "Books half the qty at +2% (breakeven stop after), rest at +4%. 5-EMA only protects before Target-1."
+          : "Full quantity exits on the 5-EMA reversal rule, same as before.";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
     async function saveCapital() {
       const amount = parseFloat(document.getElementById("capitalInput").value);
       const statusEl = document.getElementById("capitalStatus");
@@ -459,7 +488,7 @@
         <tr>
           <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
-          <td>${t.quantity}</td>
+          <td>${t.quantity}${t.target1_hit_time ? `<div class="sub" style="font-size:11px; color: var(--gold);">T1: ${t.target1_qty} @ ${t.target1_exit_price}</div>` : ""}</td>
           <td>${t.entry_price}</td>
           <td>${(t.entry_time || "").slice(0, 19)}</td>
           <td>${t.last_checked_price || "-"}</td>
