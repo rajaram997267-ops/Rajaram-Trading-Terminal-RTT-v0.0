@@ -1397,6 +1397,26 @@ def get_ltp(instrument_key: str, access_token: str) -> float | None:
         return None
 
 
+def _get_order_proxy_opener():
+    """Builds a urllib opener routed through the static-IP proxy (StaticIP.in
+    or similar), used ONLY for order placement since Upstox's static-IP
+    requirement applies to order APIs, not quotes/funds/candles. Credentials
+    come from environment variables (set in Render's dashboard) - NEVER
+    hardcoded here, since this repo is public. Returns None if the env vars
+    aren't set, so order placement falls back to a direct connection
+    (which Upstox will then reject with a static-IP error, surfaced as a
+    normal order failure - not a crash) until they're configured."""
+    host = os.environ.get("STATICIP_HOST")
+    port = os.environ.get("STATICIP_PORT")
+    user = os.environ.get("STATICIP_USER")
+    password = os.environ.get("STATICIP_PASS")
+    if not all([host, port, user, password]):
+        return None
+    proxy_url = f"https://{urllib.parse.quote(user)}:{urllib.parse.quote(password)}@{host}:{port}"
+    proxy_handler = urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    return urllib.request.build_opener(proxy_handler)
+
+
 def place_live_order(instrument_key: str, transaction_type: str, quantity: int, access_token: str) -> dict:
     """Places a real order on Upstox: CNC (Delivery) product, Market order,
     DAY validity - matching the decisions for this app (live trading only
@@ -1435,7 +1455,9 @@ def place_live_order(instrument_key: str, transaction_type: str, quantity: int, 
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        opener = _get_order_proxy_opener()
+        opener_fn = opener.open if opener else urllib.request.urlopen
+        with opener_fn(req, timeout=15) as resp:
             payload = json.loads(resp.read().decode())
         order_ids = (payload.get("data") or {}).get("order_ids") or []
         order_id = order_ids[0] if order_ids else None
@@ -2078,6 +2100,28 @@ def debug_instruments():
     and fixed precisely. Includes the option-chain parsing results too."""
     _load_instrument_master()
     return jsonify({"equities": _instrument_debug, "options": _option_debug})
+
+
+@app.route("/api/paper-trading/debug-proxy-ip")
+def debug_proxy_ip():
+    """Diagnostic-only: confirms the static-IP proxy is configured and
+    check what outbound IP it actually produces, before trusting it with a
+    real order. Hits a plain IP-echo service (not Upstox) through the same
+    proxy path place_live_order() uses, so this is a safe, order-free way
+    to verify the proxy itself works end-to-end."""
+    opener = _get_order_proxy_opener()
+    if not opener:
+        return jsonify({
+            "ok": False,
+            "error": "Proxy env vars not set (need STATICIP_HOST, STATICIP_PORT, STATICIP_USER, STATICIP_PASS on Render)",
+        })
+    try:
+        req = urllib.request.Request("https://api.ipify.org?format=json", headers={"User-Agent": BROWSER_USER_AGENT})
+        with opener.open(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode())
+        return jsonify({"ok": True, "outbound_ip_seen": payload.get("ip")})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 
 @app.route("/api/paper-trading/debug-atm")
