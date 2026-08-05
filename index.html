@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Chartink Alerts Dashboard</title>
+  <title>Rajaram Trading Terminal - RTT v0.0</title>
   <style>
     :root {
       --bg: #0b0e14;
@@ -219,6 +219,23 @@
       height: 1px;
       background: var(--border);
     }
+    .tabbar {
+      display: flex;
+      gap: 4px;
+      margin: 20px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .tabbar a {
+      padding: 10px 18px;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+    }
+    .tabbar a.active { color: var(--text); border-bottom-color: var(--green); }
+    .tabbar a:hover { color: var(--text); }
     .layout {
       display: flex;
       align-items: flex-start;
@@ -326,8 +343,8 @@
 <body>
   <div class="topbar">
     <div>
-      <h2><span class="pulse"></span>Chartink Alerts Dashboard</h2>
-      <div class="sub">Webhook endpoint: <code>/webhook/chartink</code> &middot; auto-refreshes every 5s &middot; <a href="/paper-trading" style="color: var(--green);">Paper Trading &rarr;</a></div>
+      <h2><span class="pulse"></span>Rajaram Trading Terminal <span style="color: var(--muted); font-weight: 400; font-size: 14px;">RTT v0.0</span></h2>
+      <div class="sub">Webhook endpoint: <code>/webhook/chartink</code> &middot; auto-refreshes every 5s</div>
     </div>
     <div class="controls">
       <select id="dateSelect" onchange="location.href = '/?date=' + this.value;">
@@ -345,6 +362,13 @@
         <button type="submit">Clear All</button>
       </form>
     </div>
+  </div>
+
+  <div class="tabbar">
+    <a href="/" class="{% if active_tab == 'dashboard' %}active{% endif %}">Dashboard</a>
+    <a href="/paper-trading" class="{% if active_tab == 'paper' %}active{% endif %}">Paper Trading</a>
+    <a href="/live-trading" class="{% if active_tab == 'live' %}active{% endif %}">Live Trading</a>
+    <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
   </div>
 
   <div class="layout">

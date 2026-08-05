@@ -1737,6 +1737,7 @@ def index():
 
         html = render_template(
             "index.html",
+            active_tab="dashboard",
             alerts_count=merged_count,
             grouped=grouped,
             all_sectors=all_sectors,
@@ -1882,6 +1883,7 @@ def paper_trading():
 
     html = render_template(
         "paper_trading.html",
+        active_tab="paper",
         open_trades=open_trades,
         closed_trades=closed_trades,
         total_pnl=round(total_pnl, 2),
@@ -1895,6 +1897,65 @@ def paper_trading():
         exit_strategy=exit_strategy,
         sector_filter_enabled=sector_filter_enabled,
         sector_filter_top_n=sector_filter_top_n,
+        live_open=live_stats["live_open"],
+        live_closed=live_stats["live_closed"],
+        live_pnl=live_stats["live_pnl"],
+        live_available_funds=live_available_funds,
+    )
+    body = html.encode("utf-8")
+    response = make_response(body)
+    response.headers["Content-Type"] = "text/html; charset=utf-8"
+    response.headers["Content-Length"] = str(len(body))
+    return response
+
+
+@app.route("/settings")
+def settings_page():
+    token_saved = bool(get_setting("upstox_access_token"))
+    capital = get_capital()
+    html = render_template(
+        "settings.html",
+        active_tab="settings",
+        token_saved=token_saved,
+        capital=capital,
+        live_trading_enabled=get_live_trading_enabled(),
+        exit_strategy=get_exit_strategy(),
+        sector_filter_enabled=get_sector_filter_enabled(),
+        sector_filter_top_n=get_sector_filter_top_n(),
+    )
+    body = html.encode("utf-8")
+    response = make_response(body)
+    response.headers["Content-Type"] = "text/html; charset=utf-8"
+    response.headers["Content-Length"] = str(len(body))
+    return response
+
+
+@app.route("/live-trading")
+def live_trading_page():
+    with get_db() as conn:
+        open_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE status = 'OPEN' AND live_status != 'NONE' ORDER BY id DESC"
+        ).fetchall()
+        closed_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE status = 'CLOSED' AND live_status != 'NONE' ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+
+    open_trades = [dict(t) for t in open_trades]
+    closed_trades = [dict(t) for t in closed_trades]
+    attach_unrealized_pnl(open_trades)
+
+    live_stats = compute_live_stats(open_trades, closed_trades)
+    token_saved = bool(get_setting("upstox_access_token"))
+    live_available_funds = None
+    if token_saved:
+        live_available_funds = get_upstox_available_funds_for_display(get_setting("upstox_access_token"))
+
+    html = render_template(
+        "live_trading.html",
+        active_tab="live",
+        open_trades=open_trades,
+        closed_trades=closed_trades,
+        live_trading_enabled=get_live_trading_enabled(),
         live_open=live_stats["live_open"],
         live_closed=live_stats["live_closed"],
         live_pnl=live_stats["live_pnl"],

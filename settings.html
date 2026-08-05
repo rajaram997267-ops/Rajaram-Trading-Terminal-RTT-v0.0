@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - Settings</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: #131722;
+      --border: #1e222d;
+      --text: #e6e9f0;
+      --muted: #6b7280;
+      --green: #00c896;
+      --gold: #ffb800;
+      --red: #ff5370;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+    }
+    a { color: var(--green); text-decoration: none; }
+    h2 { margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 13px; }
+    .tabbar {
+      display: flex;
+      gap: 4px;
+      margin: 20px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .tabbar a {
+      padding: 10px 18px;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+    }
+    .tabbar a.active { color: var(--text); border-bottom-color: var(--green); }
+    .tabbar a:hover { color: var(--text); }
+    .settings-box {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .settings-box input[type=text] {
+      flex: 1;
+      min-width: 240px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-family: monospace;
+    }
+    button {
+      background: var(--green);
+      color: #06110d;
+      border: none;
+      padding: 9px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    button.secondary {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    button:hover { opacity: 0.9; }
+    select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .token-status { font-size: 12px; color: var(--muted); }
+    .token-status.saved { color: var(--green); }
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 40px;
+      height: 22px;
+      flex: none;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: var(--border);
+      transition: .2s;
+      border-radius: 22px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 16px; width: 16px;
+      left: 3px; bottom: 3px;
+      background-color: var(--text);
+      transition: .2s;
+      border-radius: 50%;
+    }
+    input:checked + .slider { background-color: var(--red); }
+    input:checked + .slider:before { transform: translateX(18px); }
+  </style>
+</head>
+<body>
+  <div>
+    <h2>Settings <span style="color: var(--muted); font-weight: 400; font-size: 14px;">RTT v0.0</span></h2>
+    <div class="sub">Token, capital, live trading, exit strategy, and sector filter all live here</div>
+  </div>
+
+  <div class="tabbar">
+    <a href="/" class="{% if active_tab == 'dashboard' %}active{% endif %}">Dashboard</a>
+    <a href="/paper-trading" class="{% if active_tab == 'paper' %}active{% endif %}">Paper Trading</a>
+    <a href="/live-trading" class="{% if active_tab == 'live' %}active{% endif %}">Live Trading</a>
+    <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
+  </div>
+
+  <div class="settings-box">
+    <span>Upstox access token:</span>
+    <input type="text" id="tokenInput" placeholder="Paste today's Upstox access token here">
+    <button class="secondary" onclick="saveToken()">Save token</button>
+    <span class="token-status {% if token_saved %}saved{% endif %}" id="tokenStatus">
+      {% if token_saved %}Token saved for today{% else %}No token saved yet{% endif %}
+    </span>
+  </div>
+
+  <div class="settings-box">
+    <span>Starting capital (Rs):</span>
+    <input type="text" id="capitalInput" style="max-width: 160px; flex: none;" value="{{ capital|int }}">
+    <button class="secondary" onclick="saveCapital()">Save amount</button>
+    <span class="token-status" id="capitalStatus">Only used to seed the account - once trades start closing, the balance compounds automatically</span>
+    <button style="background: var(--red); margin-left: auto;" onclick="resetPaperTrading()">Reset paper trading</button>
+  </div>
+
+  <div class="settings-box" style="border-color: {% if live_trading_enabled %}var(--red){% else %}var(--border){% endif %};">
+    <label class="switch">
+      <input type="checkbox" id="liveToggle" {% if live_trading_enabled %}checked{% endif %} onchange="toggleLiveTrading()">
+      <span class="slider"></span>
+    </label>
+    <span>Live trading (real Upstox orders)</span>
+    <span class="token-status" id="liveStatus" style="{% if live_trading_enabled %}color: var(--red);{% endif %}">
+      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds{% else %}OFF - paper trading only{% endif %}
+    </span>
+  </div>
+
+  <div class="settings-box">
+    <span>Exit strategy for new trades:</span>
+    <select id="strategySelect" onchange="setStrategy(this.value)">
+      <option value="EMA" {% if exit_strategy == "EMA" %}selected{% endif %}>5-EMA only</option>
+      <option value="TARGETS" {% if exit_strategy == "TARGETS" %}selected{% endif %}>2% / 4% targets (half + half)</option>
+    </select>
+    <span class="token-status" id="strategyStatus">
+      {% if exit_strategy == "TARGETS" %}Books half the qty at +2% (breakeven stop after), rest at +4%. 5-EMA only protects before Target-1.{% else %}Full quantity exits on the 5-EMA reversal rule, same as before.{% endif %}
+    </span>
+  </div>
+
+  <div class="settings-box">
+    <label class="switch">
+      <input type="checkbox" id="sectorFilterToggle" {% if sector_filter_enabled %}checked{% endif %} onchange="toggleSectorFilter()">
+      <span class="slider"></span>
+    </label>
+    <span>Sector momentum filter</span>
+    <span>Top</span>
+    <input type="text" id="sectorFilterTopN" value="{{ sector_filter_top_n }}" style="width: 40px; text-align: center;" onchange="toggleSectorFilter()">
+    <span class="token-status" id="sectorFilterStatus">
+      {% if sector_filter_enabled %}ON - Buy needs a top-{{ sector_filter_top_n }} sector, Sell needs a bottom-{{ sector_filter_top_n }} sector; everything else is skipped{% else %}OFF - every alert can open a trade, regardless of its sector's performance{% endif %}
+    </span>
+  </div>
+
+  <script>
+    async function saveToken() {
+      const token = document.getElementById("tokenInput").value.trim();
+      if (!token) return;
+      const res = await fetch("/api/paper-trading/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ access_token: token }),
+      });
+      const statusEl = document.getElementById("tokenStatus");
+      if (res.ok) {
+        statusEl.textContent = "Token saved for today";
+        statusEl.classList.add("saved");
+        document.getElementById("tokenInput").value = "";
+      } else {
+        statusEl.textContent = "Failed to save token";
+        statusEl.classList.remove("saved");
+      }
+    }
+
+    async function toggleLiveTrading() {
+      const checkbox = document.getElementById("liveToggle");
+      const statusEl = document.getElementById("liveStatus");
+      const enabled = checkbox.checked;
+      if (enabled && !confirm(
+        "This turns ON live trading. The NEXT Buy alert will place a real " +
+        "ATM option order on Upstox (Call for Buy alerts, Put for Sell alerts), sized off your actual available funds. Continue?"
+      )) {
+        checkbox.checked = false;
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/live-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await res.json();
+        statusEl.textContent = result.live_trading_enabled
+          ? "ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds"
+          : "OFF - paper trading only";
+        statusEl.style.color = result.live_trading_enabled ? "var(--red)" : "";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        checkbox.checked = !enabled;
+        console.error(err);
+      }
+    }
+
+    async function setStrategy(strategy) {
+      const statusEl = document.getElementById("strategyStatus");
+      try {
+        const res = await fetch("/api/paper-trading/strategy-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ strategy }),
+        });
+        const result = await res.json();
+        statusEl.textContent = result.exit_strategy === "TARGETS"
+          ? "Books half the qty at +2% (breakeven stop after), rest at +4%. 5-EMA only protects before Target-1."
+          : "Full quantity exits on the 5-EMA reversal rule, same as before.";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function toggleSectorFilter() {
+      const checkbox = document.getElementById("sectorFilterToggle");
+      const topNInput = document.getElementById("sectorFilterTopN");
+      const statusEl = document.getElementById("sectorFilterStatus");
+      const enabled = checkbox.checked;
+      const topN = parseInt(topNInput.value, 10) || 5;
+      try {
+        const res = await fetch("/api/paper-trading/sector-filter-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled, top_n: topN }),
+        });
+        const result = await res.json();
+        topNInput.value = result.sector_filter_top_n;
+        statusEl.textContent = result.sector_filter_enabled
+          ? `ON - Buy needs a top-${result.sector_filter_top_n} sector, Sell needs a bottom-${result.sector_filter_top_n} sector; everything else is skipped`
+          : "OFF - every alert can open a trade, regardless of its sector's performance";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveCapital() {
+      const amount = parseFloat(document.getElementById("capitalInput").value);
+      const statusEl = document.getElementById("capitalStatus");
+      if (!amount || amount <= 0) {
+        statusEl.textContent = "Enter a valid amount greater than 0";
+        return;
+      }
+      const res = await fetch("/api/paper-trading/capital", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ capital: amount }),
+      });
+      if (res.ok) {
+        statusEl.textContent = `Saved - Rs ${amount} starting capital`;
+      } else {
+        statusEl.textContent = "Failed to save amount";
+      }
+    }
+
+    async function resetPaperTrading() {
+      if (!confirm("This deletes ALL paper trades (open and closed) and restarts from your starting capital. Continue?")) {
+        return;
+      }
+      const res = await fetch("/api/paper-trading/reset", { method: "POST" });
+      if (res.ok) {
+        location.reload();
+      } else {
+        alert("Reset failed - see console");
+      }
+    }
+  </script>
+</body>
+</html>

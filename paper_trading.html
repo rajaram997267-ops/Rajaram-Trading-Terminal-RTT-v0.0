@@ -34,6 +34,22 @@
     }
     h2 { margin: 0 0 4px; }
     .sub { color: var(--muted); font-size: 13px; }
+    .tabbar {
+      display: flex;
+      gap: 4px;
+      margin: 20px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .tabbar a {
+      padding: 10px 18px;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+    }
+    .tabbar a.active { color: var(--text); border-bottom-color: var(--green); }
+    .tabbar a:hover { color: var(--text); }
     .stats {
       display: flex;
       gap: 12px;
@@ -180,7 +196,7 @@
   <div class="topbar">
     <div>
       <h2>Paper Trading <span style="color: var(--muted); font-weight: 400; font-size: 14px;">RTT v0.0</span></h2>
-      <div class="sub"><a href="/">&larr; Back to alerts dashboard</a></div>
+      <div class="sub">Simulated trades - see Live Trading for real Upstox orders, Settings to configure</div>
     </div>
     <div class="controls">
       <button onclick="runCheckNow()">Check Exits Now</button>
@@ -188,56 +204,11 @@
     </div>
   </div>
 
-  <div class="settings-box">
-    <span>Upstox access token:</span>
-    <input type="text" id="tokenInput" placeholder="Paste today's Upstox access token here">
-    <button class="secondary" onclick="saveToken()">Save token</button>
-    <span class="token-status {% if token_saved %}saved{% endif %}" id="tokenStatus">
-      {% if token_saved %}Token saved for today{% else %}No token saved yet{% endif %}
-    </span>
-  </div>
-
-  <div class="settings-box">
-    <span>Starting capital (Rs):</span>
-    <input type="text" id="capitalInput" style="max-width: 160px; flex: none;" value="{{ capital|int }}">
-    <button class="secondary" onclick="saveCapital()">Save amount</button>
-    <span class="token-status" id="capitalStatus">Only used to seed the account - once trades start closing, the balance compounds automatically</span>
-    <button style="background: var(--red); margin-left: auto;" onclick="resetPaperTrading()">Reset paper trading</button>
-  </div>
-
-  <div class="settings-box" style="border-color: {% if live_trading_enabled %}var(--red){% else %}var(--border){% endif %};">
-    <label class="switch">
-      <input type="checkbox" id="liveToggle" {% if live_trading_enabled %}checked{% endif %} onchange="toggleLiveTrading()">
-      <span class="slider"></span>
-    </label>
-    <span>Live trading (real Upstox orders)</span>
-    <span class="token-status" id="liveStatus" style="{% if live_trading_enabled %}color: var(--red);{% endif %}">
-      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds{% else %}OFF - paper trading only{% endif %}
-    </span>
-  </div>
-
-  <div class="settings-box">
-    <span>Exit strategy for new trades:</span>
-    <select id="strategySelect" onchange="setStrategy(this.value)">
-      <option value="EMA" {% if exit_strategy == "EMA" %}selected{% endif %}>5-EMA only</option>
-      <option value="TARGETS" {% if exit_strategy == "TARGETS" %}selected{% endif %}>2% / 4% targets (half + half)</option>
-    </select>
-    <span class="token-status" id="strategyStatus">
-      {% if exit_strategy == "TARGETS" %}Books half the qty at +2% (breakeven stop after), rest at +4%. 5-EMA only protects before Target-1.{% else %}Full quantity exits on the 5-EMA reversal rule, same as before.{% endif %}
-    </span>
-  </div>
-
-  <div class="settings-box">
-    <label class="switch">
-      <input type="checkbox" id="sectorFilterToggle" {% if sector_filter_enabled %}checked{% endif %} onchange="toggleSectorFilter()">
-      <span class="slider"></span>
-    </label>
-    <span>Sector momentum filter</span>
-    <span>Top</span>
-    <input type="text" id="sectorFilterTopN" value="{{ sector_filter_top_n }}" style="width: 40px; text-align: center;" onchange="toggleSectorFilter()">
-    <span class="token-status" id="sectorFilterStatus">
-      {% if sector_filter_enabled %}ON - Buy needs a top-{{ sector_filter_top_n }} sector, Sell needs a bottom-{{ sector_filter_top_n }} sector; everything else is skipped{% else %}OFF - every alert can open a trade, regardless of its sector's performance{% endif %}
-    </span>
+  <div class="tabbar">
+    <a href="/" class="{% if active_tab == 'dashboard' %}active{% endif %}">Dashboard</a>
+    <a href="/paper-trading" class="{% if active_tab == 'paper' %}active{% endif %}">Paper Trading</a>
+    <a href="/live-trading" class="{% if active_tab == 'live' %}active{% endif %}">Live Trading</a>
+    <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
   </div>
 
   <div class="stats">
@@ -263,32 +234,13 @@
     </div>
   </div>
 
-  <div class="stats">
-    <div class="stat-card" style="border-color: var(--red);">
-      <div class="label">Upstox available funds (Rs)</div>
-      <div class="value" id="statLiveFunds">{{ live_available_funds if live_available_funds is not none else "-" }}</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Live open</div>
-      <div class="value" id="statLiveOpen">{{ live_open }}</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Live closed</div>
-      <div class="value" id="statLiveClosed">{{ live_closed }}</div>
-    </div>
-    <div class="stat-card">
-      <div class="label">Live P&amp;L (Rs)</div>
-      <div class="value {% if live_pnl > 0 %}pos{% elif live_pnl < 0 %}neg{% endif %}" id="statLivePnl">{{ live_pnl }}</div>
-    </div>
-  </div>
-
   <h3 class="section-title">Open trade <span style="font-size:11px; color: var(--muted); font-weight: normal;">(only one at a time - new alerts are ignored until this exits)</span></h3>
   <div id="openTradesContainer">
     {% if open_trades %}
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th>Live</th><th></th>
+        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th>
       </tr>
       {% for t in open_trades %}
       <tr>
@@ -302,11 +254,6 @@
         <td class="{% if t.unrealized_pnl_pct and t.unrealized_pnl_pct > 0 %}pnl-pos{% elif t.unrealized_pnl_pct and t.unrealized_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl_pct if t.unrealized_pnl_pct is not none else "-" }}{% if t.unrealized_pnl_pct is not none %}%{% endif %}</td>
         <td>{{ (t.last_checked_time or "")[:19] }}</td>
         <td class="error-note">{{ t.last_error or "" }}</td>
-        <td>
-          <span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span>
-          {% if t.live_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.live_option_label }}">{{ t.live_option_label }} &middot; {{ t.live_quantity }} qty</div>{% elif t.live_quantity %}<div class="sub" style="font-size:11px;">{{ t.live_quantity }} qty</div>{% endif %}
-          {% if t.live_error %}<div class="error-note" title="{{ t.live_error }}">{{ t.live_error[:30] }}{% if t.live_error|length > 30 %}...{% endif %}</div>{% endif %}
-        </td>
         <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit({{ t.id }})">Exit Now</button></td>
       </tr>
       {% endfor %}
@@ -322,7 +269,7 @@
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Exit</th>
-        <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th><th>Live</th>
+        <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th>
       </tr>
       {% for t in closed_trades %}
       <tr>
@@ -336,10 +283,6 @@
         <td>{{ t.balance_after }}</td>
         <td>{{ t.exit_reason }}</td>
         <td>{{ (t.exit_time or "")[:19] }}</td>
-        <td>
-          <span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span>
-          {% if t.live_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.live_option_label }}">{{ t.live_option_label }} &middot; {{ t.live_quantity }} qty</div>{% elif t.live_quantity %}<div class="sub" style="font-size:11px;">{{ t.live_quantity }} qty</div>{% endif %}
-        </td>
       </tr>
       {% endfor %}
     </table>
@@ -349,126 +292,6 @@
   </div>
 
   <script>
-    async function saveToken() {
-      const token = document.getElementById("tokenInput").value.trim();
-      if (!token) return;
-      const res = await fetch("/api/paper-trading/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ access_token: token }),
-      });
-      const statusEl = document.getElementById("tokenStatus");
-      if (res.ok) {
-        statusEl.textContent = "Token saved for today";
-        statusEl.classList.add("saved");
-        document.getElementById("tokenInput").value = "";
-      } else {
-        statusEl.textContent = "Failed to save token";
-        statusEl.classList.remove("saved");
-      }
-    }
-
-    async function toggleLiveTrading() {
-      const checkbox = document.getElementById("liveToggle");
-      const statusEl = document.getElementById("liveStatus");
-      const enabled = checkbox.checked;
-      if (enabled && !confirm(
-        "This turns ON live trading. The NEXT Buy alert will place a real " +
-        "ATM option order on Upstox (Call for Buy alerts, Put for Sell alerts), sized off your actual available funds. Continue?"
-      )) {
-        checkbox.checked = false;
-        return;
-      }
-      try {
-        const res = await fetch("/api/paper-trading/live-toggle", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled }),
-        });
-        const result = await res.json();
-        statusEl.textContent = result.live_trading_enabled
-          ? "ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds"
-          : "OFF - paper trading only";
-        statusEl.style.color = result.live_trading_enabled ? "var(--red)" : "";
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        checkbox.checked = !enabled;
-        console.error(err);
-      }
-    }
-
-    async function setStrategy(strategy) {
-      const statusEl = document.getElementById("strategyStatus");
-      try {
-        const res = await fetch("/api/paper-trading/strategy-toggle", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ strategy }),
-        });
-        const result = await res.json();
-        statusEl.textContent = result.exit_strategy === "TARGETS"
-          ? "Books half the qty at +2% (breakeven stop after), rest at +4%. 5-EMA only protects before Target-1."
-          : "Full quantity exits on the 5-EMA reversal rule, same as before.";
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        console.error(err);
-      }
-    }
-
-    async function toggleSectorFilter() {
-      const checkbox = document.getElementById("sectorFilterToggle");
-      const topNInput = document.getElementById("sectorFilterTopN");
-      const statusEl = document.getElementById("sectorFilterStatus");
-      const enabled = checkbox.checked;
-      const topN = parseInt(topNInput.value, 10) || 5;
-      try {
-        const res = await fetch("/api/paper-trading/sector-filter-toggle", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled, top_n: topN }),
-        });
-        const result = await res.json();
-        topNInput.value = result.sector_filter_top_n;
-        statusEl.textContent = result.sector_filter_enabled
-          ? `ON - Buy needs a top-${result.sector_filter_top_n} sector, Sell needs a bottom-${result.sector_filter_top_n} sector; everything else is skipped`
-          : "OFF - every alert can open a trade, regardless of its sector's performance";
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        console.error(err);
-      }
-    }
-
-    async function saveCapital() {
-      const amount = parseFloat(document.getElementById("capitalInput").value);
-      const statusEl = document.getElementById("capitalStatus");
-      if (!amount || amount <= 0) {
-        statusEl.textContent = "Enter a valid amount greater than 0";
-        return;
-      }
-      const res = await fetch("/api/paper-trading/capital", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ capital: amount }),
-      });
-      if (res.ok) {
-        statusEl.textContent = `Saved - Rs ${amount} starting capital`;
-      } else {
-        statusEl.textContent = "Failed to save amount";
-      }
-    }
-
-    async function resetPaperTrading() {
-      if (!confirm("This deletes ALL paper trades (open and closed) and restarts from your starting capital. Continue?")) {
-        return;
-      }
-      const res = await fetch("/api/paper-trading/reset", { method: "POST" });
-      if (res.ok) {
-        location.reload();
-      } else {
-        alert("Reset failed - see console");
-      }
-    }
-
     async function runCheckNow() {
       const statusEl = document.getElementById("checkStatus");
       statusEl.textContent = "Checking...";
@@ -532,11 +355,6 @@
           <td class="${pnlClass}">${pctText}</td>
           <td>${(t.last_checked_time || "").slice(0, 19)}</td>
           <td class="error-note">${escapeHtml(t.last_error || "")}</td>
-          <td>
-            <span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span>
-            ${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)} &middot; ${t.live_quantity} qty</div>` : (t.live_quantity ? `<div class="sub" style="font-size:11px;">${t.live_quantity} qty</div>` : "")}
-            ${t.live_error ? `<div class="error-note" title="${escapeHtml(t.live_error)}">${escapeHtml(t.live_error.slice(0, 30))}${t.live_error.length > 30 ? "..." : ""}</div>` : ""}
-          </td>
           <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit(${t.id})">Exit Now</button></td>
         </tr>
       `;
@@ -544,7 +362,7 @@
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th>Live</th><th></th></tr>
+              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th></tr>
           ${rows}
         </table>
       `;
@@ -571,17 +389,13 @@
             <td>${t.balance_after}</td>
             <td>${escapeHtml(t.exit_reason || "")}</td>
             <td>${(t.exit_time || "").slice(0, 19)}</td>
-            <td>
-              <span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span>
-              ${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)} &middot; ${t.live_quantity} qty</div>` : (t.live_quantity ? `<div class="sub" style="font-size:11px;">${t.live_quantity} qty</div>` : "")}
-            </td>
           </tr>
         `;
       }).join("");
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Exit</th>
-              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th><th>Live</th></tr>
+              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th></tr>
           ${rows}
         </table>
       `;
@@ -606,23 +420,6 @@
         if (totalPnl < 0) pnlEl.classList.add("neg");
         if (data.current_capital !== undefined) {
           document.getElementById("statCurrentCapital").textContent = data.current_capital;
-        }
-        if (data.live_available_funds !== undefined) {
-          document.getElementById("statLiveFunds").textContent =
-            data.live_available_funds === null ? "-" : data.live_available_funds;
-        }
-        if (data.live_open !== undefined) {
-          document.getElementById("statLiveOpen").textContent = data.live_open;
-        }
-        if (data.live_closed !== undefined) {
-          document.getElementById("statLiveClosed").textContent = data.live_closed;
-        }
-        if (data.live_pnl !== undefined) {
-          const liveEl = document.getElementById("statLivePnl");
-          liveEl.textContent = data.live_pnl;
-          liveEl.classList.remove("pos", "neg");
-          if (data.live_pnl > 0) liveEl.classList.add("pos");
-          if (data.live_pnl < 0) liveEl.classList.add("neg");
         }
       } catch (err) {
         console.error("Refresh failed", err);
