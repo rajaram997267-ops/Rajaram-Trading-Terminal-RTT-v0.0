@@ -426,7 +426,8 @@ def init_db():
                 target1_hit_time TEXT,
                 target1_exit_price DOUBLE PRECISION,
                 target1_qty INTEGER,
-                target1_pnl DOUBLE PRECISION
+                target1_pnl DOUBLE PRECISION,
+                trail_high_pct DOUBLE PRECISION
             )
             """
         )
@@ -458,6 +459,7 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_exit_price DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_qty INTEGER",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_pnl DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS trail_high_pct DOUBLE PRECISION",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -1539,6 +1541,7 @@ def run_paper_trade_check() -> dict:
             exit_price = None
             exit_reason = None
             partial = None  # set if Target-1 books this pass, without fully closing
+            trail_update = None  # set if the trailing stop advances this pass, without closing
 
             if strategy == "TARGETS" and last_price is not None and entry_price:
                 pct_change = (last_price - entry_price) / entry_price * 100
@@ -1559,16 +1562,32 @@ def run_paper_trade_check() -> dict:
                         exited, exit_price = check_exit("Buy", candles)
                         if exited:
                             exit_reason = "5-EMA exit (before Target-1)"
-                else:
-                    # Target-1 already booked - the stop moves to breakeven
-                    # for the remaining half (5-EMA no longer applies), and
-                    # Target-2 takes the rest.
+                elif trade["trail_high_pct"] is None:
+                    # Target-1 booked, trailing not started yet - breakeven
+                    # protects the remaining half. At +4% (Target-2), instead
+                    # of selling everything, start trailing: the stop will
+                    # ratchet up in 0.5% steps as price climbs further,
+                    # always sitting one step behind the peak, so a strong
+                    # move (like a 20%+ option runner) isn't cut off at a
+                    # flat 4% - only the eventual pullback closes it.
                     if pct_change >= 4.0:
-                        exited, exit_price = True, last_price
-                        exit_reason = "Target-2 (4%)"
+                        trail_update = {"trail_high_pct": int(pct_change // 0.5) * 0.5}
                     elif last_price <= entry_price:
                         exited, exit_price = True, last_price
                         exit_reason = "Breakeven stop after Target-1"
+                else:
+                    # Trailing active - advance the stop on a new 0.5% peak,
+                    # otherwise exit if price has pulled back to one step
+                    # (0.5%) below the highest peak reached so far.
+                    trail_high = trade["trail_high_pct"]
+                    current_milestone = int(pct_change // 0.5) * 0.5
+                    if current_milestone > trail_high:
+                        trail_update = {"trail_high_pct": current_milestone}
+                    else:
+                        stop_pct = round(trail_high - 0.5, 2)
+                        if pct_change <= stop_pct:
+                            exited, exit_price = True, last_price
+                            exit_reason = f"Trailing stop ({stop_pct:g}%) after Target-2"
             else:
                 # Both Buy and Sell alerts result in BUYING an option (Call
                 # or Put respectively) - the position is always long the
@@ -1598,6 +1617,16 @@ def run_paper_trade_check() -> dict:
                         """,
                         (now, partial["exit_price"], partial["qty"], partial["pnl"],
                          partial["remaining_qty"], last_price, now, trade["id"]),
+                    )
+                elif trail_update:
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET trail_high_pct = ?, last_checked_price = ?,
+                            last_checked_time = ?, last_error = NULL
+                        WHERE id = ?
+                        """,
+                        (trail_update["trail_high_pct"], last_price, now, trade["id"]),
                     )
                 elif exited:
                     qty = trade["quantity"] or 1
