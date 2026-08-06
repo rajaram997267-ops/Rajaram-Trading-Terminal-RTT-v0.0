@@ -1848,6 +1848,27 @@ def attach_running_balance(closed_trades_desc: list[dict], starting_capital: flo
         t["balance_after"] = round(running, 2)
 
 
+def group_trades_by_date(trades: list[dict]) -> list[dict]:
+    """Groups closed trades by exit date into [{"date", "total_pnl",
+    "trades"}, ...], most recent date first - powers the collapsible
+    per-day view (like a trading diary). Only one trade is ever open at a
+    time in this app, so entry order and exit order are the same
+    sequence - the existing id-DESC ordering already groups cleanly into
+    contiguous same-day blocks without needing to re-sort."""
+    groups: list[dict] = []
+    current_date = None
+    for t in trades:
+        exit_date = (t.get("exit_time") or "")[:10] or "Unknown"
+        if exit_date != current_date:
+            groups.append({"date": exit_date, "total_pnl": 0.0, "trades": []})
+            current_date = exit_date
+        groups[-1]["trades"].append(t)
+        groups[-1]["total_pnl"] += t.get("pnl") or 0
+    for g in groups:
+        g["total_pnl"] = round(g["total_pnl"], 2)
+    return groups
+
+
 @app.route("/paper-trading")
 def paper_trading():
     with get_db() as conn:
@@ -1870,6 +1891,7 @@ def paper_trading():
     token_saved = bool(get_setting("upstox_access_token"))
     capital = get_capital()
     attach_running_balance(closed_trades, capital)
+    closed_by_date = group_trades_by_date(closed_trades)
     current_capital = get_current_capital()
     live_trading_enabled = get_live_trading_enabled()
     exit_strategy = get_exit_strategy()
@@ -1886,6 +1908,7 @@ def paper_trading():
         active_tab="paper",
         open_trades=open_trades,
         closed_trades=closed_trades,
+        closed_by_date=closed_by_date,
         total_pnl=round(total_pnl, 2),
         win_rate=win_rate,
         total_closed=total_closed,
