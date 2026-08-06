@@ -289,7 +289,7 @@
       <tr>
         <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
-        <td>{{ t.quantity }}{% if t.target1_hit_time %}<div class="sub" style="font-size:11px; color: var(--gold);">T1: {{ t.target1_qty }} @ {{ t.target1_exit_price }}</div>{% endif %}</td>
+        <td>{{ t.quantity }}{% if t.target1_hit_time %}<div class="sub" style="font-size:11px; color: var(--gold);">T1: {{ t.target1_qty }} @ {{ t.target1_exit_price }}</div>{% endif %}{% if t.trail_high_pct is not none %}<div class="sub" style="font-size:11px; color: var(--green);">Trail stop: {{ "%.1f"|format(t.trail_high_pct - 0.5) }}%</div>{% endif %}</td>
         <td>{{ t.entry_price }}</td>
         <td>{{ t.entry_time[:19] }}</td>
         <td>{{ t.last_checked_price or "-" }}</td>
@@ -408,7 +408,7 @@
         <tr>
           <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
-          <td>${t.quantity}${t.target1_hit_time ? `<div class="sub" style="font-size:11px; color: var(--gold);">T1: ${t.target1_qty} @ ${t.target1_exit_price}</div>` : ""}</td>
+          <td>${t.quantity}${t.target1_hit_time ? `<div class="sub" style="font-size:11px; color: var(--gold);">T1: ${t.target1_qty} @ ${t.target1_exit_price}</div>` : ""}${(t.trail_high_pct !== null && t.trail_high_pct !== undefined) ? `<div class="sub" style="font-size:11px; color: var(--green);">Trail stop: ${(t.trail_high_pct - 0.5).toFixed(1)}%</div>` : ""}</td>
           <td>${t.entry_price}</td>
           <td>${(t.entry_time || "").slice(0, 19)}</td>
           <td>${t.last_checked_price || "-"}</td>

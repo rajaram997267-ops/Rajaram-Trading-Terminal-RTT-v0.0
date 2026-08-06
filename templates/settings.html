@@ -163,10 +163,10 @@
     <span>Exit strategy for new trades:</span>
     <select id="strategySelect" onchange="setStrategy(this.value)">
       <option value="EMA" {% if exit_strategy == "EMA" %}selected{% endif %}>5-EMA only</option>
-      <option value="TARGETS" {% if exit_strategy == "TARGETS" %}selected{% endif %}>2% / 4% targets (half + half)</option>
+      <option value="TARGETS" {% if exit_strategy == "TARGETS" %}selected{% endif %}>2% half + trail from 4%</option>
     </select>
     <span class="token-status" id="strategyStatus">
-      {% if exit_strategy == "TARGETS" %}Books half the qty at +2% (breakeven stop after), rest at +4%. 5-EMA only protects before Target-1.{% else %}Full quantity exits on the 5-EMA reversal rule, same as before.{% endif %}
+      {% if exit_strategy == "TARGETS" %}Books half at +2% (breakeven stop after), rest trails from +4% in 0.5% steps. 5-EMA only protects before Target-1.{% else %}Full quantity exits on the 5-EMA reversal rule, same as before.{% endif %}
     </span>
   </div>
 
@@ -242,7 +242,7 @@
         });
         const result = await res.json();
         statusEl.textContent = result.exit_strategy === "TARGETS"
-          ? "Books half the qty at +2% (breakeven stop after), rest at +4%. 5-EMA only protects before Target-1."
+          ? "Books half at +2% (breakeven stop after), rest trails from +4% in 0.5% steps. 5-EMA only protects before Target-1."
           : "Full quantity exits on the 5-EMA reversal rule, same as before.";
       } catch (err) {
         statusEl.textContent = "Failed to update - see console";
