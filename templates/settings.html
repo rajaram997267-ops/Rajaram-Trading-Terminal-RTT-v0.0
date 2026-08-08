@@ -162,12 +162,13 @@
   <div class="settings-box">
     <span>Exit strategy for new trades:</span>
     <select id="strategySelect" onchange="setStrategy(this.value)">
-      <option value="EMA" {% if exit_strategy == "EMA" %}selected{% endif %}>5-EMA only</option>
-      <option value="TARGETS" {% if exit_strategy == "TARGETS" %}selected{% endif %}>2% half + trail from 4%</option>
+      <option value="EMA" {% if exit_strategy == "EMA" %}selected{% endif %}>1) 5-EMA only, let it run</option>
+      <option value="HALF_HALF_HARD4" {% if exit_strategy == "HALF_HALF_HARD4" %}selected{% endif %}>2) 2% half book, 4% full exit</option>
+      <option value="TRAIL_FROM_2" {% if exit_strategy == "TRAIL_FROM_2" %}selected{% endif %}>3) Trail 100% qty from 2%</option>
+      <option value="FULL_AT_2" {% if exit_strategy == "FULL_AT_2" %}selected{% endif %}>4) Full exit at 2%</option>
+      <option value="FULL_AT_4" {% if exit_strategy == "FULL_AT_4" %}selected{% endif %}>5) Full exit at 4%</option>
     </select>
-    <span class="token-status" id="strategyStatus">
-      {% if exit_strategy == "TARGETS" %}Books half at +2% (breakeven stop after), rest trails from +4% in 0.5% steps. 5-EMA only protects before Target-1.{% else %}Full quantity exits on the 5-EMA reversal rule, same as before.{% endif %}
-    </span>
+    <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
   </div>
 
   <div class="settings-box">
@@ -241,9 +242,7 @@
           body: JSON.stringify({ strategy }),
         });
         const result = await res.json();
-        statusEl.textContent = result.exit_strategy === "TARGETS"
-          ? "Books half at +2% (breakeven stop after), rest trails from +4% in 0.5% steps. 5-EMA only protects before Target-1."
-          : "Full quantity exits on the 5-EMA reversal rule, same as before.";
+        statusEl.textContent = result.description || "";
       } catch (err) {
         statusEl.textContent = "Failed to update - see console";
         console.error(err);
