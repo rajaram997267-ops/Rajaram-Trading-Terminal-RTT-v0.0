@@ -1761,13 +1761,27 @@ def run_paper_trade_check() -> dict:
             exited = False
             exit_price = None
             exit_reason = None
-            partial = None  # set if Target-1 books this pass, without fully closing
+            partial = None  # set if a half-booking target books this pass, without fully closing
             trail_update = None  # set if the trailing stop advances this pass, without closing
+
+            pct_change = None
+            if last_price is not None and entry_price:
+                pct_change = (last_price - entry_price) / entry_price * 100
 
             if trade["status"] != "OPEN":
                 pass  # paper side already closed - only live-side logic below applies
-            elif strategy == "TARGETS" and last_price is not None and entry_price:
-                pct_change = (last_price - entry_price) / entry_price * 100
+
+            elif strategy == "EMA":
+                # #1: 5-EMA only, let it run - no fixed target at all.
+                exited, exit_price = check_exit("Buy", candles)
+                if exited:
+                    exit_reason = "5-EMA exit rule"
+
+            elif strategy == "HALF_HALF_HARD4" and pct_change is not None:
+                # #2: 5-EMA protects until +2%. At +2%, book half the qty
+                # (Target-1). The remaining half is protected at breakeven
+                # until +4%, where it exits in full (Target-2) - a hard
+                # target, no trailing beyond it.
                 if trade["target1_hit_time"] is None:
                     if pct_change >= 2.0:
                         original_qty = trade["original_quantity"] or trade["quantity"] or 1
@@ -1780,28 +1794,89 @@ def run_paper_trade_check() -> dict:
                             "remaining_qty": remaining_qty,
                         }
                     else:
-                        # Below Target-1 - the 5-EMA rule is the only thing
-                        # protecting the downside so far.
+                        exited, exit_price = check_exit("Buy", candles)
+                        if exited:
+                            exit_reason = "5-EMA exit (before Target-1)"
+                else:
+                    if pct_change >= 4.0:
+                        exited, exit_price = True, last_price
+                        exit_reason = "Target-2 (4%) - full exit"
+                    elif last_price <= entry_price:
+                        exited, exit_price = True, last_price
+                        exit_reason = "Breakeven stop after Target-1"
+
+            elif strategy == "TRAIL_FROM_2" and pct_change is not None:
+                # #3: 5-EMA protects until +2%. No half-booking - the FULL
+                # quantity starts trailing from +2%, ratcheting up in 0.5%
+                # steps as price climbs, always sitting one step behind
+                # the peak.
+                if trade["trail_high_pct"] is None:
+                    if pct_change >= 2.0:
+                        trail_update = {"trail_high_pct": int(pct_change // 0.5) * 0.5}
+                    else:
+                        exited, exit_price = check_exit("Buy", candles)
+                        if exited:
+                            exit_reason = "5-EMA exit (before +2%)"
+                else:
+                    trail_high = trade["trail_high_pct"]
+                    current_milestone = int(pct_change // 0.5) * 0.5
+                    if current_milestone > trail_high:
+                        trail_update = {"trail_high_pct": current_milestone}
+                    else:
+                        stop_pct = round(trail_high - 0.5, 2)
+                        if pct_change <= stop_pct:
+                            exited, exit_price = True, last_price
+                            exit_reason = f"Trailing stop ({stop_pct:g}%)"
+
+            elif strategy == "FULL_AT_2" and pct_change is not None:
+                # #4: 5-EMA protects until +2%, then the FULL quantity
+                # exits at +2% - a single fixed target, no trailing.
+                if pct_change >= 2.0:
+                    exited, exit_price = True, last_price
+                    exit_reason = "Target (2%) - full exit"
+                else:
+                    exited, exit_price = check_exit("Buy", candles)
+                    if exited:
+                        exit_reason = "5-EMA exit (before 2% target)"
+
+            elif strategy == "FULL_AT_4" and pct_change is not None:
+                # #5: 5-EMA protects until +4%, then the FULL quantity
+                # exits at +4% - a single fixed target, no trailing.
+                if pct_change >= 4.0:
+                    exited, exit_price = True, last_price
+                    exit_reason = "Target (4%) - full exit"
+                else:
+                    exited, exit_price = check_exit("Buy", candles)
+                    if exited:
+                        exit_reason = "5-EMA exit (before 4% target)"
+
+            elif strategy == "TARGETS" and pct_change is not None:
+                # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
+                # kept only so trades that opened under the old single
+                # "TARGETS" option (before this 5-way split) keep working
+                # correctly. Not offered as a choice for new trades anymore.
+                if trade["target1_hit_time"] is None:
+                    if pct_change >= 2.0:
+                        original_qty = trade["original_quantity"] or trade["quantity"] or 1
+                        half_qty = max(1, original_qty // 2)
+                        remaining_qty = max(0, original_qty - half_qty)
+                        partial = {
+                            "exit_price": last_price,
+                            "qty": half_qty,
+                            "pnl": round((last_price - entry_price) * half_qty, 2),
+                            "remaining_qty": remaining_qty,
+                        }
+                    else:
                         exited, exit_price = check_exit("Buy", candles)
                         if exited:
                             exit_reason = "5-EMA exit (before Target-1)"
                 elif trade["trail_high_pct"] is None:
-                    # Target-1 booked, trailing not started yet - breakeven
-                    # protects the remaining half. At +4% (Target-2), instead
-                    # of selling everything, start trailing: the stop will
-                    # ratchet up in 0.5% steps as price climbs further,
-                    # always sitting one step behind the peak, so a strong
-                    # move (like a 20%+ option runner) isn't cut off at a
-                    # flat 4% - only the eventual pullback closes it.
                     if pct_change >= 4.0:
                         trail_update = {"trail_high_pct": int(pct_change // 0.5) * 0.5}
                     elif last_price <= entry_price:
                         exited, exit_price = True, last_price
                         exit_reason = "Breakeven stop after Target-1"
                 else:
-                    # Trailing active - advance the stop on a new 0.5% peak,
-                    # otherwise exit if price has pulled back to one step
-                    # (0.5%) below the highest peak reached so far.
                     trail_high = trade["trail_high_pct"]
                     current_milestone = int(pct_change // 0.5) * 0.5
                     if current_milestone > trail_high:
@@ -1811,13 +1886,15 @@ def run_paper_trade_check() -> dict:
                         if pct_change <= stop_pct:
                             exited, exit_price = True, last_price
                             exit_reason = f"Trailing stop ({stop_pct:g}%) after Target-2"
-            else:
+
+            elif trade["status"] == "OPEN":
                 # Both Buy and Sell alerts result in BUYING an option (Call
                 # or Put respectively) - the position is always long the
                 # premium, so the exit rule always uses the "Buy" (long)
                 # logic here, regardless of trade["direction"] (which only
                 # reflects which alert category triggered entry, not the
-                # position's own side).
+                # position's own side). Fallback for an unrecognized
+                # strategy value or missing price data.
                 exited, exit_price = check_exit("Buy", candles)
                 if exited:
                     exit_reason = "5-EMA exit rule"
@@ -2255,6 +2332,7 @@ def settings_page():
         capital=capital,
         live_trading_enabled=get_live_trading_enabled(),
         exit_strategy=get_exit_strategy(),
+        strategy_descriptions=STRATEGY_DESCRIPTIONS,
         sector_filter_enabled=get_sector_filter_enabled(),
         sector_filter_top_n=get_sector_filter_top_n(),
     )
@@ -2410,6 +2488,17 @@ def paper_trading_live_toggle():
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
+VALID_STRATEGIES = ("EMA", "HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4")
+
+STRATEGY_DESCRIPTIONS = {
+    "EMA": "1) 5-EMA only, let it run - full quantity exits purely on the 5-EMA reversal rule, no fixed target at all.",
+    "HALF_HALF_HARD4": "2) 5-EMA protects until +2%. At +2%, half the qty books (Target-1) and the rest is protected at breakeven. At +4%, the remaining half exits in full - a hard target, no trailing beyond it.",
+    "TRAIL_FROM_2": "3) 5-EMA protects until +2%. No half-booking - the full quantity starts trailing from +2%, in 0.5% steps, always one step behind the peak.",
+    "FULL_AT_2": "4) 5-EMA protects until +2%, then the full quantity exits at +2% - one fixed target, no trailing.",
+    "FULL_AT_4": "5) 5-EMA protects until +4%, then the full quantity exits at +4% - one fixed target, no trailing.",
+}
+
+
 @app.route("/api/paper-trading/strategy-toggle", methods=["POST"])
 def paper_trading_strategy_toggle():
     """Switches which exit strategy the NEXT new trade uses. Trades already
@@ -2418,10 +2507,10 @@ def paper_trading_strategy_toggle():
     already in flight."""
     data = request.get_json(silent=True) or {}
     strategy = data.get("strategy")
-    if strategy not in ("EMA", "TARGETS"):
-        return jsonify({"status": "error", "message": "strategy must be 'EMA' or 'TARGETS'"}), 400
+    if strategy not in VALID_STRATEGIES:
+        return jsonify({"status": "error", "message": f"strategy must be one of {VALID_STRATEGIES}"}), 400
     set_setting("exit_strategy", strategy)
-    return jsonify({"status": "ok", "exit_strategy": strategy})
+    return jsonify({"status": "ok", "exit_strategy": strategy, "description": STRATEGY_DESCRIPTIONS.get(strategy, "")})
 
 
 @app.route("/api/paper-trading/sector-filter-toggle", methods=["POST"])
