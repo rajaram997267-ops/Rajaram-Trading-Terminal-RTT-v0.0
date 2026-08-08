@@ -6,6 +6,7 @@ import io
 import json
 import os
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -427,7 +428,11 @@ def init_db():
                 target1_exit_price DOUBLE PRECISION,
                 target1_qty INTEGER,
                 target1_pnl DOUBLE PRECISION,
-                trail_high_pct DOUBLE PRECISION
+                trail_high_pct DOUBLE PRECISION,
+                live_trail_high_pct DOUBLE PRECISION,
+                live_exit_reason TEXT,
+                live_exit_price DOUBLE PRECISION,
+                live_entry_price DOUBLE PRECISION
             )
             """
         )
@@ -460,6 +465,10 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_qty INTEGER",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_pnl DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS trail_high_pct DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_trail_high_pct DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_reason TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_price DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_entry_price DOUBLE PRECISION",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -713,6 +722,11 @@ def create_paper_trades_for_batch(data: dict) -> None:
         ).fetchone()
         conn.commit()
 
+    if access_token:
+        ensure_websocket_started(access_token)
+    if paper_instrument_key:
+        update_ws_subscriptions(_ws_subscribed_keys | {paper_instrument_key})
+
     # Live trading buys ATM OPTIONS, never the underlying equity: a Buy
     # alert buys the ATM Call, a Sell alert buys the ATM Put - both are
     # always a BUY transaction (never writes/shorts an option), only the
@@ -750,18 +764,26 @@ def create_paper_trades_for_batch(data: dict) -> None:
                         else:
                             live_quantity = lots * lot_size
                             result = place_live_order(option["instrument_key"], "BUY", live_quantity, access_token)
-                            with get_db() as conn:
-                                if result["ok"]:
+                            if result["ok"]:
+                                # Fetch the REAL fill price - this is what
+                                # live P&L must be based on, not the
+                                # theoretical premium we used to size the
+                                # order (see get_order_average_price).
+                                live_entry_price = get_order_average_price(result["order_id"], access_token)
+                                with get_db() as conn:
                                     conn.execute(
                                         """
                                         UPDATE paper_trades
                                         SET live_status = 'OPEN', live_entry_order_id = ?, live_quantity = ?,
-                                            live_instrument_key = ?, live_option_label = ?
+                                            live_instrument_key = ?, live_option_label = ?, live_entry_price = ?
                                         WHERE id = ?
                                         """,
-                                        (result["order_id"], live_quantity, option["instrument_key"], label, trade_id),
+                                        (result["order_id"], live_quantity, option["instrument_key"], label,
+                                         live_entry_price, trade_id),
                                     )
-                                else:
+                                    conn.commit()
+                            else:
+                                with get_db() as conn:
                                     conn.execute(
                                         """
                                         UPDATE paper_trades
@@ -771,7 +793,7 @@ def create_paper_trades_for_batch(data: dict) -> None:
                                         """,
                                         (result["error"], live_quantity, label, trade_id),
                                     )
-                                conn.commit()
+                                    conn.commit()
 
 
 def calculate_ema(values: list[float], period: int = 5) -> list[float | None]:
@@ -1352,17 +1374,18 @@ def get_upstox_available_funds_for_display(access_token: str) -> float | None:
 
 
 def compute_live_stats(open_trades: list[dict], closed_trades: list[dict]) -> dict:
-    """Live trading only ever goes long (Buy alerts, CNC), so P&L for a
-    live-closed trade is just (exit - entry) * live_quantity - the same
-    entry/exit prices the paper trade recorded, since the live order is a
-    market order placed alongside it."""
+    """Live trading runs its own exit rule now, fully decoupled from the
+    paper trade's strategy - so P&L uses live_entry_price/live_exit_price
+    (the REAL order fill prices), not the paper trade's theoretical
+    entry_price/exit_price, since a market order can fill meaningfully
+    differently from whatever price we used to decide to place it."""
     live_open = sum(1 for t in open_trades if t.get("live_status") == "OPEN")
     live_closed_trades = [t for t in closed_trades if t.get("live_status") == "CLOSED"]
     live_pnl = 0.0
     for t in live_closed_trades:
         qty = t.get("live_quantity") or 0
-        entry = t.get("entry_price") or 0
-        exit_p = t.get("exit_price") or 0
+        entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
+        exit_p = t.get("live_exit_price") if t.get("live_exit_price") is not None else (t.get("exit_price") or 0)
         live_pnl += (exit_p - entry) * qty
     return {
         "live_open": live_open,
@@ -1397,6 +1420,147 @@ def get_ltp(instrument_key: str, access_token: str) -> float | None:
         return None
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Real-time price feed via Upstox's V3 WebSocket (MarketDataStreamerV3 from
+# the official upstox-python-sdk package). This exists purely for SPEED:
+# the exit-check loop can react to price-LEVEL triggers (Target %
+# thresholds, trailing-stop pullbacks) using the latest streamed tick
+# instead of waiting on a REST candle fetch. The 5-EMA rule still uses
+# fetch_5min_candles (it needs actual OHLC history, not a single current
+# price) - this doesn't replace that, it only supplements the current
+# price used for percentage-based decisions.
+#
+# This is a SOFT dependency end to end: if upstox-python-sdk isn't
+# installed, or the connection can't be established, or a message doesn't
+# parse - everything falls back to the existing REST-only behavior. The
+# app must never crash or block because of anything in this section.
+# ---------------------------------------------------------------------------
+_ws_price_cache: dict[str, dict] = {}  # instrument_key -> {"ltp": float, "updated_at": datetime}
+_ws_lock = threading.Lock()
+_ws_streamer = None
+_ws_subscribed_keys: set[str] = set()
+_ws_thread_started = False
+_ws_debug: dict = {"status": "not_started", "error": None, "last_message_at": None, "sdk_available": None}
+
+WS_PRICE_MAX_AGE_SECONDS = 5  # a cached tick older than this is treated as stale, not used
+
+
+def get_ws_price(instrument_key: str) -> float | None:
+    """Returns the latest WebSocket-streamed LTP for this instrument, or
+    None if we don't have a fresh one (not subscribed yet, feed not
+    connected, or the last tick is too old to trust). Callers must fall
+    back to a REST fetch in that case - None here means 'use REST', not
+    'price is unavailable'."""
+    with _ws_lock:
+        entry = _ws_price_cache.get(instrument_key)
+    if not entry:
+        return None
+    age = (datetime.utcnow() - entry["updated_at"]).total_seconds()
+    if age > WS_PRICE_MAX_AGE_SECONDS:
+        return None
+    return entry["ltp"]
+
+
+def _ws_on_message(message) -> None:
+    """Callback registered with MarketDataStreamerV3 - fires on the
+    streamer's own thread for every tick. Handles both the plain 'ltpc'
+    mode shape and the 'full' mode's nested marketFF.ltpc shape, since the
+    exact shape returned by the SDK's decoded message wasn't verifiable
+    from this build environment (no live connection was possible here) -
+    kept defensive so an unexpected shape just gets skipped, never crashes
+    the feed thread."""
+    global _ws_debug
+    try:
+        feeds = message.get("feeds") if isinstance(message, dict) else None
+        if not feeds:
+            return
+        now = datetime.utcnow()
+        with _ws_lock:
+            for instrument_key, feed in feeds.items():
+                if not isinstance(feed, dict):
+                    continue
+                ltpc = feed.get("ltpc")
+                if not ltpc:
+                    full = feed.get("fullFeed") or {}
+                    market_ff = full.get("marketFF") or full.get("indexFF") or {}
+                    ltpc = market_ff.get("ltpc")
+                if not ltpc:
+                    continue
+                ltp = ltpc.get("ltp")
+                if ltp:
+                    _ws_price_cache[instrument_key] = {"ltp": float(ltp), "updated_at": now}
+        _ws_debug["last_message_at"] = now.isoformat()
+        _ws_debug["status"] = "streaming"
+    except Exception as e:
+        _ws_debug["error"] = f"on_message error: {e}"
+
+
+def _ws_run(access_token: str) -> None:
+    """Runs for the lifetime of the process on a background thread -
+    connects to Upstox's V3 feed and automatically reconnects (after a
+    pause) if the connection drops for any reason: network blip, Render
+    spinning the app down and back up, Upstox-side restart, etc."""
+    global _ws_streamer, _ws_debug
+    try:
+        import upstox_client
+        _ws_debug["sdk_available"] = True
+    except ImportError:
+        _ws_debug["sdk_available"] = False
+        _ws_debug["status"] = "sdk_not_installed"
+        _ws_debug["error"] = "upstox-python-sdk not installed - add it to requirements.txt"
+        return
+
+    while True:
+        try:
+            configuration = upstox_client.Configuration()
+            configuration.access_token = access_token
+            initial_keys = list(_ws_subscribed_keys) or ["NSE_INDEX|Nifty 50"]
+            streamer = upstox_client.MarketDataStreamerV3(
+                upstox_client.ApiClient(configuration), initial_keys, "ltpc"
+            )
+            streamer.on("message", _ws_on_message)
+            _ws_streamer = streamer
+            _ws_debug["status"] = "connecting"
+            streamer.connect()  # blocks until the connection drops
+            _ws_debug["status"] = "disconnected"
+        except Exception as e:
+            _ws_debug["status"] = "error"
+            _ws_debug["error"] = str(e)
+        _ws_streamer = None
+        time.sleep(5)  # brief pause before reconnecting, avoid a hot retry loop
+
+
+def ensure_websocket_started(access_token: str) -> None:
+    """Starts the background WebSocket thread once per process. Safe to
+    call from any request handler - a no-op if it's already running or if
+    there's no token yet."""
+    global _ws_thread_started
+    if _ws_thread_started or not access_token:
+        return
+    _ws_thread_started = True
+    threading.Thread(target=_ws_run, args=(access_token,), daemon=True).start()
+
+
+def update_ws_subscriptions(instrument_keys: set[str]) -> None:
+    """Keeps the WebSocket subscription list in sync with whatever
+    instruments currently matter (every open trade's option contract).
+    Safe to call even before the streamer connects - the next connect
+    picks up the current _ws_subscribed_keys set from scratch."""
+    global _ws_subscribed_keys
+    added = instrument_keys - _ws_subscribed_keys
+    removed = _ws_subscribed_keys - instrument_keys
+    _ws_subscribed_keys = set(instrument_keys)
+    if _ws_streamer is None or (not added and not removed):
+        return
+    try:
+        if added:
+            _ws_streamer.subscribe(list(added), "ltpc")
+        if removed:
+            _ws_streamer.unsubscribe(list(removed))
+    except Exception as e:
+        _ws_debug["error"] = f"subscribe error: {e}"
 
 
 def _get_order_proxy_opener():
@@ -1476,29 +1640,70 @@ def place_live_order(instrument_key: str, transaction_type: str, quantity: int, 
         return {"ok": False, "error": str(e)}
 
 
-def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[str | None, str | None]:
+def get_order_average_price(order_id: str, access_token: str) -> float | None:
+    """Fetches the REAL average fill price for a placed order via Upstox's
+    Order Details API. This is what live P&L must be computed from -
+    a market order can fill meaningfully differently from whatever candle
+    price we used to decide to place it (illiquid option, wide bid-ask
+    spread, fast-moving price) - using our own theoretical price instead of
+    the actual fill was silently producing wrong (sometimes even
+    wrong-signed) live P&L. Retries briefly since a market order may take a
+    moment to settle to 'complete' status. Returns None (never raises) if
+    it can't get a real fill price - callers must NOT fall back to a
+    theoretical price in that case, since that's the exact bug this fixes."""
+    url = "https://api.upstox.com/v2/order/details?order_id=" + urllib.parse.quote(order_id)
+    for attempt in range(4):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+                "User-Agent": BROWSER_USER_AGENT,
+            },
+        )
+        try:
+            opener = _get_order_proxy_opener()
+            opener_fn = opener.open if opener else urllib.request.urlopen
+            with opener_fn(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode())
+            data = payload.get("data") or {}
+            status = data.get("status")
+            avg_price = data.get("average_price")
+            if status == "complete" and avg_price:
+                return float(avg_price)
+        except Exception:
+            pass
+        if attempt < 3:
+            time.sleep(1.5)
+    return None
+
+
+def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[str | None, str | None, float | None]:
     """If this paper trade has a live position open (live_status == 'OPEN'),
     places the closing SELL order on Upstox for the EXACT option contract
     that was bought at entry (live_instrument_key) - not a freshly
     recomputed ATM strike, since the ATM strike at entry time is what's
     actually held, regardless of where the underlying has moved since.
-    Returns (order_id, error) - both None if there was no live position to
-    close, which is the normal case for any trade from before live trading
-    was turned on."""
+    Returns (order_id, error, fill_price) - all None if there was no live
+    position to close, which is the normal case for any trade from before
+    live trading was turned on. fill_price is the REAL average price the
+    order executed at (fetched via get_order_average_price), not a
+    theoretical price - callers must use this for live P&L, not last_price."""
     if trade.get("live_status") != "OPEN":
-        return None, None
+        return None, None, None
     if not access_token:
-        return None, "Live position open but no Upstox access token saved - could not close it"
+        return None, "Live position open but no Upstox access token saved - could not close it", None
 
     instrument_key = trade.get("live_instrument_key")
     if not instrument_key:
-        return None, "No live_instrument_key recorded on this trade - could not close live position"
+        return None, "No live_instrument_key recorded on this trade - could not close live position", None
 
     qty = trade.get("live_quantity") or 1
     result = place_live_order(instrument_key, "SELL", qty, access_token)
     if result["ok"]:
-        return result["order_id"], None
-    return None, f"Failed to close live position: {result['error']}"
+        fill_price = get_order_average_price(result["order_id"], access_token)
+        return result["order_id"], None, fill_price
+    return None, f"Failed to close live position: {result['error']}", None
 
 
 def run_paper_trade_check() -> dict:
@@ -1510,8 +1715,16 @@ def run_paper_trade_check() -> dict:
 
     with get_db() as conn:
         open_trades = conn.execute(
-            "SELECT * FROM paper_trades WHERE status = 'OPEN'"
+            "SELECT * FROM paper_trades WHERE status = 'OPEN' OR live_status = 'OPEN'"
         ).fetchall()
+
+    ensure_websocket_started(access_token)
+    active_keys = {
+        t["paper_instrument_key"] for t in open_trades if t["paper_instrument_key"]
+    } | {
+        t["live_instrument_key"] for t in open_trades if t["live_instrument_key"]
+    }
+    update_ws_subscriptions(active_keys)
 
     checked = 0
     closed = 0
@@ -1533,7 +1746,15 @@ def run_paper_trade_check() -> dict:
                 continue
 
             candles = fetch_5min_candles(instrument_key, access_token)
-            last_price = candles[-1][3] if candles else None
+            # Prefer a fresh WebSocket tick for the CURRENT price (used by
+            # every percentage-level check below) - it's faster than
+            # waiting on the next REST candle. The 5-EMA rule below still
+            # uses the full candle series regardless, since it needs
+            # historical shape, not just a current price. Falls back to
+            # the REST candle close whenever no fresh tick is available
+            # (feed not connected yet, symbol not subscribed, etc.).
+            ws_price = get_ws_price(instrument_key)
+            last_price = ws_price if ws_price is not None else (candles[-1][3] if candles else None)
             entry_price = trade["entry_price"]
             strategy = trade["strategy"] or "EMA"
 
@@ -1543,7 +1764,9 @@ def run_paper_trade_check() -> dict:
             partial = None  # set if Target-1 books this pass, without fully closing
             trail_update = None  # set if the trailing stop advances this pass, without closing
 
-            if strategy == "TARGETS" and last_price is not None and entry_price:
+            if trade["status"] != "OPEN":
+                pass  # paper side already closed - only live-side logic below applies
+            elif strategy == "TARGETS" and last_price is not None and entry_price:
                 pct_change = (last_price - entry_price) / entry_price * 100
                 if trade["target1_hit_time"] is None:
                     if pct_change >= 2.0:
@@ -1599,11 +1822,60 @@ def run_paper_trade_check() -> dict:
                 if exited:
                     exit_reason = "5-EMA exit rule"
 
-            # Partial exits don't touch the live position - live-order
-            # support for partial (multi-leg) exits isn't built yet, so
-            # for now the live leg only closes on the FINAL full exit.
-            if exited:
-                live_exit_order_id, live_exit_error = _close_live_position_if_any(trade, access_token)
+            # Live trading runs its OWN, independent exit rule - simpler
+            # than the paper TARGETS strategy (full quantity, no half
+            # booking): the 5-EMA rule protects until +2%, then the stop
+            # trails the whole position in 0.5% steps from there. This can
+            # close a live position at a different time than the paper
+            # side (or not at all, if the paper side is using EMA-only) -
+            # they're fully decoupled now, each governed by its own rule.
+            live_exited = False
+            live_exit_reason_val = None
+            live_trail_update = None
+            if trade["live_status"] == "OPEN" and last_price is not None and entry_price:
+                live_pct_change = (last_price - entry_price) / entry_price * 100
+                if trade["live_trail_high_pct"] is None:
+                    if live_pct_change >= 2.0:
+                        live_trail_update = int(live_pct_change // 0.5) * 0.5
+                    else:
+                        live_exited, _ = check_exit("Buy", candles)
+                        if live_exited:
+                            live_exit_reason_val = "5-EMA exit (before +2%)"
+                else:
+                    live_trail_high = trade["live_trail_high_pct"]
+                    live_milestone = int(live_pct_change // 0.5) * 0.5
+                    if live_milestone > live_trail_high:
+                        live_trail_update = live_milestone
+                    else:
+                        live_stop_pct = round(live_trail_high - 0.5, 2)
+                        if live_pct_change <= live_stop_pct:
+                            live_exited = True
+                            live_exit_reason_val = f"Trailing stop ({live_stop_pct:g}%) after +2%"
+
+            if live_exited:
+                live_exit_order_id, live_exit_error, live_fill_price = _close_live_position_if_any(trade, access_token)
+                with get_db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
+                            live_exit_order_id = COALESCE(?, live_exit_order_id),
+                            live_error = COALESCE(?, live_error),
+                            live_exit_reason = ?,
+                            live_exit_price = COALESCE(?, live_exit_price)
+                        WHERE id = ?
+                        """,
+                        (live_exit_order_id is not None, live_exit_order_id, live_exit_error,
+                         live_exit_reason_val, live_fill_price, trade["id"]),
+                    )
+                    conn.commit()
+            elif live_trail_update is not None:
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE paper_trades SET live_trail_high_pct = ? WHERE id = ?",
+                        (live_trail_update, trade["id"]),
+                    )
+                    conn.commit()
 
             with get_db() as conn:
                 if partial:
@@ -1644,22 +1916,13 @@ def run_paper_trade_check() -> dict:
                         UPDATE paper_trades
                         SET status = 'CLOSED', exit_price = ?, exit_time = ?,
                             pnl = ?, pnl_pct = ?, exit_reason = ?, last_checked_price = ?,
-                            last_checked_time = ?, last_error = NULL,
-                            live_exit_order_id = COALESCE(?, live_exit_order_id),
-                            live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
-                            live_error = COALESCE(?, live_error)
+                            last_checked_time = ?, last_error = NULL
                         WHERE id = ?
                         """,
-                        (
-                            exit_price, now, total_pnl, pnl_pct, exit_reason, last_price, now,
-                            live_exit_order_id,
-                            live_exit_order_id is not None,
-                            live_exit_error,
-                            trade["id"],
-                        ),
+                        (exit_price, now, total_pnl, pnl_pct, exit_reason, last_price, now, trade["id"]),
                     )
                     closed += 1
-                else:
+                elif trade["status"] == "OPEN":
                     conn.execute(
                         "UPDATE paper_trades SET last_checked_price = ?, last_checked_time = ?, last_error = NULL WHERE id = ?",
                         (last_price, now, trade["id"]),
@@ -1866,6 +2129,26 @@ def attach_unrealized_pnl(open_trades: list[dict]) -> None:
         t["unrealized_pnl_pct"] = round((pnl / capital_used) * 100, 2) if capital_used else 0
 
 
+def attach_live_unrealized_pnl(open_trades: list[dict]) -> None:
+    """Same as attach_unrealized_pnl but sized off live_quantity and priced
+    off live_entry_price (the REAL fill price) - not the paper trade's own
+    quantity/entry_price, since the two are sized/priced from different
+    sources (paper capital + theoretical premium vs real Upstox funds +
+    real order fill)."""
+    for t in open_trades:
+        last_price = t.get("last_checked_price")
+        qty = t.get("live_quantity") or 0
+        entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else t.get("entry_price")
+        if last_price is None or not qty or entry is None:
+            t["unrealized_pnl"] = None
+            t["unrealized_pnl_pct"] = None
+            continue
+        capital_used = entry * qty
+        pnl = (last_price - entry) * qty
+        t["unrealized_pnl"] = round(pnl, 2)
+        t["unrealized_pnl_pct"] = round((pnl / capital_used) * 100, 2) if capital_used else 0
+
+
 def attach_running_balance(closed_trades_desc: list[dict], starting_capital: float) -> None:
     """closed_trades_desc: newest first (as queried). Adds 'balance_after'
     to each trade - the account balance right after that trade closed,
@@ -1986,15 +2269,20 @@ def settings_page():
 def live_trading_page():
     with get_db() as conn:
         open_trades = conn.execute(
-            "SELECT * FROM paper_trades WHERE status = 'OPEN' AND live_status != 'NONE' ORDER BY id DESC"
+            "SELECT * FROM paper_trades WHERE live_status = 'OPEN' ORDER BY id DESC"
         ).fetchall()
         closed_trades = conn.execute(
-            "SELECT * FROM paper_trades WHERE status = 'CLOSED' AND live_status != 'NONE' ORDER BY id DESC LIMIT 200"
+            "SELECT * FROM paper_trades WHERE live_status = 'CLOSED' ORDER BY id DESC LIMIT 200"
         ).fetchall()
 
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
-    attach_unrealized_pnl(open_trades)
+    attach_live_unrealized_pnl(open_trades)
+    for t in closed_trades:
+        qty = t.get("live_quantity") or 0
+        entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
+        exit_p = t.get("live_exit_price") if t.get("live_exit_price") is not None else (t.get("exit_price") or 0)
+        t["live_pnl_value"] = round((exit_p - entry) * qty, 2)
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     token_saved = bool(get_setting("upstox_access_token"))
@@ -2018,6 +2306,43 @@ def live_trading_page():
     response.headers["Content-Type"] = "text/html; charset=utf-8"
     response.headers["Content-Length"] = str(len(body))
     return response
+
+
+@app.route("/api/live-trading/data")
+def live_trading_data():
+    """Dedicated data endpoint for the Live Trading page - deliberately
+    separate from /api/paper-trading/data since paper and live now run
+    independent exit rules and can be open/closed in different states at
+    the same time. This one is always keyed off live_status, never the
+    paper trade's own status."""
+    with get_db() as conn:
+        open_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE live_status = 'OPEN' ORDER BY id DESC"
+        ).fetchall()
+        closed_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE live_status = 'CLOSED' ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+    open_trades = [dict(t) for t in open_trades]
+    closed_trades = [dict(t) for t in closed_trades]
+    attach_live_unrealized_pnl(open_trades)
+    for t in closed_trades:
+        qty = t.get("live_quantity") or 0
+        entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
+        exit_p = t.get("live_exit_price") if t.get("live_exit_price") is not None else (t.get("exit_price") or 0)
+        t["live_pnl_value"] = round((exit_p - entry) * qty, 2)
+
+    live_stats = compute_live_stats(open_trades, closed_trades)
+    access_token = get_setting("upstox_access_token")
+    live_available_funds = get_upstox_available_funds_for_display(access_token) if access_token else None
+
+    return jsonify({
+        "open": open_trades,
+        "closed": closed_trades,
+        "live_open": live_stats["live_open"],
+        "live_closed": live_stats["live_closed"],
+        "live_pnl": live_stats["live_pnl"],
+        "live_available_funds": live_available_funds,
+    })
 
 
 @app.route("/api/paper-trading/data")
@@ -2134,15 +2459,20 @@ def paper_trading_reset():
 
 @app.route("/api/paper-trading/manual-exit/<int:trade_id>", methods=["POST"])
 def paper_trading_manual_exit(trade_id):
-    """Manually closes an open trade right now, at the freshest price we
-    can get - since the 5-EMA rule doesn't cover every situation you might
-    want to exit on (e.g. hitting a target %, end of day, news, etc.)."""
+    """Manually closes a trade right now, at the freshest price we can get -
+    since the exit rules don't cover every situation you might want to
+    exit on (e.g. hitting a target %, end of day, news, etc.). Handles two
+    cases since paper and live now run independent exit rules: the normal
+    case (paper still open - closes both together), and a live-only case
+    (paper already closed via its own rule, but the live leg is still
+    running its own separate exit logic - closes just that)."""
     with get_db() as conn:
         trade = conn.execute(
-            "SELECT * FROM paper_trades WHERE id = ? AND status = 'OPEN'", (trade_id,)
+            "SELECT * FROM paper_trades WHERE id = ? AND (status = 'OPEN' OR live_status = 'OPEN')",
+            (trade_id,),
         ).fetchone()
     if not trade:
-        return jsonify({"status": "error", "message": "Trade not found or already closed"}), 404
+        return jsonify({"status": "error", "message": "Trade not found or already fully closed"}), 404
 
     exit_price = None
     access_token = get_setting("upstox_access_token")
@@ -2150,9 +2480,13 @@ def paper_trading_manual_exit(trade_id):
         try:
             instrument_key = trade["paper_instrument_key"] or get_instrument_key(trade["symbol"])
             if instrument_key:
-                candles = fetch_5min_candles(instrument_key, access_token)
-                if candles:
-                    exit_price = candles[-1][3]
+                ws_price = get_ws_price(instrument_key)
+                if ws_price is not None:
+                    exit_price = ws_price
+                else:
+                    candles = fetch_5min_candles(instrument_key, access_token)
+                    if candles:
+                        exit_price = candles[-1][3]
         except Exception:
             pass  # fall back to last_checked_price below
 
@@ -2161,42 +2495,70 @@ def paper_trading_manual_exit(trade_id):
     if exit_price is None:
         return jsonify({"status": "error", "message": "No price available - save a token and run Check Exits Now at least once first"}), 400
 
-    entry_price = trade["entry_price"]
-    qty = trade["quantity"] or 1
-    # Always a long option position (Call or Put bought, never written) -
-    # profit is always exit minus entry, regardless of alert direction.
-    # Combines this leg with whatever Target-1 already booked, if any.
-    leg_pnl = round((exit_price - entry_price) * qty, 2)
-    pnl = round(leg_pnl + (trade["target1_pnl"] or 0), 2)
-    original_qty = trade["original_quantity"] or qty
-    capital_used = entry_price * original_qty
-    pnl_pct = round((pnl / capital_used) * 100, 2) if capital_used else 0
     now = datetime.utcnow().isoformat()
 
-    live_exit_order_id, live_exit_error = _close_live_position_if_any(trade, access_token)
+    if trade["live_status"] == "OPEN":
+        live_exit_order_id, live_exit_error, live_fill_price = _close_live_position_if_any(trade, access_token)
+    else:
+        live_exit_order_id, live_exit_error, live_fill_price = None, None, None
 
-    with get_db() as conn:
-        conn.execute(
-            """
-            UPDATE paper_trades
-            SET status = 'CLOSED', exit_price = ?, exit_time = ?,
-                pnl = ?, pnl_pct = ?, exit_reason = ?, last_checked_time = ?,
-                live_exit_order_id = COALESCE(?, live_exit_order_id),
-                live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
-                live_error = COALESCE(?, live_error)
-            WHERE id = ?
-            """,
-            (
-                exit_price, now, pnl, pnl_pct, "Manual exit", now,
-                live_exit_order_id,
-                live_exit_order_id is not None,
-                live_exit_error,
-                trade_id,
-            ),
-        )
-        conn.commit()
-
-    return jsonify({"status": "ok", "exit_price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct})
+    if trade["status"] == "OPEN":
+        entry_price = trade["entry_price"]
+        qty = trade["quantity"] or 1
+        # Always a long option position (Call or Put bought, never
+        # written) - profit is always exit minus entry, regardless of
+        # alert direction. Combines this leg with whatever Target-1
+        # already booked, if any.
+        leg_pnl = round((exit_price - entry_price) * qty, 2)
+        pnl = round(leg_pnl + (trade["target1_pnl"] or 0), 2)
+        original_qty = trade["original_quantity"] or qty
+        capital_used = entry_price * original_qty
+        pnl_pct = round((pnl / capital_used) * 100, 2) if capital_used else 0
+        with get_db() as conn:
+            conn.execute(
+                """
+                UPDATE paper_trades
+                SET status = 'CLOSED', exit_price = ?, exit_time = ?,
+                    pnl = ?, pnl_pct = ?, exit_reason = ?, last_checked_time = ?,
+                    live_exit_order_id = COALESCE(?, live_exit_order_id),
+                    live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
+                    live_error = COALESCE(?, live_error),
+                    live_exit_reason = CASE WHEN ? THEN 'Manual exit' ELSE live_exit_reason END,
+                    live_exit_price = CASE WHEN ? THEN COALESCE(?, live_exit_price) ELSE live_exit_price END
+                WHERE id = ?
+                """,
+                (
+                    exit_price, now, pnl, pnl_pct, "Manual exit", now,
+                    live_exit_order_id,
+                    live_exit_order_id is not None,
+                    live_exit_error,
+                    live_exit_order_id is not None,
+                    live_exit_order_id is not None,
+                    live_fill_price,
+                    trade_id,
+                ),
+            )
+            conn.commit()
+        return jsonify({"status": "ok", "exit_price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct})
+    else:
+        # Paper already closed via its own rule - this manual exit only
+        # closes the still-running live leg, leaving the paper trade's
+        # own result untouched.
+        with get_db() as conn:
+            conn.execute(
+                """
+                UPDATE paper_trades
+                SET live_exit_order_id = COALESCE(?, live_exit_order_id),
+                    live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
+                    live_error = COALESCE(?, live_error),
+                    live_exit_reason = 'Manual exit',
+                    live_exit_price = COALESCE(?, live_exit_price)
+                WHERE id = ?
+                """,
+                (live_exit_order_id, live_exit_order_id is not None, live_exit_error, live_fill_price, trade_id),
+            )
+            conn.commit()
+        return jsonify({"status": "ok", "exit_price": exit_price, "note": "Closed the live leg only (paper side had already closed)"})
 
 
 @app.route("/api/paper-trading/check", methods=["POST"])
@@ -2235,6 +2597,31 @@ def debug_proxy_ip():
         return jsonify({"ok": True, "outbound_ip_seen": payload.get("ip")})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/paper-trading/debug-websocket")
+def debug_websocket():
+    """Diagnostic-only: shows the WebSocket feed's connection status,
+    whether upstox-python-sdk is installed, what's currently subscribed,
+    and how many prices are cached - so a connection problem can be
+    diagnosed precisely instead of just seeing slower-than-expected
+    reactions with no visible cause."""
+    access_token = get_setting("upstox_access_token")
+    if access_token:
+        ensure_websocket_started(access_token)
+    with _ws_lock:
+        cache_size = len(_ws_price_cache)
+        sample_prices = dict(list(_ws_price_cache.items())[:5])
+    return jsonify({
+        **_ws_debug,
+        "thread_started": _ws_thread_started,
+        "subscribed_keys": list(_ws_subscribed_keys),
+        "cached_price_count": cache_size,
+        "sample_prices": {
+            k: {"ltp": v["ltp"], "age_seconds": round((datetime.utcnow() - v["updated_at"]).total_seconds(), 1)}
+            for k, v in sample_prices.items()
+        },
+    })
 
 
 @app.route("/api/paper-trading/debug-atm")
