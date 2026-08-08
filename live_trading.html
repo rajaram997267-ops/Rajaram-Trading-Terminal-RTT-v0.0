@@ -176,19 +176,20 @@
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry price</th>
-        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>Status</th><th>Entry order id</th><th>Error</th>
+        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>Status</th><th>Entry order id</th><th>Error</th><th></th>
       </tr>
       {% for t in open_trades %}
       <tr>
         <td>{{ t.symbol }}{% if t.live_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.live_option_label }}">{{ t.live_option_label }}</div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
-        <td>{{ t.live_quantity }}</td>
-        <td>{{ t.entry_price }}</td>
+        <td>{{ t.live_quantity }}{% if t.live_trail_high_pct is not none %}<div class="sub" style="font-size:11px; color: var(--green);">Trail stop: {{ "%.1f"|format(t.live_trail_high_pct - 0.5) }}%</div>{% endif %}</td>
+        <td>{{ t.live_entry_price if t.live_entry_price is not none else t.entry_price }}</td>
         <td>{{ t.last_checked_price or "-" }}</td>
         <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl if t.unrealized_pnl is not none else "-" }}</td>
         <td><span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span></td>
         <td>{{ t.live_entry_order_id or "-" }}</td>
         <td class="error-note">{{ t.live_error or "" }}</td>
+        <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit({{ t.id }})">Exit Now</button></td>
       </tr>
       {% endfor %}
     </table>
@@ -210,10 +211,10 @@
         <td>{{ t.symbol }}{% if t.live_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.live_option_label }}">{{ t.live_option_label }}</div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
         <td>{{ t.live_quantity }}</td>
-        <td>{{ t.entry_price }}</td>
-        <td>{{ t.exit_price }}</td>
-        <td class="{% if t.pnl and t.pnl > 0 %}pnl-pos{% elif t.pnl and t.pnl < 0 %}pnl-neg{% endif %}">{{ t.pnl }}</td>
-        <td>{{ t.exit_reason }}</td>
+        <td>{{ t.live_entry_price if t.live_entry_price is not none else t.entry_price }}</td>
+        <td>{{ t.live_exit_price if t.live_exit_price is not none else t.exit_price }}</td>
+        <td class="{% if t.live_pnl_value and t.live_pnl_value > 0 %}pnl-pos{% elif t.live_pnl_value and t.live_pnl_value < 0 %}pnl-neg{% endif %}">{{ t.live_pnl_value }}</td>
+        <td>{{ t.live_exit_reason or t.exit_reason }}</td>
         <td><span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span></td>
         <td>{{ t.live_entry_order_id or "-" }}</td>
         <td>{{ t.live_exit_order_id or "-" }}</td>
@@ -234,32 +235,34 @@
 
     function renderOpenTrades(trades) {
       const container = document.getElementById("openTradesContainer");
-      const liveTrades = trades.filter(t => t.live_status && t.live_status !== "NONE");
-      if (liveTrades.length === 0) {
+      if (trades.length === 0) {
         container.innerHTML = '<div class="empty">No live positions open right now.</div>';
         return;
       }
-      const rows = liveTrades.map(t => {
+      const rows = trades.map(t => {
         const pnlClass = t.unrealized_pnl > 0 ? "pnl-pos" : (t.unrealized_pnl < 0 ? "pnl-neg" : "");
         const pnlText = (t.unrealized_pnl === null || t.unrealized_pnl === undefined) ? "-" : t.unrealized_pnl;
+        const trailNote = (t.live_trail_high_pct !== null && t.live_trail_high_pct !== undefined)
+          ? `<div class="sub" style="font-size:11px; color: var(--green);">Trail stop: ${(t.live_trail_high_pct - 0.5).toFixed(1)}%</div>` : "";
         return `
         <tr>
           <td>${escapeHtml(t.symbol)}${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)}</div>` : ""}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
-          <td>${t.live_quantity}</td>
-          <td>${t.entry_price}</td>
+          <td>${t.live_quantity}${trailNote}</td>
+          <td>${(t.live_entry_price !== null && t.live_entry_price !== undefined) ? t.live_entry_price : t.entry_price}</td>
           <td>${t.last_checked_price || "-"}</td>
           <td class="${pnlClass}">${pnlText}</td>
           <td><span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span></td>
           <td>${t.live_entry_order_id || "-"}</td>
           <td class="error-note">${escapeHtml(t.live_error || "")}</td>
+          <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit(${t.id})">Exit Now</button></td>
         </tr>
       `;
       }).join("");
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry price</th>
-              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>Status</th><th>Entry order id</th><th>Error</th></tr>
+              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>Status</th><th>Entry order id</th><th>Error</th><th></th></tr>
           ${rows}
         </table>
       `;
@@ -267,22 +270,23 @@
 
     function renderClosedTrades(trades) {
       const container = document.getElementById("closedTradesContainer");
-      const liveTrades = trades.filter(t => t.live_status && t.live_status !== "NONE");
-      if (liveTrades.length === 0) {
+      if (trades.length === 0) {
         container.innerHTML = '<div class="empty">No live trades closed yet.</div>';
         return;
       }
-      const rows = liveTrades.map(t => {
-        const pnlClass = t.pnl > 0 ? "pnl-pos" : (t.pnl < 0 ? "pnl-neg" : "");
+      const rows = trades.map(t => {
+        const pnlClass = t.live_pnl_value > 0 ? "pnl-pos" : (t.live_pnl_value < 0 ? "pnl-neg" : "");
+        const exitPrice = (t.live_exit_price !== null && t.live_exit_price !== undefined) ? t.live_exit_price : t.exit_price;
+        const exitReason = t.live_exit_reason || t.exit_reason || "";
         return `
           <tr>
             <td>${escapeHtml(t.symbol)}${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)}</div>` : ""}</td>
             <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
             <td>${t.live_quantity}</td>
-            <td>${t.entry_price}</td>
-            <td>${t.exit_price}</td>
-            <td class="${pnlClass}">${t.pnl}</td>
-            <td>${escapeHtml(t.exit_reason || "")}</td>
+            <td>${(t.live_entry_price !== null && t.live_entry_price !== undefined) ? t.live_entry_price : t.entry_price}</td>
+            <td>${exitPrice}</td>
+            <td class="${pnlClass}">${t.live_pnl_value}</td>
+            <td>${escapeHtml(exitReason)}</td>
             <td><span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span></td>
             <td>${t.live_entry_order_id || "-"}</td>
             <td>${t.live_exit_order_id || "-"}</td>
@@ -300,7 +304,7 @@
 
     async function refreshTrades() {
       try {
-        const res = await fetch("/api/paper-trading/data");
+        const res = await fetch("/api/live-trading/data");
         const data = await res.json();
         renderOpenTrades(data.open);
         renderClosedTrades(data.closed);
@@ -323,6 +327,21 @@
         }
       } catch (err) {
         console.error("Refresh failed", err);
+      }
+    }
+
+    async function manualExit(tradeId) {
+      if (!confirm("Close this live position right now at the current price?")) return;
+      try {
+        const res = await fetch(`/api/paper-trading/manual-exit/${tradeId}`, { method: "POST" });
+        const result = await res.json();
+        if (result.status !== "ok") {
+          alert(result.message || "Exit failed");
+        }
+        await refreshTrades();
+      } catch (err) {
+        alert("Exit failed - see console");
+        console.error(err);
       }
     }
 
