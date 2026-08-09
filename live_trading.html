@@ -130,6 +130,49 @@
     .live-FAILED { background: rgba(255, 83, 112, 0.15); color: var(--red); }
     .live-CLOSED { background: rgba(255, 184, 0, 0.15); color: var(--gold); }
     .live-NONE { color: var(--muted); }
+    .date-group {
+      margin-bottom: 12px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    .date-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 16px;
+      background: var(--panel);
+      cursor: pointer;
+      user-select: none;
+    }
+    .date-header:hover { background: #171c29; }
+    .date-header .date-left {
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+    }
+    .date-header .date-label { font-weight: 600; font-size: 14px; }
+    .date-header .date-count { font-size: 12px; color: var(--muted); }
+    .date-header .date-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .date-header .date-pnl { font-weight: 700; font-size: 15px; }
+    .date-header .chevron {
+      color: var(--muted);
+      font-size: 11px;
+      transition: transform 0.15s;
+    }
+    .date-group.expanded .chevron { transform: rotate(180deg); }
+    .date-group .date-trades { display: none; }
+    .date-group.expanded .date-trades { display: block; }
+    .date-group table {
+      margin-bottom: 0;
+      border-radius: 0;
+      border: none;
+      border-top: 1px solid var(--border);
+    }
   </style>
 </head>
 <body>
@@ -200,27 +243,45 @@
 
   <h3 class="section-title">Live closed trades</h3>
   <div id="closedTradesContainer">
-    {% if closed_trades %}
-    <table>
-      <tr>
-        <th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry</th><th>Exit</th>
-        <th>P&amp;L (Rs)</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th>
-      </tr>
-      {% for t in closed_trades %}
-      <tr>
-        <td>{{ t.symbol }}{% if t.live_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.live_option_label }}">{{ t.live_option_label }}</div>{% endif %}</td>
-        <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
-        <td>{{ t.live_quantity }}</td>
-        <td>{{ t.live_entry_price if t.live_entry_price is not none else t.entry_price }}</td>
-        <td>{{ t.live_exit_price if t.live_exit_price is not none else t.exit_price }}</td>
-        <td class="{% if t.live_pnl_value and t.live_pnl_value > 0 %}pnl-pos{% elif t.live_pnl_value and t.live_pnl_value < 0 %}pnl-neg{% endif %}">{{ t.live_pnl_value }}</td>
-        <td>{{ t.live_exit_reason or t.exit_reason }}</td>
-        <td><span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span></td>
-        <td>{{ t.live_entry_order_id or "-" }}</td>
-        <td>{{ t.live_exit_order_id or "-" }}</td>
-      </tr>
+    {% if closed_by_date %}
+      {% for group in closed_by_date %}
+      <div class="date-group{% if loop.first %} expanded{% endif %}">
+        <div class="date-header" onclick="this.parentElement.classList.toggle('expanded')">
+          <div class="date-left">
+            <span class="date-label">{{ group.date }}</span>
+            <span class="date-count">{{ group.trades|length }} trade{% if group.trades|length != 1 %}s{% endif %}</span>
+          </div>
+          <div class="date-right">
+            <span class="date-pnl {% if group.total_pnl > 0 %}pnl-pos{% elif group.total_pnl < 0 %}pnl-neg{% endif %}">
+              {% if group.total_pnl > 0 %}+{% endif %}Rs {{ group.total_pnl }}
+            </span>
+            <span class="chevron">&#9660;</span>
+          </div>
+        </div>
+        <div class="date-trades">
+          <table>
+            <tr>
+              <th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry</th><th>Exit</th>
+              <th>P&amp;L (Rs)</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th>
+            </tr>
+            {% for t in group.trades %}
+            <tr>
+              <td>{{ t.symbol }}{% if t.live_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.live_option_label }}">{{ t.live_option_label }}</div>{% endif %}</td>
+              <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
+              <td>{{ t.live_quantity }}</td>
+              <td>{{ t.live_entry_price if t.live_entry_price is not none else t.entry_price }}</td>
+              <td>{{ t.live_exit_price if t.live_exit_price is not none else t.exit_price }}</td>
+              <td class="{% if t.live_pnl_value and t.live_pnl_value > 0 %}pnl-pos{% elif t.live_pnl_value and t.live_pnl_value < 0 %}pnl-neg{% endif %}">{{ t.live_pnl_value }}</td>
+              <td>{{ t.live_exit_reason or t.exit_reason }}</td>
+              <td><span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span></td>
+              <td>{{ t.live_entry_order_id or "-" }}</td>
+              <td>{{ t.live_exit_order_id or "-" }}</td>
+            </tr>
+            {% endfor %}
+          </table>
+        </div>
+      </div>
       {% endfor %}
-    </table>
     {% else %}
     <div class="empty">No live trades closed yet.</div>
     {% endif %}
@@ -268,38 +329,83 @@
       `;
     }
 
+    function groupTradesByDate(trades, dateField, pnlField) {
+      const sorted = [...trades].sort((a, b) => (b[dateField] || "").localeCompare(a[dateField] || ""));
+      const groups = [];
+      let current = null;
+      sorted.forEach(t => {
+        const exitDate = (t[dateField] || "").slice(0, 10) || "Unknown";
+        if (exitDate !== current) {
+          groups.push({ date: exitDate, total_pnl: 0, trades: [] });
+          current = exitDate;
+        }
+        const g = groups[groups.length - 1];
+        g.trades.push(t);
+        g.total_pnl += t[pnlField] || 0;
+      });
+      groups.forEach(g => { g.total_pnl = Math.round(g.total_pnl * 100) / 100; });
+      return groups;
+    }
+
     function renderClosedTrades(trades) {
       const container = document.getElementById("closedTradesContainer");
       if (trades.length === 0) {
         container.innerHTML = '<div class="empty">No live trades closed yet.</div>';
         return;
       }
-      const rows = trades.map(t => {
-        const pnlClass = t.live_pnl_value > 0 ? "pnl-pos" : (t.live_pnl_value < 0 ? "pnl-neg" : "");
-        const exitPrice = (t.live_exit_price !== null && t.live_exit_price !== undefined) ? t.live_exit_price : t.exit_price;
-        const exitReason = t.live_exit_reason || t.exit_reason || "";
+      const expandedDates = new Set();
+      container.querySelectorAll(".date-group.expanded .date-label").forEach(el => {
+        expandedDates.add(el.textContent);
+      });
+      const isFirstRender = expandedDates.size === 0 && container.querySelector(".date-group") === null;
+
+      const groups = groupTradesByDate(trades, "live_exit_time", "live_pnl_value");
+      const html = groups.map((g, idx) => {
+        const pnlClass = g.total_pnl > 0 ? "pnl-pos" : (g.total_pnl < 0 ? "pnl-neg" : "");
+        const sign = g.total_pnl > 0 ? "+" : "";
+        const expanded = expandedDates.has(g.date) || (isFirstRender && idx === 0);
+        const rows = g.trades.map(t => {
+          const pnlClassRow = t.live_pnl_value > 0 ? "pnl-pos" : (t.live_pnl_value < 0 ? "pnl-neg" : "");
+          const exitPrice = (t.live_exit_price !== null && t.live_exit_price !== undefined) ? t.live_exit_price : t.exit_price;
+          const exitReason = t.live_exit_reason || t.exit_reason || "";
+          return `
+            <tr>
+              <td>${escapeHtml(t.symbol)}${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)}</div>` : ""}</td>
+              <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
+              <td>${t.live_quantity}</td>
+              <td>${(t.live_entry_price !== null && t.live_entry_price !== undefined) ? t.live_entry_price : t.entry_price}</td>
+              <td>${exitPrice}</td>
+              <td class="${pnlClassRow}">${t.live_pnl_value}</td>
+              <td>${escapeHtml(exitReason)}</td>
+              <td><span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span></td>
+              <td>${t.live_entry_order_id || "-"}</td>
+              <td>${t.live_exit_order_id || "-"}</td>
+            </tr>
+          `;
+        }).join("");
         return `
-          <tr>
-            <td>${escapeHtml(t.symbol)}${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)}</div>` : ""}</td>
-            <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
-            <td>${t.live_quantity}</td>
-            <td>${(t.live_entry_price !== null && t.live_entry_price !== undefined) ? t.live_entry_price : t.entry_price}</td>
-            <td>${exitPrice}</td>
-            <td class="${pnlClass}">${t.live_pnl_value}</td>
-            <td>${escapeHtml(exitReason)}</td>
-            <td><span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span></td>
-            <td>${t.live_entry_order_id || "-"}</td>
-            <td>${t.live_exit_order_id || "-"}</td>
-          </tr>
+          <div class="date-group${expanded ? " expanded" : ""}">
+            <div class="date-header" onclick="this.parentElement.classList.toggle('expanded')">
+              <div class="date-left">
+                <span class="date-label">${g.date}</span>
+                <span class="date-count">${g.trades.length} trade${g.trades.length !== 1 ? "s" : ""}</span>
+              </div>
+              <div class="date-right">
+                <span class="date-pnl ${pnlClass}">${sign}Rs ${g.total_pnl}</span>
+                <span class="chevron">&#9660;</span>
+              </div>
+            </div>
+            <div class="date-trades">
+              <table>
+                <tr><th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry</th><th>Exit</th>
+                    <th>P&amp;L (Rs)</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th></tr>
+                ${rows}
+              </table>
+            </div>
+          </div>
         `;
       }).join("");
-      container.innerHTML = `
-        <table>
-          <tr><th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry</th><th>Exit</th>
-              <th>P&amp;L (Rs)</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th></tr>
-          ${rows}
-        </table>
-      `;
+      container.innerHTML = html;
     }
 
     async function refreshTrades() {

@@ -432,7 +432,8 @@ def init_db():
                 live_trail_high_pct DOUBLE PRECISION,
                 live_exit_reason TEXT,
                 live_exit_price DOUBLE PRECISION,
-                live_entry_price DOUBLE PRECISION
+                live_entry_price DOUBLE PRECISION,
+                live_exit_time TEXT
             )
             """
         )
@@ -469,6 +470,7 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_reason TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_price DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_entry_price DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_time TEXT",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -1939,11 +1941,13 @@ def run_paper_trade_check() -> dict:
                             live_exit_order_id = COALESCE(?, live_exit_order_id),
                             live_error = COALESCE(?, live_error),
                             live_exit_reason = ?,
-                            live_exit_price = COALESCE(?, live_exit_price)
+                            live_exit_price = COALESCE(?, live_exit_price),
+                            live_exit_time = CASE WHEN ? THEN ? ELSE live_exit_time END
                         WHERE id = ?
                         """,
                         (live_exit_order_id is not None, live_exit_order_id, live_exit_error,
-                         live_exit_reason_val, live_fill_price, trade["id"]),
+                         live_exit_reason_val, live_fill_price,
+                         live_exit_order_id is not None, now, trade["id"]),
                     )
                     conn.commit()
             elif live_trail_update is not None:
@@ -2237,22 +2241,26 @@ def attach_running_balance(closed_trades_desc: list[dict], starting_capital: flo
         t["balance_after"] = round(running, 2)
 
 
-def group_trades_by_date(trades: list[dict]) -> list[dict]:
+def group_trades_by_date(trades: list[dict], date_field: str = "exit_time", pnl_field: str = "pnl") -> list[dict]:
     """Groups closed trades by exit date into [{"date", "total_pnl",
     "trades"}, ...], most recent date first - powers the collapsible
-    per-day view (like a trading diary). Only one trade is ever open at a
-    time in this app, so entry order and exit order are the same
-    sequence - the existing id-DESC ordering already groups cleanly into
-    contiguous same-day blocks without needing to re-sort."""
+    per-day view (like a trading diary). date_field/pnl_field let this
+    serve both paper trades (exit_time/pnl) and live trades
+    (live_exit_time/live_pnl_value), which can now close at different
+    times/prices since the two run independent exit rules. Rows aren't
+    guaranteed to already be in date order here (unlike the paper-only
+    case, since live_exit_time isn't tied to insertion order the way
+    exit_time was), so this sorts by the date field first."""
+    trades_sorted = sorted(trades, key=lambda t: t.get(date_field) or "", reverse=True)
     groups: list[dict] = []
     current_date = None
-    for t in trades:
-        exit_date = (t.get("exit_time") or "")[:10] or "Unknown"
+    for t in trades_sorted:
+        exit_date = (t.get(date_field) or "")[:10] or "Unknown"
         if exit_date != current_date:
             groups.append({"date": exit_date, "total_pnl": 0.0, "trades": []})
             current_date = exit_date
         groups[-1]["trades"].append(t)
-        groups[-1]["total_pnl"] += t.get("pnl") or 0
+        groups[-1]["total_pnl"] += t.get(pnl_field) or 0
     for g in groups:
         g["total_pnl"] = round(g["total_pnl"], 2)
     return groups
@@ -2363,6 +2371,7 @@ def live_trading_page():
         t["live_pnl_value"] = round((exit_p - entry) * qty, 2)
 
     live_stats = compute_live_stats(open_trades, closed_trades)
+    closed_by_date = group_trades_by_date(closed_trades, date_field="live_exit_time", pnl_field="live_pnl_value")
     token_saved = bool(get_setting("upstox_access_token"))
     live_available_funds = None
     if token_saved:
@@ -2373,6 +2382,7 @@ def live_trading_page():
         active_tab="live",
         open_trades=open_trades,
         closed_trades=closed_trades,
+        closed_by_date=closed_by_date,
         live_trading_enabled=get_live_trading_enabled(),
         live_open=live_stats["live_open"],
         live_closed=live_stats["live_closed"],
@@ -2613,7 +2623,8 @@ def paper_trading_manual_exit(trade_id):
                     live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
                     live_error = COALESCE(?, live_error),
                     live_exit_reason = CASE WHEN ? THEN 'Manual exit' ELSE live_exit_reason END,
-                    live_exit_price = CASE WHEN ? THEN COALESCE(?, live_exit_price) ELSE live_exit_price END
+                    live_exit_price = CASE WHEN ? THEN COALESCE(?, live_exit_price) ELSE live_exit_price END,
+                    live_exit_time = CASE WHEN ? THEN ? ELSE live_exit_time END
                 WHERE id = ?
                 """,
                 (
@@ -2624,6 +2635,8 @@ def paper_trading_manual_exit(trade_id):
                     live_exit_order_id is not None,
                     live_exit_order_id is not None,
                     live_fill_price,
+                    live_exit_order_id is not None,
+                    now,
                     trade_id,
                 ),
             )
@@ -2641,10 +2654,11 @@ def paper_trading_manual_exit(trade_id):
                     live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
                     live_error = COALESCE(?, live_error),
                     live_exit_reason = 'Manual exit',
-                    live_exit_price = COALESCE(?, live_exit_price)
+                    live_exit_price = COALESCE(?, live_exit_price),
+                    live_exit_time = ?
                 WHERE id = ?
                 """,
-                (live_exit_order_id, live_exit_order_id is not None, live_exit_error, live_fill_price, trade_id),
+                (live_exit_order_id, live_exit_order_id is not None, live_exit_error, live_fill_price, now, trade_id),
             )
             conn.commit()
         return jsonify({"status": "ok", "exit_price": exit_price, "note": "Closed the live leg only (paper side had already closed)"})
