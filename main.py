@@ -1444,7 +1444,7 @@ _ws_lock = threading.Lock()
 _ws_streamer = None
 _ws_subscribed_keys: set[str] = set()
 _ws_thread_started = False
-_ws_debug: dict = {"status": "not_started", "error": None, "last_message_at": None, "sdk_available": None}
+_ws_debug: dict = {"status": "not_started", "error": None, "last_message_at": None, "sdk_available": None, "connect_attempts": 0}
 
 WS_PRICE_MAX_AGE_SECONDS = 5  # a cached tick older than this is treated as stale, not used
 
@@ -1523,13 +1523,60 @@ def _ws_run(access_token: str) -> None:
                 upstox_client.ApiClient(configuration), initial_keys, "ltpc"
             )
             streamer.on("message", _ws_on_message)
+            # Best-effort: register open/close/error events too, if the
+            # SDK exposes them - wrapped individually since it's unverified
+            # which events this particular SDK version supports.
+            try:
+                streamer.on("open", lambda *a: _ws_debug.update({"status": "streaming", "error": None}))
+            except Exception:
+                pass
+            try:
+                streamer.on("error", lambda *a: _ws_debug.update({"status": "error", "error": f"ws error event: {a}"}))
+            except Exception:
+                pass
+            try:
+                streamer.on("close", lambda *a: _ws_debug.update({"status": "disconnected"}))
+            except Exception:
+                pass
             _ws_streamer = streamer
             _ws_debug["status"] = "connecting"
-            streamer.connect()  # blocks until the connection drops
-            _ws_debug["status"] = "disconnected"
+            _ws_debug["connect_attempts"] += 1
+            streamer.connect()
+            # connect() may block for the life of the connection (a
+            # typical run_forever pattern), or may return quickly after
+            # starting the feed on its own internal thread - handled
+            # either way below via a staleness monitor, instead of
+            # treating "connect() returned" as "it disconnected" and
+            # immediately retrying in a tight loop (which is what produced
+            # a connect/reconnect flap in testing - status kept landing on
+            # 'disconnected' with no actual error).
         except Exception as e:
             _ws_debug["status"] = "error"
             _ws_debug["error"] = str(e)
+            _ws_streamer = None
+            time.sleep(5)
+            continue
+
+        # Monitor loop: only treat the feed as dead (and reconnect) once
+        # it's genuinely gone quiet for a while with subscriptions active -
+        # not the instant connect() happens to return.
+        quiet_checks = 0
+        while True:
+            time.sleep(10)
+            if _ws_debug["status"] == "error":
+                break  # the "error" event fired above - go reconnect
+            last_msg = _ws_debug.get("last_message_at")
+            if last_msg:
+                age = (datetime.utcnow() - datetime.fromisoformat(last_msg)).total_seconds()
+                if age < 60:
+                    quiet_checks = 0
+                    continue
+            if not _ws_subscribed_keys:
+                continue  # nothing subscribed yet - silence is expected, not staleness
+            quiet_checks += 1
+            if quiet_checks >= 3:  # ~30s of silence despite active subscriptions
+                _ws_debug["status"] = "stale_reconnecting"
+                break
         _ws_streamer = None
         time.sleep(5)  # brief pause before reconnecting, avoid a hot retry loop
 
