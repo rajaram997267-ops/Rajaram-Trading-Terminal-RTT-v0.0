@@ -1760,6 +1760,26 @@ def run_paper_trade_check() -> dict:
             entry_price = trade["entry_price"]
             strategy = trade["strategy"] or "EMA"
 
+            # Paper and live each resolve their own ATM contract at entry
+            # time (both from the same alert price, moments apart) - in
+            # practice that's almost always the same strike, but if it
+            # ever isn't, live's own decisions (both the price used for %
+            # checks AND the candle series used for the 5-EMA check) must
+            # use live's own contract, not paper's. Only does the extra
+            # work when they actually differ - the common case reuses
+            # candles/last_price with no extra calls.
+            live_instrument_key = trade["live_instrument_key"]
+            if live_instrument_key and live_instrument_key != instrument_key:
+                live_candles = fetch_5min_candles(live_instrument_key, access_token)
+                live_ws_price = get_ws_price(live_instrument_key)
+                if live_ws_price is not None:
+                    live_last_price = live_ws_price
+                else:
+                    live_last_price = live_candles[-1][3] if live_candles else None
+            else:
+                live_candles = candles
+                live_last_price = last_price
+
             exited = False
             exit_price = None
             exit_reason = None
@@ -1911,13 +1931,19 @@ def run_paper_trade_check() -> dict:
             live_exited = False
             live_exit_reason_val = None
             live_trail_update = None
-            if trade["live_status"] == "OPEN" and last_price is not None and entry_price:
-                live_pct_change = (last_price - entry_price) / entry_price * 100
+            # Must use the REAL fill price (live_entry_price), not the
+            # paper trade's theoretical entry_price - a market order can
+            # fill at a genuinely different price, so using paper's number
+            # here would make live's own +2%/trailing checkpoints wrong
+            # relative to what was actually paid.
+            live_entry_ref = trade["live_entry_price"] if trade["live_entry_price"] is not None else entry_price
+            if trade["live_status"] == "OPEN" and live_last_price is not None and live_entry_ref:
+                live_pct_change = (live_last_price - live_entry_ref) / live_entry_ref * 100
                 if trade["live_trail_high_pct"] is None:
                     if live_pct_change >= 2.0:
                         live_trail_update = int(live_pct_change // 0.5) * 0.5
                     else:
-                        live_exited, _ = check_exit("Buy", candles)
+                        live_exited, _ = check_exit("Buy", live_candles)
                         if live_exited:
                             live_exit_reason_val = "5-EMA exit (before +2%)"
                 else:
