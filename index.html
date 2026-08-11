@@ -214,6 +214,45 @@
     .section-header.sell h3 { color: #ff5370; }
     .section-header.buy h3 { color: var(--green); }
     .section-header.others h3 { color: var(--gold); }
+    .side-switch {
+      position: relative;
+      display: inline-block;
+      width: 32px;
+      height: 18px;
+      flex: none;
+      margin-left: 4px;
+    }
+    .side-switch input { opacity: 0; width: 0; height: 0; }
+    .side-slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: var(--border);
+      transition: .15s;
+      border-radius: 18px;
+    }
+    .side-slider:before {
+      position: absolute;
+      content: "";
+      height: 13px; width: 13px;
+      left: 2.5px; bottom: 2.5px;
+      background-color: var(--text);
+      transition: .15s;
+      border-radius: 50%;
+    }
+    .section-header.sell .side-switch input:checked + .side-slider { background-color: #ff5370; }
+    .section-header.buy .side-switch input:checked + .side-slider { background-color: var(--green); }
+    .side-switch input:checked + .side-slider:before { transform: translateX(14px); }
+    .category-column.side-off {
+      opacity: 0.4;
+    }
+    .side-off-label {
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-left: 2px;
+    }
     .section-line {
       flex: 1;
       height: 1px;
@@ -392,10 +431,17 @@
         {% if grouped %}
           <div class="categories-row">
             {% for category, items in grouped %}
-            <div class="category-column" data-category="{{ category }}">
+            <div class="category-column{% if category == 'Buy' and not buy_alerts_enabled %} side-off{% elif category == 'Sell' and not sell_alerts_enabled %} side-off{% endif %}" data-category="{{ category }}">
               <div class="section-header {{ category|lower }}">
                 <h3>{{ category }}</h3>
                 <span class="section-count">{{ items|length }}</span>
+                {% if category in ('Buy', 'Sell') %}
+                <label class="side-switch">
+                  <input type="checkbox" {% if (category == 'Buy' and buy_alerts_enabled) or (category == 'Sell' and sell_alerts_enabled) %}checked{% endif %} onchange="toggleSide('{{ category }}', this)">
+                  <span class="side-slider"></span>
+                </label>
+                <span class="side-off-label" style="display:{% if (category == 'Buy' and buy_alerts_enabled) or (category == 'Sell' and sell_alerts_enabled) %}none{% else %}inline{% endif %};">off</span>
+                {% endif %}
                 <div class="section-line"></div>
               </div>
               <div class="category-list">
@@ -430,6 +476,8 @@
   <script>
     const SELECTED_DATE = {{ selected_date|tojson }};
     const TODAY_STR = {{ today_str|tojson }};
+    let buyAlertsEnabled = {{ buy_alerts_enabled|tojson }};
+    let sellAlertsEnabled = {{ sell_alerts_enabled|tojson }};
     const CATEGORY_ORDER = ["Sell", "Buy", "Others"];
     // Remembers the globally chosen sector so it survives the 5s
     // auto-refresh instead of resetting to "All sectors" every time.
@@ -467,11 +515,21 @@
     }
 
     function sectionHTML(category, items) {
+      const isToggleable = category === "Buy" || category === "Sell";
+      const isEnabled = category === "Buy" ? buyAlertsEnabled : (category === "Sell" ? sellAlertsEnabled : true);
+      const switchHtml = isToggleable ? `
+            <label class="side-switch">
+              <input type="checkbox" ${isEnabled ? "checked" : ""} onchange="toggleSide('${category}', this)">
+              <span class="side-slider"></span>
+            </label>
+            <span class="side-off-label" style="display:${isEnabled ? "none" : "inline"};">off</span>
+      ` : "";
       return `
-        <div class="category-column" data-category="${category}">
+        <div class="category-column${!isEnabled ? " side-off" : ""}" data-category="${category}">
           <div class="section-header ${category.toLowerCase()}">
             <h3>${category}</h3>
             <span class="section-count">${items.length}</span>
+            ${switchHtml}
             <div class="section-line"></div>
           </div>
           <div class="category-list">${items.map(rowHTML).join("")}</div>
@@ -501,6 +559,31 @@
       document.querySelectorAll("#alertsContainer .list-row").forEach(row => {
         row.style.display = (!globalSector || row.dataset.sector === globalSector) ? "" : "none";
       });
+    }
+
+    // Toggles whether Buy-side or Sell-side alerts create a trade. The
+    // alert feed itself is never hidden by this - only trade creation.
+    async function toggleSide(category, checkbox) {
+      const enabled = checkbox.checked;
+      try {
+        const res = await fetch("/api/paper-trading/category-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ category, enabled }),
+        });
+        const result = await res.json();
+        if (category === "Buy") buyAlertsEnabled = result.enabled;
+        if (category === "Sell") sellAlertsEnabled = result.enabled;
+        const column = checkbox.closest(".category-column");
+        if (column) column.classList.toggle("side-off", !result.enabled);
+        const label = checkbox.parentElement.nextElementSibling;
+        if (label && label.classList.contains("side-off-label")) {
+          label.style.display = result.enabled ? "none" : "inline";
+        }
+      } catch (err) {
+        checkbox.checked = !enabled;
+        console.error("Toggle failed", err);
+      }
     }
 
     // Fetches each sector's today's % change and fills in the sidebar,

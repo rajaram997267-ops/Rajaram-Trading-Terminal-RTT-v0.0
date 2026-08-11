@@ -511,6 +511,19 @@ def get_sector_filter_enabled() -> bool:
     return get_setting("sector_filter_enabled", "false") == "true"
 
 
+def get_buy_alerts_enabled() -> bool:
+    """On by default - when off, Buy alerts still show up on the dashboard
+    (the raw alert feed is untouched) but never open a paper or live
+    trade. Lets the user favor one side based on market sentiment without
+    losing visibility into what's firing."""
+    return get_setting("buy_alerts_enabled", "true") == "true"
+
+
+def get_sell_alerts_enabled() -> bool:
+    """Same as get_buy_alerts_enabled() but for Sell alerts."""
+    return get_setting("sell_alerts_enabled", "true") == "true"
+
+
 def get_sector_filter_top_n() -> int:
     try:
         return int(get_setting("sector_filter_top_n", "5"))
@@ -634,6 +647,15 @@ def create_paper_trades_for_batch(data: dict) -> None:
     signal independently."""
     category = categorize(data)
     if category not in ("Buy", "Sell"):
+        return
+
+    # Per-side kill switch - lets the user favor Buy-only or Sell-only
+    # based on market sentiment. The alert itself still shows on the
+    # dashboard (saved separately in the webhook handler) - only trade
+    # creation is skipped here.
+    if category == "Buy" and not get_buy_alerts_enabled():
+        return
+    if category == "Sell" and not get_sell_alerts_enabled():
         return
 
     with get_db() as conn:
@@ -2191,6 +2213,8 @@ def index():
             available_dates=available_dates,
             selected_date=selected_date,
             today_str=today_str,
+            buy_alerts_enabled=get_buy_alerts_enabled(),
+            sell_alerts_enabled=get_sell_alerts_enabled(),
         )
     except Exception:
         import traceback
@@ -2616,6 +2640,20 @@ def paper_trading_sector_filter_toggle():
         "sector_filter_enabled": enabled,
         "sector_filter_top_n": get_sector_filter_top_n(),
     })
+
+
+@app.route("/api/paper-trading/category-toggle", methods=["POST"])
+def paper_trading_category_toggle():
+    """Turns Buy-side or Sell-side trade creation on/off. The alert feed on
+    the dashboard is unaffected either way - this only controls whether a
+    paper/live trade gets created from that side's alerts."""
+    data = request.get_json(silent=True) or {}
+    category = data.get("category")
+    enabled = bool(data.get("enabled"))
+    if category not in ("Buy", "Sell"):
+        return jsonify({"status": "error", "message": "category must be 'Buy' or 'Sell'"}), 400
+    set_setting(f"{category.lower()}_alerts_enabled", "true" if enabled else "false")
+    return jsonify({"status": "ok", "category": category, "enabled": enabled})
 
 
 @app.route("/api/paper-trading/reset", methods=["POST"])
