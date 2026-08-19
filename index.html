@@ -643,6 +643,28 @@
       }
     }
     setInterval(refreshAlerts, 5000);
+
+    // Instant push: the moment a new Chartink alert lands, the server
+    // wakes this connection up (see /api/stream/alerts) instead of us
+    // waiting for the next 5s poll to happen to catch it. The setInterval
+    // poll above stays in place as a fallback - if this connection drops
+    // (proxy hiccup, tab backgrounded, etc.) the poll still keeps things
+    // eventually consistent, this just makes the common case near-instant.
+    if (window.EventSource) {
+      let alertStream = null;
+      function connectAlertStream() {
+        alertStream = new EventSource("/api/stream/alerts");
+        alertStream.onmessage = (e) => {
+          if (e.data === "alert") refreshAlerts();
+        };
+        alertStream.onerror = () => {
+          // Browsers auto-reconnect EventSource on their own after a
+          // drop - nothing to do here beyond not letting an error bubble
+          // up and break anything else on the page.
+        };
+      }
+      connectAlertStream();
+    }
   </script>
 </body>
 </html>

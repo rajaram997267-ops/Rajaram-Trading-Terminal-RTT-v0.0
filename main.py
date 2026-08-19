@@ -4,7 +4,9 @@ import csv
 import gzip
 import io
 import json
+import math
 import os
+import queue
 import threading
 import time
 import urllib.error
@@ -13,17 +15,42 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 
-from flask import Flask, jsonify, render_template, request, redirect, url_for, make_response
+from flask import Flask, jsonify, render_template, request, redirect, url_for, make_response, Response
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
 app = Flask(__name__)
+
+# SSE pub/sub for instant dashboard alert pushes - each connected browser
+# tab holds one Queue here; a new alert puts a message on every queue at
+# once so the dashboard can refresh the instant a webhook lands, instead
+# of waiting on its 5s poll. The poll stays in place as a fallback (a
+# dropped SSE connection just means the poll keeps things eventually
+# consistent), this only makes the common case near-instant.
+_alert_subscribers: list[queue.Queue] = []
+_alert_subscribers_lock = threading.Lock()
+
+
+def notify_alert_subscribers() -> None:
+    """Wakes up every connected dashboard tab's SSE stream. Best-effort:
+    a full/broken queue for one subscriber is dropped silently rather
+    than blocking or failing the alert save that triggered this."""
+    with _alert_subscribers_lock:
+        subscribers = list(_alert_subscribers)
+    for q in subscribers:
+        try:
+            q.put_nowait("alert")
+        except Exception:
+            pass
+
 
 SECTOR_MAP = {
     "360ONE": "Financials",
@@ -331,10 +358,14 @@ class PGConnWrapper:
     a cursor with .fetchall()/.fetchone(), and rows support row["column"]
     access via RealDictCursor. This lets every existing query in this file
     work unchanged - only this class and init_db()'s schema needed to
-    change for the Postgres move."""
+    change for the Postgres move. Connections now come from a pool (see
+    get_db_pool below) rather than opening a fresh TCP+TLS connection on
+    every single query - real savings given the 5s background exit-check
+    loop alone does this dozens of times a minute."""
 
-    def __init__(self, conn):
+    def __init__(self, conn, pool):
         self._conn = conn
+        self._pool = pool
 
     def execute(self, query, params=None):
         pg_query = query.replace("?", "%s")  # sqlite-style -> psycopg2-style
@@ -352,11 +383,43 @@ class PGConnWrapper:
         try:
             if exc_type is None:
                 self._conn.commit()
+                self._pool.putconn(self._conn)
             else:
                 self._conn.rollback()
-        finally:
-            self._conn.close()
+                # Discard rather than return a connection that just hit an
+                # error - avoids handing the next caller a poisoned/half-
+                # broken connection out of the pool.
+                self._pool.putconn(self._conn, close=True)
+        except Exception:
+            try:
+                self._pool.putconn(self._conn, close=True)
+            except Exception:
+                pass
         return False
+
+
+_db_pool: ThreadedConnectionPool | None = None
+_db_pool_lock = threading.Lock()
+
+
+def get_db_pool() -> ThreadedConnectionPool:
+    """Lazily creates the connection pool on first use and reuses it for
+    the life of the process. minconn=1 keeps one connection warm;
+    maxconn=20 comfortably covers the 5s background exit-check loop, the
+    16-worker parallel sector-close loader, and normal request traffic at
+    the same time without exhausting a free-tier Postgres connection
+    limit."""
+    global _db_pool
+    if _db_pool is None:
+        with _db_pool_lock:
+            if _db_pool is None:  # re-check inside the lock - another thread may have just created it
+                if not DATABASE_URL:
+                    raise RuntimeError(
+                        "DATABASE_URL environment variable is not set - add your Neon "
+                        "connection string in Render's Environment settings."
+                    )
+                _db_pool = ThreadedConnectionPool(minconn=1, maxconn=20, dsn=DATABASE_URL)
+    return _db_pool
 
 
 def get_db():
@@ -365,8 +428,9 @@ def get_db():
             "DATABASE_URL environment variable is not set - add your Neon "
             "connection string in Render's Environment settings."
         )
-    conn = psycopg2.connect(DATABASE_URL)
-    return PGConnWrapper(conn)
+    pool = get_db_pool()
+    conn = pool.getconn()
+    return PGConnWrapper(conn, pool)
 
 
 def init_db():
@@ -644,6 +708,8 @@ def save_alert_batch(data: dict):
                 ),
             )
         conn.commit()
+
+    notify_alert_subscribers()
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +998,14 @@ def calculate_atr(candles: list[tuple[float, float, float, float]], period: int 
     return atr
 
 
+def _floor_to_step(value: float, step: float) -> float:
+    """Floor `value` down to the nearest multiple of `step`. Uses a tiny
+    epsilon so binary float imprecision doesn't clip a value that should
+    land exactly on a step (e.g. 0.6 landing on 2 steps of 0.2 instead of
+    3, because 0.6 / 0.2 comes out as 2.9999999999999996 in float math)."""
+    return round(math.floor(value / step + 1e-9) * step, 2)
+
+
 def check_exit(direction: str, candles: list[tuple[float, float, float, float]]):
     """candles: list of (open, high, low, close), oldest first.
     Buy exit: 2 consecutive red candles (close < open) closing below the
@@ -1186,46 +1260,64 @@ def _ist_today_str() -> str:
     return (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
 
 
+def _fetch_one_prev_close(symbol: str, access_token: str, today: str, from_date: str) -> tuple[str, float | None]:
+    """Fetches a single symbol's most recent completed daily close. Split
+    out from _load_prev_closes_background so it can run inside a thread
+    pool - one symbol's failure (timeout, bad instrument key, etc.) can't
+    affect any other's."""
+    key = get_instrument_key(symbol)
+    if not key:
+        return symbol, None
+    url = (
+        f"https://api.upstox.com/v2/historical-candle/"
+        f"{urllib.parse.quote(key, safe='|')}/day/{today}/{from_date}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+        candles = (payload.get("data") or {}).get("candles") or []
+        # Candles come back newest-first; the first entry is the most
+        # recent COMPLETED trading day (today's still-open session isn't
+        # included here), so its close is what we want.
+        return (symbol, candles[0][4]) if candles else (symbol, None)
+    except Exception:
+        return symbol, None
+
+
 def _load_prev_closes_background(access_token: str) -> None:
-    """Runs in a background thread: loops every mapped symbol and fetches
-    its most recent completed daily candle's close via the Historical
-    Candle Data API. This is ~180 sequential calls, so it's kept off the
-    request/response path entirely - callers just see stale/partial data
-    in _prev_close_cache until this finishes. Each symbol's close is
-    written to the DB as soon as it's fetched (not just at the end), so a
-    Render cold-start or redeploy mid-load never throws away progress
-    already made today."""
+    """Runs in a background thread: fetches every mapped symbol's most
+    recent completed daily close via the Historical Candle Data API, in
+    parallel across a 16-worker thread pool rather than ~180 calls one at
+    a time - this is what actually makes the sector sidebar populate in a
+    couple of seconds instead of well over a minute. Each symbol's close
+    is still written to the DB as soon as ITS OWN fetch completes (not
+    just at the end, and not in submission order - as_completed yields
+    whichever finishes first), so a Render cold-start or redeploy
+    mid-load never throws away progress already made today."""
     global _prev_close_cache, _prev_close_loading
     today = _ist_today_str()
     from_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=10)).strftime("%Y-%m-%d")
     closes: dict[str, float] = dict(_prev_close_cache["closes"])  # keep anything already loaded today
-    for symbol in SECTOR_MAP:
-        if symbol in closes:
-            continue  # already have it (from DB or an earlier partial run today)
-        key = get_instrument_key(symbol)
-        if not key:
-            continue
-        url = (
-            f"https://api.upstox.com/v2/historical-candle/"
-            f"{urllib.parse.quote(key, safe='|')}/day/{today}/{from_date}"
-        )
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json",
-                "User-Agent": BROWSER_USER_AGENT,
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                payload = json.loads(resp.read().decode())
-            candles = (payload.get("data") or {}).get("candles") or []
-            # Candles come back newest-first; the first entry is the most
-            # recent COMPLETED trading day (today's still-open session
-            # isn't included here), so its close is what we want.
-            if candles:
-                close = candles[0][4]
+    missing = [s for s in SECTOR_MAP if s not in closes]
+
+    if missing:
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            futures = {
+                pool.submit(_fetch_one_prev_close, s, access_token, today, from_date): s
+                for s in missing
+            }
+            for future in as_completed(futures):
+                symbol, close = future.result()
+                if close is None:
+                    continue
                 closes[symbol] = close
                 _prev_close_cache = {"date": today, "closes": dict(closes)}
                 with get_db() as conn:
@@ -1235,8 +1327,7 @@ def _load_prev_closes_background(access_token: str) -> None:
                         (symbol, close, today),
                     )
                     conn.commit()
-        except Exception:
-            continue
+
     _prev_close_cache = {"date": today, "closes": closes}
     _prev_close_loading = False
 
@@ -2229,33 +2320,49 @@ def run_paper_trade_check() -> dict:
                     exit_reason = "Stop-loss (-2%)"
 
             elif strategy == "ATR_TRAIL" and pct_change is not None:
-                # #6: Chandelier-style ATR trailing stop - stop distance
-                # scales with how much the option premium is actually
-                # moving (ATR), instead of a fixed %. This means the stop
-                # sits wider during choppy/volatile stretches (e.g. the
-                # first 15-30 minutes) and tighter once things calm down,
-                # rather than getting stopped out at the same distance
-                # regardless of conditions. A hard -2% floor covers the
-                # trade only until there's enough candle history
-                # (atr_period + 1 candles) to compute the first ATR
-                # reading - after that, the ATR stop takes over entirely.
-                atr_period = get_atr_period()
-                atr_multiplier = get_atr_multiplier()
-                atr_series = calculate_atr(candles or [], atr_period)
-                current_atr = atr_series[-1] if atr_series else None
-                if current_atr is None:
-                    if pct_change <= -2.0:
-                        exited, exit_price = True, last_price
-                        exit_reason = "Stop-loss (-2%, ATR not ready yet)"
-                else:
-                    peak_price = trade["atr_trail_peak_price"]
-                    peak_price = max(peak_price, last_price) if peak_price is not None else max(entry_price, last_price)
-                    stop_price = peak_price - (current_atr * atr_multiplier)
-                    if last_price <= stop_price:
-                        exited, exit_price = True, last_price
-                        exit_reason = f"ATR trailing stop ({atr_period}p x{atr_multiplier:g}, stop {stop_price:.2f})"
+                # #6 (hybrid): ATR (Chandelier-style) protects the
+                # downside only until +2% profit - stop distance scales
+                # with how much the premium is actually moving, so it
+                # sits wider in choppy/volatile stretches and tighter once
+                # things calm down, instead of a fixed %. A -2% floor
+                # covers the trade until there's enough candle history for
+                # the first ATR reading. Once +2% is reached, ATR hands
+                # off entirely to a plain 0.5%-step trailing stop on the %
+                # gain (same mechanism as strategy #3, wider steps) - this
+                # is what actually locks in profit mechanically, rather
+                # than risk ATR suddenly going quiet on a winning trade
+                # and loosening the stop right when it should be tightest.
+                if trade["trail_high_pct"] is None:
+                    if pct_change >= 2.0:
+                        trail_update = {"trail_high_pct": _floor_to_step(pct_change, 0.5)}
                     else:
-                        trail_update = {"atr_trail_peak_price": peak_price}
+                        atr_period = get_atr_period()
+                        atr_multiplier = get_atr_multiplier()
+                        atr_series = calculate_atr(candles or [], atr_period)
+                        current_atr = atr_series[-1] if atr_series else None
+                        if current_atr is None:
+                            if pct_change <= -2.0:
+                                exited, exit_price = True, last_price
+                                exit_reason = "Stop-loss (-2%, ATR not ready yet)"
+                        else:
+                            peak_price = trade["atr_trail_peak_price"]
+                            peak_price = max(peak_price, last_price) if peak_price is not None else max(entry_price, last_price)
+                            stop_price = peak_price - (current_atr * atr_multiplier)
+                            if last_price <= stop_price:
+                                exited, exit_price = True, last_price
+                                exit_reason = f"ATR stop ({atr_period}p x{atr_multiplier:g}, stop {stop_price:.2f})"
+                            else:
+                                trail_update = {"atr_trail_peak_price": peak_price}
+                else:
+                    trail_high = trade["trail_high_pct"]
+                    current_milestone = _floor_to_step(pct_change, 0.5)
+                    if current_milestone > trail_high:
+                        trail_update = {"trail_high_pct": current_milestone}
+                    else:
+                        stop_pct = round(trail_high - 0.5, 2)
+                        if pct_change <= stop_pct:
+                            exited, exit_price = True, last_price
+                            exit_reason = f"Trailing stop ({stop_pct:g}%) after ATR phase"
 
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
@@ -2621,6 +2728,34 @@ def api_alerts():
     return jsonify(merged_alerts)
 
 
+@app.route("/api/stream/alerts")
+def stream_alerts():
+    """Server-Sent Events endpoint - each connected dashboard tab holds
+    this connection open and gets a one-word push the instant a new
+    Chartink alert is saved (see notify_alert_subscribers, called from
+    save_alert_batch), instead of waiting on the 5s poll to happen to
+    catch it. A 20s idle heartbeat keeps the connection from being
+    dropped by an idle-timeout proxy in between real alerts."""
+    def event_stream():
+        q: queue.Queue = queue.Queue(maxsize=10)
+        with _alert_subscribers_lock:
+            _alert_subscribers.append(q)
+        try:
+            yield "data: connected\n\n"
+            while True:
+                try:
+                    message = q.get(timeout=20)
+                    yield f"data: {message}\n\n"
+                except queue.Empty:
+                    yield "data: ping\n\n"
+        finally:
+            with _alert_subscribers_lock:
+                if q in _alert_subscribers:
+                    _alert_subscribers.remove(q)
+
+    return Response(event_stream(), mimetype="text/event-stream")
+
+
 @app.route("/webhook/chartink", methods=["POST"])
 def chartink_webhook():
     data = request.get_json(silent=True)
@@ -2638,6 +2773,80 @@ def clear_alerts():
         conn.execute("DELETE FROM alerts")
         conn.commit()
     return redirect(url_for("index"))
+
+
+def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
+    """Adds a human-readable 'stop_info' string (and 'atr_value' when
+    relevant) to each open trade, showing exactly where its stop actually
+    sits right now - not just the exit_reason that appears after the fact
+    once it's hit. Strategy-aware: reads the same fields/logic
+    run_paper_trade_check uses to decide exits, so this is a live view of
+    the real stop, not an approximation. For ATR_TRAIL specifically, this
+    also does a fresh ATR calculation off the latest candles (one extra
+    Upstox call per open trade using that strategy - never more than one,
+    since only a single position is open at a time in this app)."""
+    for t in open_trades:
+        strategy = t.get("strategy") or "EMA"
+        entry = t.get("entry_price")
+        if not entry:
+            t["stop_info"] = None
+            t["atr_value"] = None
+            continue
+
+        if strategy == "HALF_HALF_HARD4":
+            stop_pct = 0.0 if t.get("target1_hit_time") else -2.0
+            stop_price = entry * (1 + stop_pct / 100)
+            t["stop_info"] = f"{'Breakeven' if stop_pct == 0 else 'Stop'}: {stop_pct:+.1f}% ({stop_price:.2f})"
+            t["atr_value"] = None
+
+        elif strategy == "TRAIL_FROM_2":
+            trail_high = t.get("trail_high_pct")
+            stop_pct = -2.0 if trail_high is None else round(trail_high - 0.2, 2)
+            stop_price = entry * (1 + stop_pct / 100)
+            t["stop_info"] = f"{'Stop' if trail_high is None else 'Trail stop'}: {stop_pct:+.2f}% ({stop_price:.2f})"
+            t["atr_value"] = None
+
+        elif strategy in ("FULL_AT_2", "FULL_AT_4"):
+            stop_price = entry * 0.98
+            t["stop_info"] = f"Stop: -2.0% ({stop_price:.2f})"
+            t["atr_value"] = None
+
+        elif strategy == "ATR_TRAIL":
+            trail_high = t.get("trail_high_pct")
+            if trail_high is not None:
+                # Past +2% - in the plain 0.5%-step trailing phase.
+                stop_pct = round(trail_high - 0.5, 2)
+                stop_price = entry * (1 + stop_pct / 100)
+                t["stop_info"] = f"Trail stop: {stop_pct:+.2f}% ({stop_price:.2f})"
+                t["atr_value"] = None
+            else:
+                # Still in the ATR phase - recompute live off fresh candles.
+                current_atr = None
+                instrument_key = t.get("paper_instrument_key")
+                if instrument_key and access_token:
+                    try:
+                        candles = fetch_5min_candles(instrument_key, access_token)
+                        atr_series = calculate_atr(candles, get_atr_period())
+                        current_atr = atr_series[-1] if atr_series else None
+                    except Exception:
+                        current_atr = None
+                if current_atr is None:
+                    t["stop_info"] = "Stop: -2.0% (ATR warming up)"
+                    t["atr_value"] = None
+                else:
+                    last_price = t.get("last_checked_price")
+                    peak_price = t.get("atr_trail_peak_price") or entry
+                    if last_price is not None:
+                        peak_price = max(peak_price, last_price)
+                    atr_mult = get_atr_multiplier()
+                    stop_price = peak_price - (current_atr * atr_mult)
+                    stop_pct = round((stop_price / entry - 1) * 100, 2)
+                    t["atr_value"] = round(current_atr, 2)
+                    t["stop_info"] = f"ATR stop: {stop_price:.2f} ({stop_pct:+.2f}%)"
+
+        else:
+            t["stop_info"] = None
+            t["atr_value"] = None
 
 
 def attach_unrealized_pnl(open_trades: list[dict]) -> None:
@@ -2732,6 +2941,7 @@ def paper_trading():
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
+    attach_stop_info(open_trades, get_setting("upstox_access_token"))
 
     total_pnl = sum(t["pnl"] for t in closed_trades if t["pnl"] is not None)
     wins = sum(1 for t in closed_trades if (t["pnl"] or 0) > 0)
@@ -2904,6 +3114,7 @@ def paper_trading_data():
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     access_token = get_setting("upstox_access_token")
+    attach_stop_info(open_trades, access_token)
     live_available_funds = get_upstox_available_funds_for_display(access_token) if access_token else None
 
     return jsonify({
@@ -2961,7 +3172,7 @@ STRATEGY_DESCRIPTIONS = {
     "TRAIL_FROM_2": "3) Hard -2% stop-loss protects until +2%. No half-booking - the full quantity starts trailing from +2%, in 0.2% steps, always one step behind the peak.",
     "FULL_AT_2": "4) Hard -2% stop-loss protects until +2%, then the full quantity exits at +2% - one fixed target, 1:1 risk-reward.",
     "FULL_AT_4": "5) Hard -2% stop-loss protects until +4%, then the full quantity exits at +4% - one fixed target, 1:2 risk-reward.",
-    "ATR_TRAIL": "6) ATR trailing stop (Chandelier-style) - stop = highest price since entry minus (ATR x multiplier), so the stop distance widens automatically in choppy/volatile conditions and tightens when calm, instead of a fixed %. Uses the ATR period/multiplier set below. A -2% floor protects the trade until enough candle history exists to compute the first ATR reading.",
+    "ATR_TRAIL": "6) Hybrid ATR + trail: an ATR (Chandelier-style) stop protects the downside until +2% profit - stop = highest price since entry minus (ATR x multiplier), widening automatically in choppy conditions and tightening when calm. A -2% floor covers the trade until enough candle history exists for the first ATR reading. Once +2% is reached, hands off entirely to a plain 0.5% step trailing stop on the % gain, to lock in profit mechanically. Uses the ATR period/multiplier set below.",
 }
 
 
