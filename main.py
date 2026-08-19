@@ -423,6 +423,7 @@ def init_db():
                 paper_instrument_key TEXT,
                 paper_option_label TEXT,
                 strategy TEXT DEFAULT 'EMA',
+                entry_reason TEXT,
                 original_quantity INTEGER,
                 target1_hit_time TEXT,
                 target1_exit_price DOUBLE PRECISION,
@@ -460,6 +461,7 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS paper_instrument_key TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS paper_option_label TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'EMA'",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_reason TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS original_quantity INTEGER",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_hit_time TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_exit_price DOUBLE PRECISION",
@@ -496,12 +498,11 @@ def get_live_trading_enabled() -> bool:
 
 
 def get_exit_strategy() -> str:
-    """Which exit strategy new trades use: 'EMA' (the original 5-EMA-only
-    rule) or 'TARGETS' (book half at +2%, protect the rest at breakeven,
-    take the remaining half at +4% - falling back to the 5-EMA rule only
-    for protection before Target-1 is ever hit). Defaults to EMA so
-    deploying this code doesn't silently change existing behavior."""
-    return get_setting("exit_strategy", "EMA")
+    """Which exit strategy new trades use. Defaults to TRAIL_FROM_2 (hard
+    -2% stop-loss, full quantity trails from +2% in 0.2% steps) since
+    'EMA' was retired from selection - it let losses run too deep waiting
+    for a pattern reversal to confirm, instead of a hard stop."""
+    return get_setting("exit_strategy", "TRAIL_FROM_2")
 
 
 def get_sector_filter_enabled() -> bool:
@@ -522,6 +523,14 @@ def get_buy_alerts_enabled() -> bool:
 def get_sell_alerts_enabled() -> bool:
     """Same as get_buy_alerts_enabled() but for Sell alerts."""
     return get_setting("sell_alerts_enabled", "true") == "true"
+
+
+def get_poc_filter_enabled() -> bool:
+    """Off by default - when on, an alert only opens a trade if the
+    option's own price has closed on the correct side of its Volume
+    Profile POC (above for a Call/Buy alert, below for a Put/Sell alert),
+    computed over today's session so far."""
+    return get_setting("poc_filter_enabled", "false") == "true"
 
 
 def get_sector_filter_top_n() -> int:
@@ -710,6 +719,7 @@ def create_paper_trades_for_batch(data: dict) -> None:
     paper_instrument_key = None
     paper_option_label = None
     fallback_note = None
+    entry_reason = None
     if option and premium and premium > 0:
         capital = get_current_capital()
         lot_size = option["lot_size"]
@@ -718,6 +728,12 @@ def create_paper_trades_for_batch(data: dict) -> None:
         entry_price = premium
         paper_instrument_key = option["instrument_key"]
         paper_option_label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
+
+        if get_poc_filter_enabled():
+            poc_ok, poc_reason = poc_qualifies(option["instrument_key"], category, premium, access_token)
+            if not poc_ok:
+                return  # doesn't qualify - skip this alert entirely, no paper or live trade
+            entry_reason = poc_reason
     else:
         capital = get_current_capital()
         quantity = int(capital // price_val) or 1
@@ -1320,6 +1336,78 @@ def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[flo
     return resample_1min_to_5min(raw_candles)
 
 
+def fetch_intraday_candles_with_volume(instrument_key: str, access_token: str) -> list[tuple[float, float, float, float, float]]:
+    """Same endpoint as fetch_5min_candles, but keeps volume and returns
+    raw 1-minute candles (not resampled) - needed for the Volume Profile
+    POC calculation, which fetch_5min_candles' OHLC-only tuples don't
+    carry. Returns (open, high, low, close, volume), oldest first."""
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/1minute"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode())
+    raw_candles = payload.get("data", {}).get("candles", [])
+    # Upstox candle format: [timestamp, open, high, low, close, volume, oi]
+    raw_candles = sorted(raw_candles, key=lambda c: c[0])
+    return [(c[1], c[2], c[3], c[4], c[5]) for c in raw_candles]
+
+
+def get_poc_price(instrument_key: str, access_token: str) -> float | None:
+    """Computes the Point of Control (the price level with the highest
+    traded volume) for this option contract's own price action, over
+    today's session so far - a simplified Volume Profile Fixed Range: each
+    1-minute candle's full volume is attributed to the bucket containing
+    its close price (not split across the candle's high-low range), across
+    20 buckets spanning today's close-price range. Returns None if there's
+    not enough data yet to compute a meaningful profile."""
+    try:
+        candles = fetch_intraday_candles_with_volume(instrument_key, access_token)
+    except Exception:
+        return None
+    if not candles or len(candles) < 3:
+        return None
+    closes = [c[3] for c in candles]
+    lo, hi = min(closes), max(closes)
+    if hi <= lo:
+        return closes[-1]
+    bucket_count = 20
+    bucket_size = (hi - lo) / bucket_count
+    volume_by_bucket: dict[int, float] = {}
+    for _, _, _, close, volume in candles:
+        idx = min(int((close - lo) / bucket_size), bucket_count - 1)
+        volume_by_bucket[idx] = volume_by_bucket.get(idx, 0) + (volume or 0)
+    if not volume_by_bucket:
+        return None
+    poc_bucket = max(volume_by_bucket, key=volume_by_bucket.get)
+    poc_price = lo + (poc_bucket + 0.5) * bucket_size
+    return round(poc_price, 2)
+
+
+def poc_qualifies(instrument_key: str, category: str, current_price: float, access_token: str) -> tuple[bool, str]:
+    """Entry filter: a Buy alert (buying a Call) needs that Call's own
+    price to have closed ABOVE its Point of Control; a Sell alert (buying
+    a Put) needs that Put's own price to have closed BELOW its own POC.
+    Returns (qualifies, reason) - reason is stored as the trade's entry
+    reason on success, or used for debugging on failure."""
+    poc = get_poc_price(instrument_key, access_token)
+    if poc is None:
+        return False, "POC unavailable (not enough intraday data yet)"
+    if category == "Buy":
+        if current_price > poc:
+            return True, "Price close above POC line"
+        return False, f"Price {current_price} not above POC {poc}"
+    else:
+        if current_price < poc:
+            return True, "Price close below POC line"
+        return False, f"Price {current_price} not below POC {poc}"
+
+
 UPSTOX_FUNDS_URL = "https://api.upstox.com/v3/user/get-funds-and-margin"
 
 # Upstox's API sits behind Cloudflare, which blocks requests without a
@@ -1863,16 +1951,21 @@ def run_paper_trade_check() -> dict:
                 pass  # paper side already closed - only live-side logic below applies
 
             elif strategy == "EMA":
-                # #1: 5-EMA only, let it run - no fixed target at all.
+                # #1: 5-EMA only, let it run - kept only for backward
+                # compatibility with any trade that opened under this
+                # strategy before it was retired from the picklist (5-EMA
+                # alone let losses run too deep - see strategies below).
                 exited, exit_price = check_exit("Buy", candles)
                 if exited:
                     exit_reason = "5-EMA exit rule"
 
             elif strategy == "HALF_HALF_HARD4" and pct_change is not None:
-                # #2: 5-EMA protects until +2%. At +2%, book half the qty
-                # (Target-1). The remaining half is protected at breakeven
-                # until +4%, where it exits in full (Target-2) - a hard
-                # target, no trailing beyond it.
+                # #2: hard -2% stop-loss protects until +2% (immediate,
+                # not pattern-based - the 5-EMA rule let losses run too
+                # deep waiting for a reversal to confirm). At +2%, book
+                # half the qty (Target-1). The remaining half is protected
+                # at breakeven until +4%, where it exits in full
+                # (Target-2) - a hard target, no trailing beyond it.
                 if trade["target1_hit_time"] is None:
                     if pct_change >= 2.0:
                         original_qty = trade["original_quantity"] or trade["quantity"] or 1
@@ -1884,10 +1977,9 @@ def run_paper_trade_check() -> dict:
                             "pnl": round((last_price - entry_price) * half_qty, 2),
                             "remaining_qty": remaining_qty,
                         }
-                    else:
-                        exited, exit_price = check_exit("Buy", candles)
-                        if exited:
-                            exit_reason = "5-EMA exit (before Target-1)"
+                    elif pct_change <= -2.0:
+                        exited, exit_price = True, last_price
+                        exit_reason = "Stop-loss (-2%)"
                 else:
                     if pct_change >= 4.0:
                         exited, exit_price = True, last_price
@@ -1897,49 +1989,48 @@ def run_paper_trade_check() -> dict:
                         exit_reason = "Breakeven stop after Target-1"
 
             elif strategy == "TRAIL_FROM_2" and pct_change is not None:
-                # #3: 5-EMA protects until +2%. No half-booking - the FULL
-                # quantity starts trailing from +2%, ratcheting up in 0.5%
-                # steps as price climbs, always sitting one step behind
-                # the peak.
+                # #3: hard -2% stop-loss protects until +2% (immediate,
+                # not pattern-based). No half-booking - the FULL quantity
+                # starts trailing from +2%, ratcheting up in 0.2% steps as
+                # price climbs, always sitting one step behind the peak.
                 if trade["trail_high_pct"] is None:
                     if pct_change >= 2.0:
-                        trail_update = {"trail_high_pct": int(pct_change // 0.5) * 0.5}
-                    else:
-                        exited, exit_price = check_exit("Buy", candles)
-                        if exited:
-                            exit_reason = "5-EMA exit (before +2%)"
+                        trail_update = {"trail_high_pct": round(int(pct_change / 0.2) * 0.2, 2)}
+                    elif pct_change <= -2.0:
+                        exited, exit_price = True, last_price
+                        exit_reason = "Stop-loss (-2%)"
                 else:
                     trail_high = trade["trail_high_pct"]
-                    current_milestone = int(pct_change // 0.5) * 0.5
+                    current_milestone = round(int(pct_change / 0.2) * 0.2, 2)
                     if current_milestone > trail_high:
                         trail_update = {"trail_high_pct": current_milestone}
                     else:
-                        stop_pct = round(trail_high - 0.5, 2)
+                        stop_pct = round(trail_high - 0.2, 2)
                         if pct_change <= stop_pct:
                             exited, exit_price = True, last_price
                             exit_reason = f"Trailing stop ({stop_pct:g}%)"
 
             elif strategy == "FULL_AT_2" and pct_change is not None:
-                # #4: 5-EMA protects until +2%, then the FULL quantity
-                # exits at +2% - a single fixed target, no trailing.
+                # #4: hard -2% stop-loss protects until +2%, then the FULL
+                # quantity exits at +2% - a single fixed target, no
+                # trailing, symmetric 1:1 risk-reward.
                 if pct_change >= 2.0:
                     exited, exit_price = True, last_price
                     exit_reason = "Target (2%) - full exit"
-                else:
-                    exited, exit_price = check_exit("Buy", candles)
-                    if exited:
-                        exit_reason = "5-EMA exit (before 2% target)"
+                elif pct_change <= -2.0:
+                    exited, exit_price = True, last_price
+                    exit_reason = "Stop-loss (-2%)"
 
             elif strategy == "FULL_AT_4" and pct_change is not None:
-                # #5: 5-EMA protects until +4%, then the FULL quantity
-                # exits at +4% - a single fixed target, no trailing.
+                # #5: hard -2% stop-loss protects until +4%, then the FULL
+                # quantity exits at +4% - a single fixed target, no
+                # trailing, 1:2 risk-reward.
                 if pct_change >= 4.0:
                     exited, exit_price = True, last_price
                     exit_reason = "Target (4%) - full exit"
-                else:
-                    exited, exit_price = check_exit("Buy", candles)
-                    if exited:
-                        exit_reason = "5-EMA exit (before 4% target)"
+                elif pct_change <= -2.0:
+                    exited, exit_price = True, last_price
+                    exit_reason = "Stop-loss (-2%)"
 
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
@@ -2595,14 +2686,14 @@ def paper_trading_live_toggle():
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
-VALID_STRATEGIES = ("EMA", "HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4")
+VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4")
 
 STRATEGY_DESCRIPTIONS = {
-    "EMA": "1) 5-EMA only, let it run - full quantity exits purely on the 5-EMA reversal rule, no fixed target at all.",
-    "HALF_HALF_HARD4": "2) 5-EMA protects until +2%. At +2%, half the qty books (Target-1) and the rest is protected at breakeven. At +4%, the remaining half exits in full - a hard target, no trailing beyond it.",
-    "TRAIL_FROM_2": "3) 5-EMA protects until +2%. No half-booking - the full quantity starts trailing from +2%, in 0.5% steps, always one step behind the peak.",
-    "FULL_AT_2": "4) 5-EMA protects until +2%, then the full quantity exits at +2% - one fixed target, no trailing.",
-    "FULL_AT_4": "5) 5-EMA protects until +4%, then the full quantity exits at +4% - one fixed target, no trailing.",
+    "EMA": "1) 5-EMA only, let it run - retired from selection (let losses run too deep waiting for a pattern reversal to confirm). Kept only for trades that already opened under it.",
+    "HALF_HALF_HARD4": "2) Hard -2% stop-loss protects until +2% (immediate, not pattern-based). At +2%, half the qty books (Target-1) and the rest is protected at breakeven. At +4%, the remaining half exits in full - a hard target, no trailing beyond it.",
+    "TRAIL_FROM_2": "3) Hard -2% stop-loss protects until +2%. No half-booking - the full quantity starts trailing from +2%, in 0.2% steps, always one step behind the peak.",
+    "FULL_AT_2": "4) Hard -2% stop-loss protects until +2%, then the full quantity exits at +2% - one fixed target, 1:1 risk-reward.",
+    "FULL_AT_4": "5) Hard -2% stop-loss protects until +4%, then the full quantity exits at +4% - one fixed target, 1:2 risk-reward.",
 }
 
 

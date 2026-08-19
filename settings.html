@@ -162,11 +162,10 @@
   <div class="settings-box">
     <span>Exit strategy for new trades:</span>
     <select id="strategySelect" onchange="setStrategy(this.value)">
-      <option value="EMA" {% if exit_strategy == "EMA" %}selected{% endif %}>1) 5-EMA only, let it run</option>
-      <option value="HALF_HALF_HARD4" {% if exit_strategy == "HALF_HALF_HARD4" %}selected{% endif %}>2) 2% half book, 4% full exit</option>
-      <option value="TRAIL_FROM_2" {% if exit_strategy == "TRAIL_FROM_2" %}selected{% endif %}>3) Trail 100% qty from 2%</option>
-      <option value="FULL_AT_2" {% if exit_strategy == "FULL_AT_2" %}selected{% endif %}>4) Full exit at 2%</option>
-      <option value="FULL_AT_4" {% if exit_strategy == "FULL_AT_4" %}selected{% endif %}>5) Full exit at 4%</option>
+      <option value="HALF_HALF_HARD4" {% if exit_strategy == "HALF_HALF_HARD4" %}selected{% endif %}>2) -2% SL, 2% half book, 4% full exit</option>
+      <option value="TRAIL_FROM_2" {% if exit_strategy == "TRAIL_FROM_2" %}selected{% endif %}>3) -2% SL, trail 100% qty from 2% (0.2% steps)</option>
+      <option value="FULL_AT_2" {% if exit_strategy == "FULL_AT_2" %}selected{% endif %}>4) -2% SL, full exit at 2%</option>
+      <option value="FULL_AT_4" {% if exit_strategy == "FULL_AT_4" %}selected{% endif %}>5) -2% SL, full exit at 4%</option>
     </select>
     <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
   </div>
