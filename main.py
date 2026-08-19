@@ -434,7 +434,9 @@ def init_db():
                 live_exit_reason TEXT,
                 live_exit_price DOUBLE PRECISION,
                 live_entry_price DOUBLE PRECISION,
-                live_exit_time TEXT
+                live_exit_time TEXT,
+                live_sl_order_id TEXT,
+                live_sl_trigger_price DOUBLE PRECISION
             )
             """
         )
@@ -473,6 +475,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_price DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_entry_price DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_time TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_sl_order_id TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_sl_trigger_price DOUBLE PRECISION",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -810,16 +814,45 @@ def create_paper_trades_for_batch(data: dict) -> None:
                                 # theoretical premium we used to size the
                                 # order (see get_order_average_price).
                                 live_entry_price = get_order_average_price(result["order_id"], access_token)
+
+                                # Immediately place a broker-side SL-M stop
+                                # at -2% from the real fill price. This is
+                                # what actually protects the position if
+                                # this app, the server, or the network goes
+                                # down - Upstox's own engine fires it, not
+                                # our polling loop. Best-effort: a failure
+                                # here doesn't fail the trade (the position
+                                # is already live and open), it's just
+                                # recorded so it's visible that this
+                                # position is running without a broker-side
+                                # net and needs the app's own monitoring.
+                                live_sl_order_id = None
+                                live_sl_trigger_price = None
+                                sl_note = None
+                                if live_entry_price:
+                                    live_sl_trigger_price = round(live_entry_price * 0.98, 1)
+                                    sl_result = place_live_order(
+                                        option["instrument_key"], "SELL", live_quantity, access_token,
+                                        order_type="SL-M", trigger_price=live_sl_trigger_price,
+                                    )
+                                    if sl_result["ok"]:
+                                        live_sl_order_id = sl_result["order_id"]
+                                    else:
+                                        sl_note = f"Entry filled but broker SL-M stop failed to place: {sl_result['error']}"
+                                else:
+                                    sl_note = "Entry filled but no fill price yet - broker SL-M stop skipped, app-side monitoring only"
+
                                 with get_db() as conn:
                                     conn.execute(
                                         """
                                         UPDATE paper_trades
                                         SET live_status = 'OPEN', live_entry_order_id = ?, live_quantity = ?,
-                                            live_instrument_key = ?, live_option_label = ?, live_entry_price = ?
+                                            live_instrument_key = ?, live_option_label = ?, live_entry_price = ?,
+                                            live_sl_order_id = ?, live_sl_trigger_price = ?, live_error = ?
                                         WHERE id = ?
                                         """,
                                         (result["order_id"], live_quantity, option["instrument_key"], label,
-                                         live_entry_price, trade_id),
+                                         live_entry_price, live_sl_order_id, live_sl_trigger_price, sl_note, trade_id),
                                     )
                                     conn.commit()
                             else:
@@ -1742,11 +1775,22 @@ def _get_order_proxy_opener():
     return urllib.request.build_opener(proxy_handler)
 
 
-def place_live_order(instrument_key: str, transaction_type: str, quantity: int, access_token: str) -> dict:
-    """Places a real order on Upstox: CNC (Delivery) product, Market order,
-    DAY validity - matching the decisions for this app (live trading only
-    ever goes long, so transaction_type is effectively always 'BUY' to open
-    and 'SELL' to close the same delivery position).
+def place_live_order(
+    instrument_key: str,
+    transaction_type: str,
+    quantity: int,
+    access_token: str,
+    order_type: str = "MARKET",
+    trigger_price: float = 0.0,
+) -> dict:
+    """Places a real order on Upstox: CNC (Delivery) product, DAY validity -
+    matching the decisions for this app (live trading only ever goes long,
+    so transaction_type is effectively always 'BUY' to open and 'SELL' to
+    close the same delivery position). order_type defaults to 'MARKET' (the
+    original behavior); pass order_type='SL-M' with a trigger_price to
+    place a stop-loss-market order instead - used to protect a fresh
+    position with a broker-side stop that fires even if this app/server is
+    down, rather than relying only on our own polling.
 
     Never raises - a live-order failure must not be able to crash paper
     trade creation or the exit-check loop. Returns:
@@ -1757,13 +1801,13 @@ def place_live_order(instrument_key: str, transaction_type: str, quantity: int, 
         "quantity": quantity,
         "product": "D",  # CNC / Delivery
         "validity": "DAY",
-        "price": 0,  # ignored by Upstox for MARKET orders
+        "price": 0,  # ignored by Upstox for MARKET/SL-M orders
         "tag": "chartink-auto",
         "instrument_token": instrument_key,
-        "order_type": "MARKET",
+        "order_type": order_type,
         "transaction_type": transaction_type,  # "BUY" or "SELL"
         "disclosed_quantity": 0,
-        "trigger_price": 0,
+        "trigger_price": trigger_price,
         "is_amo": False,
     }
     data = json.dumps(body).encode("utf-8")
@@ -1837,6 +1881,59 @@ def get_order_average_price(order_id: str, access_token: str) -> float | None:
     return None
 
 
+def get_order_status(order_id: str, access_token: str) -> dict | None:
+    """Fetches an order's current status/fields from Upstox (status,
+    average_price, filled_quantity, trigger_price, etc.) without the
+    retry-and-wait behavior of get_order_average_price - used to poll
+    whether a resting SL-M stop order has fired on its own. Returns None
+    (never raises) on any failure."""
+    url = "https://api.upstox.com/v2/order/details?order_id=" + urllib.parse.quote(order_id)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        opener = _get_order_proxy_opener()
+        opener_fn = opener.open if opener else urllib.request.urlopen
+        with opener_fn(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+        return payload.get("data") or None
+    except Exception:
+        return None
+
+
+def cancel_order(order_id: str, access_token: str) -> bool:
+    """Cancels a resting order on Upstox (used to pull the protective SL-M
+    stop the moment software decides to exit the position some other way -
+    a trailing stop firing, a target hit, etc. - so the two exit paths can
+    never both fill and double-sell the position). Returns True on a
+    successful cancel request; never raises. Treats 'already
+    filled/cancelled' errors as a non-fatal no-op, since that's exactly
+    what happens when the SL-M itself already fired first."""
+    url = "https://api.upstox.com/v2/order/cancel?order_id=" + urllib.parse.quote(order_id)
+    req = urllib.request.Request(
+        url,
+        method="DELETE",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        opener = _get_order_proxy_opener()
+        opener_fn = opener.open if opener else urllib.request.urlopen
+        with opener_fn(req, timeout=10) as resp:
+            resp.read()
+        return True
+    except Exception:
+        return False
+
+
 def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[str | None, str | None, float | None]:
     """If this paper trade has a live position open (live_status == 'OPEN'),
     places the closing SELL order on Upstox for the EXACT option contract
@@ -1857,6 +1954,16 @@ def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[
     if not instrument_key:
         return None, "No live_instrument_key recorded on this trade - could not close live position", None
 
+    # Pull the resting broker-side SL-M stop first, if one exists - a
+    # software-driven exit (trailing stop, target hit, manual close) and
+    # the SL-M firing on its own must never both go through, or the
+    # position gets double-sold. Best-effort: if the cancel fails because
+    # the SL-M already fired, the subsequent SELL below will simply fail
+    # or oversell-protect at the broker, and get picked up as an error.
+    sl_order_id = trade.get("live_sl_order_id")
+    if sl_order_id:
+        cancel_order(sl_order_id, access_token)
+
     qty = trade.get("live_quantity") or 1
     result = place_live_order(instrument_key, "SELL", qty, access_token)
     if result["ok"]:
@@ -1865,9 +1972,47 @@ def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[
     return None, f"Failed to close live position: {result['error']}", None
 
 
+EXIT_CHECK_INTERVAL_SECONDS = 5
+_exit_check_thread_started = False
+
+
+def _exit_check_loop() -> None:
+    """Runs for the life of the process on its own background thread,
+    calling run_paper_trade_check() on a short fixed cadence - this is
+    what makes every % based exit (the -2% stoploss included) a real
+    stop instead of one that only gets evaluated once a minute, and only
+    when a browser tab happens to be open. The frontend's own 60s poll
+    (in paper_trading.html / live_trading.html) still runs too, purely to
+    refresh what's on screen - this loop is what keeps the actual checking
+    tight in between, tab or no tab, as long as the server process is
+    alive. Never lets one bad check kill the loop."""
+    while True:
+        try:
+            run_paper_trade_check()
+        except Exception as e:
+            print(f"[exit-check-loop] error: {e}")
+        time.sleep(EXIT_CHECK_INTERVAL_SECONDS)
+
+
+def ensure_exit_check_loop_started() -> None:
+    """Starts the background exit-check thread once per process. Safe to
+    call from anywhere - a no-op if it's already running. Unlike the
+    WebSocket starter, this doesn't need a token up front: it's called
+    once at import time (see bottom of file) and run_paper_trade_check()
+    itself already handles the no-token case cleanly every pass."""
+    global _exit_check_thread_started
+    if _exit_check_thread_started:
+        return
+    _exit_check_thread_started = True
+    threading.Thread(target=_exit_check_loop, daemon=True).start()
+
+
 def run_paper_trade_check() -> dict:
-    """Checks every open paper trade against the live 5-min candle exit
-    rule, closing any that qualify. Returns a summary dict for the UI."""
+    """Checks every open paper trade against its exit strategy, closing
+    any that qualify. Returns a summary dict for the UI. Runs both from
+    the frontend's periodic poll AND continuously from the background
+    _exit_check_loop thread (see above) - the latter is what keeps this
+    from only firing once a minute with a tab open."""
     access_token = get_setting("upstox_access_token")
     if not access_token:
         return {"checked": 0, "closed": 0, "error": "No Upstox access token saved yet."}
@@ -1904,37 +2049,41 @@ def run_paper_trade_check() -> dict:
                     conn.commit()
                 continue
 
-            candles = fetch_5min_candles(instrument_key, access_token)
-            # Prefer a fresh WebSocket tick for the CURRENT price (used by
-            # every percentage-level check below) - it's faster than
-            # waiting on the next REST candle. The 5-EMA rule below still
-            # uses the full candle series regardless, since it needs
-            # historical shape, not just a current price. Falls back to
-            # the REST candle close whenever no fresh tick is available
-            # (feed not connected yet, symbol not subscribed, etc.).
+            strategy = trade["strategy"] or "EMA"
+            # Candles are only fetched when actually needed: strategies
+            # 2-5 (the current ones) decide purely off a % move against
+            # entry, using the WebSocket tick price - no candle series
+            # required. Only the legacy EMA/TARGETS paths (kept for
+            # backward compatibility on trades opened before the strategy
+            # picklist changed) need the 5-min candle series for the
+            # 5-EMA rule. Skipping the fetch for the common case is what
+            # makes it safe to run this check every few seconds instead of
+            # once a minute, without hammering Upstox's candle endpoint.
+            needs_candles = strategy in ("EMA", "TARGETS")
             ws_price = get_ws_price(instrument_key)
+            candles = fetch_5min_candles(instrument_key, access_token) if (needs_candles or ws_price is None) else None
             last_price = ws_price if ws_price is not None else (candles[-1][3] if candles else None)
             entry_price = trade["entry_price"]
-            strategy = trade["strategy"] or "EMA"
 
             # Paper and live each resolve their own ATM contract at entry
             # time (both from the same alert price, moments apart) - in
             # practice that's almost always the same strike, but if it
-            # ever isn't, live's own decisions (both the price used for %
-            # checks AND the candle series used for the 5-EMA check) must
-            # use live's own contract, not paper's. Only does the extra
-            # work when they actually differ - the common case reuses
-            # candles/last_price with no extra calls.
+            # ever isn't, live's own price checks must use live's own
+            # contract, not paper's. Only does the extra work when they
+            # actually differ - the common case reuses last_price with no
+            # extra call. Live no longer needs a candle series at all
+            # (its downside is now a broker-side SL-M order, not a
+            # software 5-EMA check - see run_paper_trade_check's live
+            # section below), so this is just a price lookup.
             live_instrument_key = trade["live_instrument_key"]
             if live_instrument_key and live_instrument_key != instrument_key:
-                live_candles = fetch_5min_candles(live_instrument_key, access_token)
                 live_ws_price = get_ws_price(live_instrument_key)
                 if live_ws_price is not None:
                     live_last_price = live_ws_price
                 else:
-                    live_last_price = live_candles[-1][3] if live_candles else None
+                    live_candles_fallback = fetch_5min_candles(live_instrument_key, access_token)
+                    live_last_price = live_candles_fallback[-1][3] if live_candles_fallback else None
             else:
-                live_candles = candles
                 live_last_price = last_price
 
             exited = False
@@ -1955,7 +2104,7 @@ def run_paper_trade_check() -> dict:
                 # compatibility with any trade that opened under this
                 # strategy before it was retired from the picklist (5-EMA
                 # alone let losses run too deep - see strategies below).
-                exited, exit_price = check_exit("Buy", candles)
+                exited, exit_price = check_exit("Buy", candles or [])
                 if exited:
                     exit_reason = "5-EMA exit rule"
 
@@ -2049,7 +2198,7 @@ def run_paper_trade_check() -> dict:
                             "remaining_qty": remaining_qty,
                         }
                     else:
-                        exited, exit_price = check_exit("Buy", candles)
+                        exited, exit_price = check_exit("Buy", candles or [])
                         if exited:
                             exit_reason = "5-EMA exit (before Target-1)"
                 elif trade["trail_high_pct"] is None:
@@ -2077,35 +2226,49 @@ def run_paper_trade_check() -> dict:
                 # reflects which alert category triggered entry, not the
                 # position's own side). Fallback for an unrecognized
                 # strategy value or missing price data.
-                exited, exit_price = check_exit("Buy", candles)
+                exited, exit_price = check_exit("Buy", candles or [])
                 if exited:
                     exit_reason = "5-EMA exit rule"
 
-            # Live trading runs its OWN, independent exit rule - simpler
-            # than the paper TARGETS strategy (full quantity, no half
-            # booking): the 5-EMA rule protects until +2%, then the stop
-            # trails the whole position in 0.5% steps from there. This can
-            # close a live position at a different time than the paper
-            # side (or not at all, if the paper side is using EMA-only) -
-            # they're fully decoupled now, each governed by its own rule.
+            # Live trading runs its OWN, independent exit rule from the
+            # paper strategy chosen in Settings - full quantity, no half
+            # booking. Downside is now protected by a REAL broker-side
+            # SL-M stop order placed at entry (see place_live_order call
+            # above) instead of a software-checked rule, so it fires from
+            # Upstox's own engine even if this app/server is down. This
+            # loop's job on the downside is just to notice when that SL-M
+            # has already fired and reconcile our own status - never to
+            # place a second closing order on top of it. From +2%, the
+            # stop trails the whole position in 0.5% steps, closed via a
+            # normal software-driven market SELL when it's hit (which also
+            # cancels the now-unneeded SL-M first, see
+            # _close_live_position_if_any).
             live_exited = False
             live_exit_reason_val = None
             live_trail_update = None
+            live_sl_fired_price = None
+
+            # Check whether the resting SL-M stop already fired on its own
+            # since the last pass - if so, the broker closed the position
+            # for us; reconcile status instead of treating it as still open.
+            if trade["live_status"] == "OPEN" and trade["live_sl_order_id"]:
+                sl_status = get_order_status(trade["live_sl_order_id"], access_token)
+                if sl_status and sl_status.get("status") == "complete":
+                    live_exited = True
+                    live_exit_reason_val = "Stoploss (-2%, broker SL-M order)"
+                    live_sl_fired_price = sl_status.get("average_price")
+
             # Must use the REAL fill price (live_entry_price), not the
             # paper trade's theoretical entry_price - a market order can
             # fill at a genuinely different price, so using paper's number
             # here would make live's own +2%/trailing checkpoints wrong
             # relative to what was actually paid.
             live_entry_ref = trade["live_entry_price"] if trade["live_entry_price"] is not None else entry_price
-            if trade["live_status"] == "OPEN" and live_last_price is not None and live_entry_ref:
+            if not live_exited and trade["live_status"] == "OPEN" and live_last_price is not None and live_entry_ref:
                 live_pct_change = (live_last_price - live_entry_ref) / live_entry_ref * 100
                 if trade["live_trail_high_pct"] is None:
                     if live_pct_change >= 2.0:
                         live_trail_update = int(live_pct_change // 0.5) * 0.5
-                    else:
-                        live_exited, _ = check_exit("Buy", live_candles)
-                        if live_exited:
-                            live_exit_reason_val = "5-EMA exit (before +2%)"
                 else:
                     live_trail_high = trade["live_trail_high_pct"]
                     live_milestone = int(live_pct_change // 0.5) * 0.5
@@ -2117,7 +2280,23 @@ def run_paper_trade_check() -> dict:
                             live_exited = True
                             live_exit_reason_val = f"Trailing stop ({live_stop_pct:g}%) after +2%"
 
-            if live_exited:
+            if live_exited and live_sl_fired_price is not None:
+                # The SL-M already filled at the broker - nothing left to
+                # place, just record it. Skip _close_live_position_if_any
+                # entirely (it would try to cancel/sell an already-closed
+                # position).
+                with get_db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET live_status = 'CLOSED', live_exit_reason = ?,
+                            live_exit_price = ?, live_exit_time = ?
+                        WHERE id = ?
+                        """,
+                        (live_exit_reason_val, live_sl_fired_price, now, trade["id"]),
+                    )
+                    conn.commit()
+            elif live_exited:
                 live_exit_order_id, live_exit_error, live_fill_price = _close_live_position_if_any(trade, access_token)
                 with get_db() as conn:
                     conn.execute(
@@ -2993,6 +3172,7 @@ def debug_profile():
 
 
 init_db()  # runs on import too, so gunicorn (used in production) creates the table
+ensure_exit_check_loop_started()  # same: starts on import, tab-independent from here on
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
