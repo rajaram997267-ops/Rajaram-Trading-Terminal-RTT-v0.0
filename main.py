@@ -436,7 +436,8 @@ def init_db():
                 live_entry_price DOUBLE PRECISION,
                 live_exit_time TEXT,
                 live_sl_order_id TEXT,
-                live_sl_trigger_price DOUBLE PRECISION
+                live_sl_trigger_price DOUBLE PRECISION,
+                atr_trail_peak_price DOUBLE PRECISION
             )
             """
         )
@@ -477,6 +478,7 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_time TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_sl_order_id TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_sl_trigger_price DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS atr_trail_peak_price DOUBLE PRECISION",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -542,6 +544,25 @@ def get_sector_filter_top_n() -> int:
         return int(get_setting("sector_filter_top_n", "5"))
     except (TypeError, ValueError):
         return 5
+
+
+def get_atr_period() -> int:
+    """Lookback period (in 5-min candles) for the ATR_TRAIL exit
+    strategy's Average True Range calculation. Defaults to 10."""
+    try:
+        return max(2, int(get_setting("atr_period", "10")))
+    except (TypeError, ValueError):
+        return 10
+
+
+def get_atr_multiplier() -> float:
+    """Multiplier applied to ATR for the ATR_TRAIL exit strategy's
+    Chandelier-style trailing stop: stop = highest price since entry -
+    (ATR * multiplier). Defaults to 2.0."""
+    try:
+        return max(0.1, float(get_setting("atr_multiplier", "2")))
+    except (TypeError, ValueError):
+        return 2.0
 
 
 def sector_qualifies(symbol: str, category: str, access_token: str | None) -> bool:
@@ -883,6 +904,32 @@ def calculate_ema(values: list[float], period: int = 5) -> list[float | None]:
     for price in values[period:]:
         ema.append(price * k + ema[-1] * (1 - k))
     return ema
+
+
+def calculate_atr(candles: list[tuple[float, float, float, float]], period: int = 10) -> list[float | None]:
+    """Average True Range using Wilder's smoothing (the standard
+    definition - a plain moving average of True Range understates
+    volatility spikes). candles: list of (open, high, low, close), oldest
+    first. Same length as `candles`, with None for the seeding gap at the
+    start (needs `period` True Range values before the first ATR reading
+    exists, which itself needs one prior candle for the first True Range -
+    so `period + 1` candles minimum)."""
+    n = len(candles)
+    if n < period + 1:
+        return [None] * n
+
+    true_ranges: list[float | None] = [None]
+    for i in range(1, n):
+        high, low = candles[i][1], candles[i][2]
+        prev_close = candles[i - 1][3]
+        true_ranges.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+
+    atr: list[float | None] = [None] * period
+    seed = sum(true_ranges[1:period + 1]) / period
+    atr.append(seed)
+    for i in range(period + 1, n):
+        atr.append((atr[-1] * (period - 1) + true_ranges[i]) / period)
+    return atr
 
 
 def check_exit(direction: str, candles: list[tuple[float, float, float, float]]):
@@ -2059,7 +2106,7 @@ def run_paper_trade_check() -> dict:
             # 5-EMA rule. Skipping the fetch for the common case is what
             # makes it safe to run this check every few seconds instead of
             # once a minute, without hammering Upstox's candle endpoint.
-            needs_candles = strategy in ("EMA", "TARGETS")
+            needs_candles = strategy in ("EMA", "TARGETS", "ATR_TRAIL")
             ws_price = get_ws_price(instrument_key)
             candles = fetch_5min_candles(instrument_key, access_token) if (needs_candles or ws_price is None) else None
             last_price = ws_price if ws_price is not None else (candles[-1][3] if candles else None)
@@ -2180,6 +2227,35 @@ def run_paper_trade_check() -> dict:
                 elif pct_change <= -2.0:
                     exited, exit_price = True, last_price
                     exit_reason = "Stop-loss (-2%)"
+
+            elif strategy == "ATR_TRAIL" and pct_change is not None:
+                # #6: Chandelier-style ATR trailing stop - stop distance
+                # scales with how much the option premium is actually
+                # moving (ATR), instead of a fixed %. This means the stop
+                # sits wider during choppy/volatile stretches (e.g. the
+                # first 15-30 minutes) and tighter once things calm down,
+                # rather than getting stopped out at the same distance
+                # regardless of conditions. A hard -2% floor covers the
+                # trade only until there's enough candle history
+                # (atr_period + 1 candles) to compute the first ATR
+                # reading - after that, the ATR stop takes over entirely.
+                atr_period = get_atr_period()
+                atr_multiplier = get_atr_multiplier()
+                atr_series = calculate_atr(candles or [], atr_period)
+                current_atr = atr_series[-1] if atr_series else None
+                if current_atr is None:
+                    if pct_change <= -2.0:
+                        exited, exit_price = True, last_price
+                        exit_reason = "Stop-loss (-2%, ATR not ready yet)"
+                else:
+                    peak_price = trade["atr_trail_peak_price"]
+                    peak_price = max(peak_price, last_price) if peak_price is not None else max(entry_price, last_price)
+                    stop_price = peak_price - (current_atr * atr_multiplier)
+                    if last_price <= stop_price:
+                        exited, exit_price = True, last_price
+                        exit_reason = f"ATR trailing stop ({atr_period}p x{atr_multiplier:g}, stop {stop_price:.2f})"
+                    else:
+                        trail_update = {"atr_trail_peak_price": peak_price}
 
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
@@ -2336,7 +2412,7 @@ def run_paper_trade_check() -> dict:
                         (now, partial["exit_price"], partial["qty"], partial["pnl"],
                          partial["remaining_qty"], last_price, now, trade["id"]),
                     )
-                elif trail_update:
+                elif trail_update and "trail_high_pct" in trail_update:
                     conn.execute(
                         """
                         UPDATE paper_trades
@@ -2345,6 +2421,16 @@ def run_paper_trade_check() -> dict:
                         WHERE id = ?
                         """,
                         (trail_update["trail_high_pct"], last_price, now, trade["id"]),
+                    )
+                elif trail_update and "atr_trail_peak_price" in trail_update:
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET atr_trail_peak_price = ?, last_checked_price = ?,
+                            last_checked_time = ?, last_error = NULL
+                        WHERE id = ?
+                        """,
+                        (trail_update["atr_trail_peak_price"], last_price, now, trade["id"]),
                     )
                 elif exited:
                     qty = trade["quantity"] or 1
@@ -2710,6 +2796,8 @@ def settings_page():
         strategy_descriptions=STRATEGY_DESCRIPTIONS,
         sector_filter_enabled=get_sector_filter_enabled(),
         sector_filter_top_n=get_sector_filter_top_n(),
+        atr_period=get_atr_period(),
+        atr_multiplier=get_atr_multiplier(),
     )
     body = html.encode("utf-8")
     response = make_response(body)
@@ -2865,7 +2953,7 @@ def paper_trading_live_toggle():
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
-VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4")
+VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL")
 
 STRATEGY_DESCRIPTIONS = {
     "EMA": "1) 5-EMA only, let it run - retired from selection (let losses run too deep waiting for a pattern reversal to confirm). Kept only for trades that already opened under it.",
@@ -2873,6 +2961,7 @@ STRATEGY_DESCRIPTIONS = {
     "TRAIL_FROM_2": "3) Hard -2% stop-loss protects until +2%. No half-booking - the full quantity starts trailing from +2%, in 0.2% steps, always one step behind the peak.",
     "FULL_AT_2": "4) Hard -2% stop-loss protects until +2%, then the full quantity exits at +2% - one fixed target, 1:1 risk-reward.",
     "FULL_AT_4": "5) Hard -2% stop-loss protects until +4%, then the full quantity exits at +4% - one fixed target, 1:2 risk-reward.",
+    "ATR_TRAIL": "6) ATR trailing stop (Chandelier-style) - stop = highest price since entry minus (ATR x multiplier), so the stop distance widens automatically in choppy/volatile conditions and tightens when calm, instead of a fixed %. Uses the ATR period/multiplier set below. A -2% floor protects the trade until enough candle history exists to compute the first ATR reading.",
 }
 
 
@@ -2888,6 +2977,27 @@ def paper_trading_strategy_toggle():
         return jsonify({"status": "error", "message": f"strategy must be one of {VALID_STRATEGIES}"}), 400
     set_setting("exit_strategy", strategy)
     return jsonify({"status": "ok", "exit_strategy": strategy, "description": STRATEGY_DESCRIPTIONS.get(strategy, "")})
+
+
+@app.route("/api/paper-trading/atr-settings", methods=["POST"])
+def paper_trading_atr_settings():
+    """Sets the ATR period and multiplier used by the ATR_TRAIL exit
+    strategy. Takes effect immediately for any open trade already running
+    that strategy (the check reads these settings fresh every pass), not
+    just new trades - unlike exit_strategy, which is locked in per-trade
+    at entry."""
+    data = request.get_json(silent=True) or {}
+    try:
+        period = max(2, int(data.get("atr_period")))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "atr_period must be a whole number >= 2"}), 400
+    try:
+        multiplier = max(0.1, float(data.get("atr_multiplier")))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "atr_multiplier must be a number >= 0.1"}), 400
+    set_setting("atr_period", str(period))
+    set_setting("atr_multiplier", str(multiplier))
+    return jsonify({"status": "ok", "atr_period": period, "atr_multiplier": multiplier})
 
 
 @app.route("/api/paper-trading/sector-filter-toggle", methods=["POST"])
