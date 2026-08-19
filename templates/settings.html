@@ -155,7 +155,7 @@
     </label>
     <span>Live trading (real Upstox orders)</span>
     <span class="token-status" id="liveStatus" style="{% if live_trading_enabled %}color: var(--red);{% endif %}">
-      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds{% else %}OFF - paper trading only{% endif %}
+      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. A real -2% SL-M stop order is placed with Upstox at entry, so it protects the position even if this app is down{% else %}OFF - paper trading only{% endif %}
     </span>
   </div>
 
@@ -209,7 +209,8 @@
       const enabled = checkbox.checked;
       if (enabled && !confirm(
         "This turns ON live trading. The NEXT Buy alert will place a real " +
-        "ATM option order on Upstox (Call for Buy alerts, Put for Sell alerts), sized off your actual available funds. Continue?"
+        "ATM option order on Upstox (Call for Buy alerts, Put for Sell alerts), sized off your actual available funds, " +
+        "with a -2% SL-M stop order placed right after entry. Continue?"
       )) {
         checkbox.checked = false;
         return;
@@ -222,7 +223,7 @@
         });
         const result = await res.json();
         statusEl.textContent = result.live_trading_enabled
-          ? "ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds"
+          ? "ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. A real -2% SL-M stop order is placed with Upstox at entry, so it protects the position even if this app is down"
           : "OFF - paper trading only";
         statusEl.style.color = result.live_trading_enabled ? "var(--red)" : "";
       } catch (err) {
