@@ -88,7 +88,7 @@
     <div class="empty-state" id="liveEmpty" style="display:none;">No closed live trades yet.</div>
   </div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.1/chart.umd.min.js"></script>
   <script>
     function fmtTime(iso) {
       if (!iso) return "";
@@ -139,17 +139,48 @@
     }
 
     async function loadStats() {
+      let data;
       try {
         const res = await fetch("/api/stats/pnl-curve");
-        const data = await res.json();
+        data = await res.json();
+      } catch (err) {
+        console.error("Failed to fetch stats data", err);
+        document.getElementById("paperEmpty").textContent = "Failed to load data - see console.";
+        document.getElementById("paperEmpty").style.display = "block";
+        document.getElementById("liveEmpty").textContent = "Failed to load data - see console.";
+        document.getElementById("liveEmpty").style.display = "block";
+        return;
+      }
 
+      if (typeof Chart === "undefined") {
+        // The Chart.js library itself failed to load (CDN blocked, bad
+        // version, offline, etc.) - show this clearly instead of leaving
+        // both boxes silently blank with no explanation.
+        console.error("Chart.js failed to load from CDN");
+        document.getElementById("paperEmpty").textContent = "Chart library failed to load - check your connection and reload.";
+        document.getElementById("paperEmpty").style.display = "block";
+        document.getElementById("liveEmpty").textContent = "Chart library failed to load - check your connection and reload.";
+        document.getElementById("liveEmpty").style.display = "block";
+        return;
+      }
+
+      // Each chart is attempted independently - a problem with one
+      // (e.g. malformed data) should never prevent the other from
+      // rendering.
+      try {
         if (data.paper && data.paper.length > 0) {
           buildLineChart("paperChart", data.paper, "balance", "Balance", "#00c896");
         } else {
           document.getElementById("paperChart").style.display = "none";
           document.getElementById("paperEmpty").style.display = "block";
         }
+      } catch (err) {
+        console.error("Failed to render paper chart", err);
+        document.getElementById("paperEmpty").textContent = "Failed to render chart - see console.";
+        document.getElementById("paperEmpty").style.display = "block";
+      }
 
+      try {
         if (data.live && data.live.length > 0) {
           buildLineChart("liveChart", data.live, "pnl", "Cumulative P&L", "#ffb800");
         } else {
@@ -157,7 +188,9 @@
           document.getElementById("liveEmpty").style.display = "block";
         }
       } catch (err) {
-        console.error("Failed to load stats", err);
+        console.error("Failed to render live chart", err);
+        document.getElementById("liveEmpty").textContent = "Failed to render chart - see console.";
+        document.getElementById("liveEmpty").style.display = "block";
       }
     }
 
