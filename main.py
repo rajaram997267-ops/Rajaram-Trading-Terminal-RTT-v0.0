@@ -4,6 +4,7 @@ import csv
 import gzip
 import io
 import json
+import math
 import os
 import threading
 import time
@@ -930,6 +931,14 @@ def calculate_atr(candles: list[tuple[float, float, float, float]], period: int 
     for i in range(period + 1, n):
         atr.append((atr[-1] * (period - 1) + true_ranges[i]) / period)
     return atr
+
+
+def _floor_to_step(value: float, step: float) -> float:
+    """Floor `value` down to the nearest multiple of `step`. Uses a tiny
+    epsilon so binary float imprecision doesn't clip a value that should
+    land exactly on a step (e.g. 0.6 landing on 2 steps of 0.2 instead of
+    3, because 0.6 / 0.2 comes out as 2.9999999999999996 in float math)."""
+    return round(math.floor(value / step + 1e-9) * step, 2)
 
 
 def check_exit(direction: str, candles: list[tuple[float, float, float, float]]):
@@ -2229,33 +2238,49 @@ def run_paper_trade_check() -> dict:
                     exit_reason = "Stop-loss (-2%)"
 
             elif strategy == "ATR_TRAIL" and pct_change is not None:
-                # #6: Chandelier-style ATR trailing stop - stop distance
-                # scales with how much the option premium is actually
-                # moving (ATR), instead of a fixed %. This means the stop
-                # sits wider during choppy/volatile stretches (e.g. the
-                # first 15-30 minutes) and tighter once things calm down,
-                # rather than getting stopped out at the same distance
-                # regardless of conditions. A hard -2% floor covers the
-                # trade only until there's enough candle history
-                # (atr_period + 1 candles) to compute the first ATR
-                # reading - after that, the ATR stop takes over entirely.
-                atr_period = get_atr_period()
-                atr_multiplier = get_atr_multiplier()
-                atr_series = calculate_atr(candles or [], atr_period)
-                current_atr = atr_series[-1] if atr_series else None
-                if current_atr is None:
-                    if pct_change <= -2.0:
-                        exited, exit_price = True, last_price
-                        exit_reason = "Stop-loss (-2%, ATR not ready yet)"
-                else:
-                    peak_price = trade["atr_trail_peak_price"]
-                    peak_price = max(peak_price, last_price) if peak_price is not None else max(entry_price, last_price)
-                    stop_price = peak_price - (current_atr * atr_multiplier)
-                    if last_price <= stop_price:
-                        exited, exit_price = True, last_price
-                        exit_reason = f"ATR trailing stop ({atr_period}p x{atr_multiplier:g}, stop {stop_price:.2f})"
+                # #6 (hybrid): ATR (Chandelier-style) protects the
+                # downside only until +2% profit - stop distance scales
+                # with how much the premium is actually moving, so it
+                # sits wider in choppy/volatile stretches and tighter once
+                # things calm down, instead of a fixed %. A -2% floor
+                # covers the trade until there's enough candle history for
+                # the first ATR reading. Once +2% is reached, ATR hands
+                # off entirely to a plain 0.5%-step trailing stop on the %
+                # gain (same mechanism as strategy #3, wider steps) - this
+                # is what actually locks in profit mechanically, rather
+                # than risk ATR suddenly going quiet on a winning trade
+                # and loosening the stop right when it should be tightest.
+                if trade["trail_high_pct"] is None:
+                    if pct_change >= 2.0:
+                        trail_update = {"trail_high_pct": _floor_to_step(pct_change, 0.5)}
                     else:
-                        trail_update = {"atr_trail_peak_price": peak_price}
+                        atr_period = get_atr_period()
+                        atr_multiplier = get_atr_multiplier()
+                        atr_series = calculate_atr(candles or [], atr_period)
+                        current_atr = atr_series[-1] if atr_series else None
+                        if current_atr is None:
+                            if pct_change <= -2.0:
+                                exited, exit_price = True, last_price
+                                exit_reason = "Stop-loss (-2%, ATR not ready yet)"
+                        else:
+                            peak_price = trade["atr_trail_peak_price"]
+                            peak_price = max(peak_price, last_price) if peak_price is not None else max(entry_price, last_price)
+                            stop_price = peak_price - (current_atr * atr_multiplier)
+                            if last_price <= stop_price:
+                                exited, exit_price = True, last_price
+                                exit_reason = f"ATR stop ({atr_period}p x{atr_multiplier:g}, stop {stop_price:.2f})"
+                            else:
+                                trail_update = {"atr_trail_peak_price": peak_price}
+                else:
+                    trail_high = trade["trail_high_pct"]
+                    current_milestone = _floor_to_step(pct_change, 0.5)
+                    if current_milestone > trail_high:
+                        trail_update = {"trail_high_pct": current_milestone}
+                    else:
+                        stop_pct = round(trail_high - 0.5, 2)
+                        if pct_change <= stop_pct:
+                            exited, exit_price = True, last_price
+                            exit_reason = f"Trailing stop ({stop_pct:g}%) after ATR phase"
 
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
@@ -2640,6 +2665,80 @@ def clear_alerts():
     return redirect(url_for("index"))
 
 
+def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
+    """Adds a human-readable 'stop_info' string (and 'atr_value' when
+    relevant) to each open trade, showing exactly where its stop actually
+    sits right now - not just the exit_reason that appears after the fact
+    once it's hit. Strategy-aware: reads the same fields/logic
+    run_paper_trade_check uses to decide exits, so this is a live view of
+    the real stop, not an approximation. For ATR_TRAIL specifically, this
+    also does a fresh ATR calculation off the latest candles (one extra
+    Upstox call per open trade using that strategy - never more than one,
+    since only a single position is open at a time in this app)."""
+    for t in open_trades:
+        strategy = t.get("strategy") or "EMA"
+        entry = t.get("entry_price")
+        if not entry:
+            t["stop_info"] = None
+            t["atr_value"] = None
+            continue
+
+        if strategy == "HALF_HALF_HARD4":
+            stop_pct = 0.0 if t.get("target1_hit_time") else -2.0
+            stop_price = entry * (1 + stop_pct / 100)
+            t["stop_info"] = f"{'Breakeven' if stop_pct == 0 else 'Stop'}: {stop_pct:+.1f}% ({stop_price:.2f})"
+            t["atr_value"] = None
+
+        elif strategy == "TRAIL_FROM_2":
+            trail_high = t.get("trail_high_pct")
+            stop_pct = -2.0 if trail_high is None else round(trail_high - 0.2, 2)
+            stop_price = entry * (1 + stop_pct / 100)
+            t["stop_info"] = f"{'Stop' if trail_high is None else 'Trail stop'}: {stop_pct:+.2f}% ({stop_price:.2f})"
+            t["atr_value"] = None
+
+        elif strategy in ("FULL_AT_2", "FULL_AT_4"):
+            stop_price = entry * 0.98
+            t["stop_info"] = f"Stop: -2.0% ({stop_price:.2f})"
+            t["atr_value"] = None
+
+        elif strategy == "ATR_TRAIL":
+            trail_high = t.get("trail_high_pct")
+            if trail_high is not None:
+                # Past +2% - in the plain 0.5%-step trailing phase.
+                stop_pct = round(trail_high - 0.5, 2)
+                stop_price = entry * (1 + stop_pct / 100)
+                t["stop_info"] = f"Trail stop: {stop_pct:+.2f}% ({stop_price:.2f})"
+                t["atr_value"] = None
+            else:
+                # Still in the ATR phase - recompute live off fresh candles.
+                current_atr = None
+                instrument_key = t.get("paper_instrument_key")
+                if instrument_key and access_token:
+                    try:
+                        candles = fetch_5min_candles(instrument_key, access_token)
+                        atr_series = calculate_atr(candles, get_atr_period())
+                        current_atr = atr_series[-1] if atr_series else None
+                    except Exception:
+                        current_atr = None
+                if current_atr is None:
+                    t["stop_info"] = "Stop: -2.0% (ATR warming up)"
+                    t["atr_value"] = None
+                else:
+                    last_price = t.get("last_checked_price")
+                    peak_price = t.get("atr_trail_peak_price") or entry
+                    if last_price is not None:
+                        peak_price = max(peak_price, last_price)
+                    atr_mult = get_atr_multiplier()
+                    stop_price = peak_price - (current_atr * atr_mult)
+                    stop_pct = round((stop_price / entry - 1) * 100, 2)
+                    t["atr_value"] = round(current_atr, 2)
+                    t["stop_info"] = f"ATR stop: {stop_price:.2f} ({stop_pct:+.2f}%)"
+
+        else:
+            t["stop_info"] = None
+            t["atr_value"] = None
+
+
 def attach_unrealized_pnl(open_trades: list[dict]) -> None:
     """Adds 'unrealized_pnl' and 'unrealized_pnl_pct' to each open trade.
     The percentage is against the capital actually deployed for that
@@ -2732,6 +2831,7 @@ def paper_trading():
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
+    attach_stop_info(open_trades, get_setting("upstox_access_token"))
 
     total_pnl = sum(t["pnl"] for t in closed_trades if t["pnl"] is not None)
     wins = sum(1 for t in closed_trades if (t["pnl"] or 0) > 0)
@@ -2904,6 +3004,7 @@ def paper_trading_data():
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     access_token = get_setting("upstox_access_token")
+    attach_stop_info(open_trades, access_token)
     live_available_funds = get_upstox_available_funds_for_display(access_token) if access_token else None
 
     return jsonify({
@@ -2961,7 +3062,7 @@ STRATEGY_DESCRIPTIONS = {
     "TRAIL_FROM_2": "3) Hard -2% stop-loss protects until +2%. No half-booking - the full quantity starts trailing from +2%, in 0.2% steps, always one step behind the peak.",
     "FULL_AT_2": "4) Hard -2% stop-loss protects until +2%, then the full quantity exits at +2% - one fixed target, 1:1 risk-reward.",
     "FULL_AT_4": "5) Hard -2% stop-loss protects until +4%, then the full quantity exits at +4% - one fixed target, 1:2 risk-reward.",
-    "ATR_TRAIL": "6) ATR trailing stop (Chandelier-style) - stop = highest price since entry minus (ATR x multiplier), so the stop distance widens automatically in choppy/volatile conditions and tightens when calm, instead of a fixed %. Uses the ATR period/multiplier set below. A -2% floor protects the trade until enough candle history exists to compute the first ATR reading.",
+    "ATR_TRAIL": "6) Hybrid ATR + trail: an ATR (Chandelier-style) stop protects the downside until +2% profit - stop = highest price since entry minus (ATR x multiplier), widening automatically in choppy conditions and tightening when calm. A -2% floor covers the trade until enough candle history exists for the first ATR reading. Once +2% is reached, hands off entirely to a plain 0.5% step trailing stop on the % gain, to lock in profit mechanically. Uses the ATR period/multiplier set below.",
 }
 
 

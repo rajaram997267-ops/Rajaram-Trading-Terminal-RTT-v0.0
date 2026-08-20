@@ -283,16 +283,17 @@
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th>
+        <th>Last checked price</th><th>Stop</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th>
       </tr>
       {% for t in open_trades %}
       <tr>
         <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
-        <td>{{ t.quantity }}{% if t.target1_hit_time %}<div class="sub" style="font-size:11px; color: var(--gold);">T1: {{ t.target1_qty }} @ {{ t.target1_exit_price }}</div>{% endif %}{% if t.trail_high_pct is not none %}<div class="sub" style="font-size:11px; color: var(--green);">Trail stop: {{ "%.1f"|format(t.trail_high_pct - 0.5) }}%</div>{% endif %}</td>
+        <td>{{ t.quantity }}{% if t.target1_hit_time %}<div class="sub" style="font-size:11px; color: var(--gold);">T1: {{ t.target1_qty }} @ {{ t.target1_exit_price }}</div>{% endif %}</td>
         <td>{{ t.entry_price }}</td>
         <td>{{ t.entry_time[:19] }}</td>
         <td>{{ t.last_checked_price or "-" }}</td>
+        <td>{% if t.stop_info %}<div style="font-size:12px; color: var(--green);">{{ t.stop_info }}</div>{% endif %}{% if t.atr_value is not none %}<div class="sub" style="font-size:11px; color: var(--muted);">ATR: {{ t.atr_value }}</div>{% endif %}</td>
         <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl if t.unrealized_pnl is not none else "-" }}</td>
         <td class="{% if t.unrealized_pnl_pct and t.unrealized_pnl_pct > 0 %}pnl-pos{% elif t.unrealized_pnl_pct and t.unrealized_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl_pct if t.unrealized_pnl_pct is not none else "-" }}{% if t.unrealized_pnl_pct is not none %}%{% endif %}</td>
         <td>{{ (t.last_checked_time or "")[:19] }}</td>
@@ -408,10 +409,11 @@
         <tr>
           <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
-          <td>${t.quantity}${t.target1_hit_time ? `<div class="sub" style="font-size:11px; color: var(--gold);">T1: ${t.target1_qty} @ ${t.target1_exit_price}</div>` : ""}${(t.trail_high_pct !== null && t.trail_high_pct !== undefined) ? `<div class="sub" style="font-size:11px; color: var(--green);">Trail stop: ${(t.trail_high_pct - 0.5).toFixed(1)}%</div>` : ""}</td>
+          <td>${t.quantity}${t.target1_hit_time ? `<div class="sub" style="font-size:11px; color: var(--gold);">T1: ${t.target1_qty} @ ${t.target1_exit_price}</div>` : ""}</td>
           <td>${t.entry_price}</td>
           <td>${(t.entry_time || "").slice(0, 19)}</td>
           <td>${t.last_checked_price || "-"}</td>
+          <td>${t.stop_info ? `<div style="font-size:12px; color: var(--green);">${escapeHtml(t.stop_info)}</div>` : ""}${(t.atr_value !== null && t.atr_value !== undefined) ? `<div class="sub" style="font-size:11px; color: var(--muted);">ATR: ${t.atr_value}</div>` : ""}</td>
           <td class="${pnlClass}">${pnlText}</td>
           <td class="${pnlClass}">${pctText}</td>
           <td>${(t.last_checked_time || "").slice(0, 19)}</td>
@@ -423,7 +425,7 @@
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th></tr>
+              <th>Last checked price</th><th>Stop</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th></tr>
           ${rows}
         </table>
       `;

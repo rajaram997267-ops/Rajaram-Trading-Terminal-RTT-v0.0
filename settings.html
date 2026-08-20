@@ -166,7 +166,7 @@
       <option value="TRAIL_FROM_2" {% if exit_strategy == "TRAIL_FROM_2" %}selected{% endif %}>3) -2% SL, trail 100% qty from 2% (0.2% steps)</option>
       <option value="FULL_AT_2" {% if exit_strategy == "FULL_AT_2" %}selected{% endif %}>4) -2% SL, full exit at 2%</option>
       <option value="FULL_AT_4" {% if exit_strategy == "FULL_AT_4" %}selected{% endif %}>5) -2% SL, full exit at 4%</option>
-      <option value="ATR_TRAIL" {% if exit_strategy == "ATR_TRAIL" %}selected{% endif %}>6) ATR trailing stop (Chandelier-style)</option>
+      <option value="ATR_TRAIL" {% if exit_strategy == "ATR_TRAIL" %}selected{% endif %}>6) ATR stop until +2%, then trail 0.5% steps</option>
     </select>
     <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
   </div>
