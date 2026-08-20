@@ -547,6 +547,26 @@ def get_sector_filter_top_n() -> int:
         return 5
 
 
+def get_entry_time_filter() -> str | None:
+    """Earliest clock time (IST, 'HH:MM') new trades are allowed to open,
+    e.g. '09:45' - alerts before this are simply skipped, same as if the
+    sector filter or a single-position lock rejected them. Empty/unset
+    means no filter (any time is fine). Stored as plain 'HH:MM' text so
+    it sorts/compares as a string against the current IST time cleanly."""
+    value = (get_setting("entry_time_filter", "") or "").strip()
+    return value or None
+
+
+def is_after_entry_time_filter() -> bool:
+    """True if either no entry-time filter is set, or the current IST
+    clock time is at/after the configured cutoff."""
+    cutoff = get_entry_time_filter()
+    if not cutoff:
+        return True
+    now_hhmm = (datetime.utcnow() + IST_OFFSET).strftime("%H:%M")
+    return now_hhmm >= cutoff
+
+
 def get_atr_period() -> int:
     """Lookback period (in 5-min candles) for the ATR_TRAIL exit
     strategy's Average True Range calculation. Defaults to 10."""
@@ -693,6 +713,12 @@ def create_paper_trades_for_batch(data: dict) -> None:
     if category == "Sell" and not get_sell_alerts_enabled():
         return
 
+    # Entry-time filter - lets the user skip the noisier opening minutes
+    # entirely and only let the system open trades from a chosen clock
+    # time onward (e.g. 09:45). Off by default (no filter).
+    if not is_after_entry_time_filter():
+        return
+
     with get_db() as conn:
         already_open = conn.execute(
             "SELECT id FROM paper_trades WHERE status = 'OPEN' LIMIT 1"
@@ -722,6 +748,18 @@ def create_paper_trades_for_batch(data: dict) -> None:
     if symbol is None:
         return
 
+    open_trade_for_symbol(symbol, category, price_val)
+
+
+def open_trade_for_symbol(symbol: str, category: str, price_val: float) -> None:
+    """Opens exactly one paper trade (and, if live trading is on, a
+    matching live order) for a single already-resolved symbol/category/
+    price. This is the shared core used by both the normal webhook
+    alert flow (create_paper_trades_for_batch) and the manual 'missed
+    alert' Buy button on the dashboard (api_manual_enter_alert).
+    Callers are responsible for their own already-open-trade / entry-
+    time / buy-sell-enabled checks first - this function only applies
+    the per-trade qualification checks (sector filter, POC filter)."""
     # Paper trading now simulates the actual ATM OPTION this alert would
     # buy live (Call for Buy, Put for Sell) - not the equity - so it's a
     # true preview of the live strategy: premium as entry price, quantity
@@ -2130,7 +2168,7 @@ def run_paper_trade_check() -> dict:
             # strategy - it's a second Upstox call on top of the option's
             # own, so no reason to pay for it otherwise.
             spot_candles = None
-            if strategy == "EMA_SPOT_TRAIL":
+            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE"):
                 spot_key = get_instrument_key(symbol)
                 if spot_key:
                     spot_candles = fetch_5min_candles(spot_key, access_token)
@@ -2324,6 +2362,23 @@ def run_paper_trade_check() -> dict:
                     if spot_exited:
                         exited, exit_price = True, last_price
                         exit_reason = "5-EMA (spot) reversal"
+
+            elif strategy == "EMA_SPOT_PURE" and last_price is not None:
+                # #8: pure 5-EMA (spot) trail - NO -2% floor, no fixed
+                # target. The full quantity only exits when the
+                # UNDERLYING stock confirms a reversal against the
+                # position (same rule as #7, just without a stop
+                # underneath it):
+                #   Buy:  2 red candles closing below EMA(5) of the LOWS
+                #   Sell: 2 green candles closing above EMA(5) of the HIGHS
+                # Deliberately unprotected on the downside - the whole
+                # point is to never cut a trade off before the EMA itself
+                # ever gets a chance to trail it. A losing trade can run
+                # further than any other strategy here before this fires.
+                spot_exited, _ = check_exit(trade["direction"], spot_candles or [])
+                if spot_exited:
+                    exited, exit_price = True, last_price
+                    exit_reason = "5-EMA (spot) reversal"
 
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
@@ -2700,6 +2755,45 @@ def chartink_webhook():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/api/alerts/<int:alert_id>/enter", methods=["POST"])
+def api_manual_enter_alert(alert_id):
+    """Manually opens a trade for one specific alert picked off the
+    dashboard - typically a signal that was missed because another trade
+    was already open at the time it fired, and has since closed. Uses the
+    exact same entry logic as the normal webhook flow
+    (open_trade_for_symbol), just triggered by a button instead of
+    matching a live incoming alert. Still respects the single-position
+    rule - refuses if a trade is already open, same as the automatic
+    path would."""
+    with get_db() as conn:
+        alert = conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+    if not alert:
+        return jsonify({"status": "error", "message": "Alert not found"}), 404
+
+    alert_dict = dict(alert)
+    category = categorize(alert_dict)
+    if category not in ("Buy", "Sell"):
+        return jsonify({"status": "error", "message": "Could not determine Buy/Sell for this alert"}), 400
+
+    with get_db() as conn:
+        already_open = conn.execute(
+            "SELECT id FROM paper_trades WHERE status = 'OPEN' LIMIT 1"
+        ).fetchone()
+    if already_open:
+        return jsonify({"status": "error", "message": "A trade is already open - exit it first before manually entering another"}), 409
+
+    symbol = alert_dict.get("symbol")
+    try:
+        price_val = float(alert_dict.get("trigger_price") or 0)
+    except (TypeError, ValueError):
+        price_val = 0
+    if not symbol or price_val <= 0:
+        return jsonify({"status": "error", "message": "This alert doesn't have a usable symbol/price"}), 400
+
+    open_trade_for_symbol(symbol, category, price_val)
+    return jsonify({"status": "ok", "symbol": symbol, "category": category})
+
+
 @app.route("/clear", methods=["POST"])
 def clear_alerts():
     with get_db() as conn:
@@ -2778,13 +2872,12 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                     t["atr_value"] = round(current_atr, 2)
                     t["stop_info"] = f"ATR stop: {stop_price:.2f} ({stop_pct:+.2f}%)"
 
-        elif strategy == "EMA_SPOT_TRAIL":
+        elif strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE"):
             # Informational only - unlike the others, this isn't a single
             # stop price. Exit needs 2 consecutive spot candles closing
             # beyond the current 5-EMA, so show the live 5-EMA(low/high)
             # value as context, not something that fires the instant
             # price touches it.
-            stop_price = entry * 0.98
             spot_ema_note = ""
             spot_key = t.get("symbol")
             if spot_key and access_token:
@@ -2801,7 +2894,11 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                                 spot_ema_note = f" | spot {label}: {current_ema:.2f}"
                 except Exception:
                     spot_ema_note = ""
-            t["stop_info"] = f"Stop: -2.0% ({stop_price:.2f}){spot_ema_note}"
+            if strategy == "EMA_SPOT_TRAIL":
+                stop_price = entry * 0.98
+                t["stop_info"] = f"Stop: -2.0% ({stop_price:.2f}){spot_ema_note}"
+            else:
+                t["stop_info"] = f"No floor - pattern exit only{spot_ema_note}"
             t["atr_value"] = None
 
         else:
@@ -2952,6 +3049,59 @@ def paper_trading():
     return response
 
 
+@app.route("/stats")
+def stats_page():
+    html = render_template("stats.html", active_tab="stats")
+    body = html.encode("utf-8")
+    response = make_response(body)
+    response.headers["Content-Type"] = "text/html; charset=utf-8"
+    response.headers["Content-Length"] = str(len(body))
+    return response
+
+
+@app.route("/api/stats/pnl-curve")
+def api_stats_pnl_curve():
+    """Two independent equity/P&L curves - paper and live are fully
+    decoupled (different exit rules, different money), so they're built
+    and returned separately rather than combined into one line.
+
+    Paper: starting capital + cumulative P&L, walked oldest-to-newest -
+    the same running-balance math attach_running_balance uses for the
+    Paper Trading page's closed-trades table, just returned as a time
+    series instead of attached per-row.
+
+    Live: cumulative REAL P&L (live_entry_price/live_exit_price, the
+    actual fill prices - see compute_live_stats), starting at 0 rather
+    than a seeded capital figure, since live trading draws on the
+    Upstox account's real funds rather than a seeded pool this app
+    tracks."""
+    with get_db() as conn:
+        paper_rows = conn.execute(
+            "SELECT exit_time, pnl FROM paper_trades WHERE status = 'CLOSED' AND exit_time IS NOT NULL ORDER BY exit_time ASC"
+        ).fetchall()
+        live_rows = conn.execute(
+            "SELECT live_exit_time, live_entry_price, live_exit_price, live_quantity, entry_price, exit_price "
+            "FROM paper_trades WHERE live_status = 'CLOSED' AND live_exit_time IS NOT NULL ORDER BY live_exit_time ASC"
+        ).fetchall()
+
+    paper_points = []
+    running = get_capital()
+    for r in paper_rows:
+        running += r["pnl"] or 0
+        paper_points.append({"time": r["exit_time"], "balance": round(running, 2)})
+
+    live_points = []
+    running_live = 0.0
+    for r in live_rows:
+        qty = r["live_quantity"] or 0
+        entry = r["live_entry_price"] if r["live_entry_price"] is not None else (r["entry_price"] or 0)
+        exit_p = r["live_exit_price"] if r["live_exit_price"] is not None else (r["exit_price"] or 0)
+        running_live += (exit_p - entry) * qty
+        live_points.append({"time": r["live_exit_time"], "pnl": round(running_live, 2)})
+
+    return jsonify({"paper": paper_points, "live": live_points})
+
+
 @app.route("/settings")
 def settings_page():
     token_saved = bool(get_setting("upstox_access_token"))
@@ -2968,6 +3118,7 @@ def settings_page():
         sector_filter_top_n=get_sector_filter_top_n(),
         atr_period=get_atr_period(),
         atr_multiplier=get_atr_multiplier(),
+        entry_time_filter=get_entry_time_filter() or "",
     )
     body = html.encode("utf-8")
     response = make_response(body)
@@ -3124,7 +3275,7 @@ def paper_trading_live_toggle():
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
-VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL")
+VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE")
 
 STRATEGY_DESCRIPTIONS = {
     "EMA": "1) 5-EMA only, let it run - retired from selection (let losses run too deep waiting for a pattern reversal to confirm). Kept only for trades that already opened under it.",
@@ -3134,6 +3285,7 @@ STRATEGY_DESCRIPTIONS = {
     "FULL_AT_4": "5) Hard -2% stop-loss protects until +4%, then the full quantity exits at +4% - one fixed target, 1:2 risk-reward.",
     "ATR_TRAIL": "6) Hybrid ATR + trail: an ATR (Chandelier-style) stop protects the downside until +2% profit - stop = highest price since entry minus (ATR x multiplier), widening automatically in choppy conditions and tightening when calm. A -2% floor covers the trade until enough candle history exists for the first ATR reading. Once +2% is reached, hands off entirely to a plain 0.5% step trailing stop on the % gain, to lock in profit mechanically. Uses the ATR period/multiplier set below.",
     "EMA_SPOT_TRAIL": "7) 5-EMA (spot) trail with -2% floor: a hard -2% stop-loss protects the trade throughout. On top of that, the full quantity exits the moment the UNDERLYING stock (not the option premium) closes 2 consecutive candles beyond its own 5-EMA - below EMA(5) of the lows for a Buy, above EMA(5) of the highs for a Sell. Tracks the same clean trend line you'd watch on the spot chart, instead of the option premium's noisier candles.",
+    "EMA_SPOT_PURE": "8) Pure 5-EMA (spot) trail, NO floor: same underlying-based 5-EMA rule as #7 (2 consecutive candles closing beyond EMA(5) of lows/highs), but with no -2% stop underneath it. The trade is never cut off before the EMA itself gets a chance to trail - deliberately unprotected on the downside, so a losing trade can run further than any other strategy here before this fires.",
 }
 
 
@@ -3170,6 +3322,25 @@ def paper_trading_atr_settings():
     set_setting("atr_period", str(period))
     set_setting("atr_multiplier", str(multiplier))
     return jsonify({"status": "ok", "atr_period": period, "atr_multiplier": multiplier})
+
+
+@app.route("/api/paper-trading/entry-time-filter", methods=["POST"])
+def paper_trading_entry_time_filter():
+    """Sets (or clears) the earliest clock time new trades are allowed to
+    open - lets the noisier opening minutes be skipped entirely. Takes
+    effect on the very next alert; doesn't touch anything already open."""
+    data = request.get_json(silent=True) or {}
+    raw = (data.get("entry_time_filter") or "").strip()
+    if not raw:
+        set_setting("entry_time_filter", "")
+        return jsonify({"status": "ok", "entry_time_filter": None})
+    try:
+        parsed = datetime.strptime(raw, "%H:%M")
+    except ValueError:
+        return jsonify({"status": "error", "message": "entry_time_filter must be HH:MM (24-hour), e.g. 09:45"}), 400
+    value = parsed.strftime("%H:%M")
+    set_setting("entry_time_filter", value)
+    return jsonify({"status": "ok", "entry_time_filter": value})
 
 
 @app.route("/api/paper-trading/sector-filter-toggle", methods=["POST"])

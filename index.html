@@ -85,6 +85,17 @@
       font-size: 13px;
     }
     button:hover { opacity: 0.9; }
+    .btn-enter {
+      background: var(--green);
+      color: #06110d;
+      border: none;
+      padding: 3px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .btn-enter:hover { opacity: 0.85; }
 
     /* --- List row (replaces the old card grid) --- */
     .category-list {
@@ -407,6 +418,7 @@
     <a href="/" class="{% if active_tab == 'dashboard' %}active{% endif %}">Dashboard</a>
     <a href="/paper-trading" class="{% if active_tab == 'paper' %}active{% endif %}">Paper Trading</a>
     <a href="/live-trading" class="{% if active_tab == 'live' %}active{% endif %}">Live Trading</a>
+    <a href="/stats" class="{% if active_tab == 'stats' %}active{% endif %}">Stats</a>
     <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
   </div>
 
@@ -458,6 +470,9 @@
                       {% endfor %}
                     </span>
                     <span class="time-inline">{{ alert["triggered_at"] or alert["created_at"][11:19] }}</span>
+                    {% if category in ('Buy', 'Sell') and alert.get('id') %}
+                    <button class="btn-enter" onclick="manualEnterAlert({{ alert['id'] }}, '{{ (alert['symbol'] or '')|escape }}', '{{ category }}')">Enter</button>
+                    {% endif %}
                   </div>
                 </div>
                 {% endfor %}
@@ -500,6 +515,15 @@
       const badgesHtml = scanNames.map(sn => `<span class="badge">${escapeHtml(sn || "Scan alert")}</span>`).join("");
       const titleAttr = a.alert_name ? ` title="${escapeHtml(a.alert_name)}"` : "";
       const timeText = a.triggered_at || (a.created_at || "").slice(11, 19);
+      const cat = categorize(a);
+      // Manual entry: lets a missed alert (one that fired while another
+      // trade was already open, so the system skipped it) be entered by
+      // hand once the coast is clear - same entry logic as the automatic
+      // path, just triggered by a click. Only shown for actual Buy/Sell
+      // alerts, not "Others".
+      const enterBtn = (cat === "Buy" || cat === "Sell") && a.id
+        ? `<button class="btn-enter" onclick="manualEnterAlert(${a.id}, '${escapeHtml(a.symbol || "")}', '${cat}')">Enter</button>`
+        : "";
       return `
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
@@ -509,6 +533,7 @@
           <div class="row-bottom">
             <span class="badges-inline">${badgesHtml}</span>
             <span class="time-inline">${escapeHtml(timeText)}</span>
+            ${enterBtn}
           </div>
         </div>
       `;
@@ -643,6 +668,25 @@
       }
     }
     setInterval(refreshAlerts, 5000);
+
+    async function manualEnterAlert(id, symbol, category) {
+      if (!confirm(`Manually enter a ${category} trade for ${symbol}? This only works if no trade is currently open.`)) {
+        return;
+      }
+      try {
+        const res = await fetch(`/api/alerts/${id}/enter`, { method: "POST" });
+        const result = await res.json();
+        if (res.ok) {
+          alert(`Trade opened for ${result.symbol} (${result.category}).`);
+          await refreshAlerts();
+        } else {
+          alert(result.message || "Failed to enter trade");
+        }
+      } catch (err) {
+        alert("Failed to enter trade - see console");
+        console.error(err);
+      }
+    }
 
     // Instant push: the moment a new Chartink alert lands, the server
     // wakes this connection up (see /api/stream/alerts) instead of us
