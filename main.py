@@ -2266,6 +2266,15 @@ def run_paper_trade_check() -> dict:
                             peak_price = trade["atr_trail_peak_price"]
                             peak_price = max(peak_price, last_price) if peak_price is not None else max(entry_price, last_price)
                             stop_price = peak_price - (current_atr * atr_multiplier)
+                            # Never let the ATR stop sit LOOSER than the
+                            # -2% floor - thin/illiquid option premiums
+                            # can produce 5-min candles with huge true
+                            # range relative to price (bid-ask noise, not
+                            # real movement), which can otherwise make the
+                            # ATR stop far wider than intended. ATR can
+                            # only tighten the stop below -2%, never widen
+                            # it past that.
+                            stop_price = max(stop_price, entry_price * 0.98)
                             if last_price <= stop_price:
                                 exited, exit_price = True, last_price
                                 exit_reason = f"ATR stop ({atr_period}p x{atr_multiplier:g}, stop {stop_price:.2f})"
@@ -2730,6 +2739,7 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                         peak_price = max(peak_price, last_price)
                     atr_mult = get_atr_multiplier()
                     stop_price = peak_price - (current_atr * atr_mult)
+                    stop_price = max(stop_price, entry * 0.98)  # never display looser than the -2% floor
                     stop_pct = round((stop_price / entry - 1) * 100, 2)
                     t["atr_value"] = round(current_atr, 2)
                     t["stop_info"] = f"ATR stop: {stop_price:.2f} ({stop_pct:+.2f}%)"
