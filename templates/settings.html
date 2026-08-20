@@ -128,6 +128,7 @@
     <a href="/" class="{% if active_tab == 'dashboard' %}active{% endif %}">Dashboard</a>
     <a href="/paper-trading" class="{% if active_tab == 'paper' %}active{% endif %}">Paper Trading</a>
     <a href="/live-trading" class="{% if active_tab == 'live' %}active{% endif %}">Live Trading</a>
+    <a href="/stats" class="{% if active_tab == 'stats' %}active{% endif %}">Stats</a>
     <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
   </div>
 
@@ -168,6 +169,7 @@
       <option value="FULL_AT_4" {% if exit_strategy == "FULL_AT_4" %}selected{% endif %}>5) -2% SL, full exit at 4%</option>
       <option value="ATR_TRAIL" {% if exit_strategy == "ATR_TRAIL" %}selected{% endif %}>6) ATR stop until +2%, then trail 0.5% steps</option>
       <option value="EMA_SPOT_TRAIL" {% if exit_strategy == "EMA_SPOT_TRAIL" %}selected{% endif %}>7) 5-EMA (spot) trail, -2% floor</option>
+      <option value="EMA_SPOT_PURE" {% if exit_strategy == "EMA_SPOT_PURE" %}selected{% endif %}>8) Pure 5-EMA (spot) trail, no floor</option>
     </select>
     <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
   </div>
@@ -180,6 +182,14 @@
     <input type="text" id="atrMultiplierInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_multiplier }}">
     <button class="secondary" onclick="saveAtrSettings()">Save</button>
     <span class="token-status" id="atrSettingsStatus">Used by the "6) ATR trailing stop" exit strategy above - stop = highest price since entry &minus; (ATR &times; multiplier). Changes apply immediately to any open ATR trade too, not just new ones.</span>
+  </div>
+
+  <div class="settings-box">
+    <span>Earliest entry time (IST):</span>
+    <input type="text" id="entryTimeFilterInput" placeholder="e.g. 09:45" style="max-width: 100px; flex: none; text-align: center;" value="{{ entry_time_filter }}">
+    <button class="secondary" onclick="saveEntryTimeFilter()">Save</button>
+    <button class="secondary" onclick="clearEntryTimeFilter()">Clear</button>
+    <span class="token-status" id="entryTimeFilterStatus">{% if entry_time_filter %}ON - no new trades open before {{ entry_time_filter }} IST{% else %}OFF - trades can open any time the market's open{% endif %}</span>
   </div>
 
   <div class="settings-box">
@@ -285,6 +295,38 @@
         statusEl.textContent = "Failed to update - see console";
         console.error(err);
       }
+    }
+
+    async function saveEntryTimeFilter() {
+      const statusEl = document.getElementById("entryTimeFilterStatus");
+      const raw = document.getElementById("entryTimeFilterInput").value.trim();
+      if (raw && !/^\d{1,2}:\d{2}$/.test(raw)) {
+        statusEl.textContent = "Enter time as HH:MM, e.g. 09:45";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/entry-time-filter", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ entry_time_filter: raw }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = result.entry_time_filter
+            ? `ON - no new trades open before ${result.entry_time_filter} IST`
+            : "OFF - trades can open any time the market's open";
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function clearEntryTimeFilter() {
+      document.getElementById("entryTimeFilterInput").value = "";
+      await saveEntryTimeFilter();
     }
 
     async function toggleSectorFilter() {
