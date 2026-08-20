@@ -167,6 +167,7 @@
       <option value="FULL_AT_2" {% if exit_strategy == "FULL_AT_2" %}selected{% endif %}>4) -2% SL, full exit at 2%</option>
       <option value="FULL_AT_4" {% if exit_strategy == "FULL_AT_4" %}selected{% endif %}>5) -2% SL, full exit at 4%</option>
       <option value="ATR_TRAIL" {% if exit_strategy == "ATR_TRAIL" %}selected{% endif %}>6) ATR stop until +2%, then trail 0.5% steps</option>
+      <option value="EMA_SPOT_TRAIL" {% if exit_strategy == "EMA_SPOT_TRAIL" %}selected{% endif %}>7) 5-EMA (spot) trail, -2% floor</option>
     </select>
     <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
   </div>

@@ -2121,6 +2121,20 @@ def run_paper_trade_check() -> dict:
             last_price = ws_price if ws_price is not None else (candles[-1][3] if candles else None)
             entry_price = trade["entry_price"]
 
+            # EMA_SPOT_TRAIL is the one strategy that needs a candle
+            # series from the UNDERLYING stock, not the option premium -
+            # the whole point of it is trailing the same clean 5-EMA
+            # pattern a trader would watch on the spot chart, since
+            # option premiums are far noisier than the stock itself.
+            # Fetched lazily, only for trades actually running this
+            # strategy - it's a second Upstox call on top of the option's
+            # own, so no reason to pay for it otherwise.
+            spot_candles = None
+            if strategy == "EMA_SPOT_TRAIL":
+                spot_key = get_instrument_key(symbol)
+                if spot_key:
+                    spot_candles = fetch_5min_candles(spot_key, access_token)
+
             # Paper and live each resolve their own ATM contract at entry
             # time (both from the same alert price, moments apart) - in
             # practice that's almost always the same strike, but if it
@@ -2290,6 +2304,26 @@ def run_paper_trade_check() -> dict:
                         if pct_change <= stop_pct:
                             exited, exit_price = True, last_price
                             exit_reason = f"Trailing stop ({stop_pct:g}%) after ATR phase"
+
+            elif strategy == "EMA_SPOT_TRAIL" and pct_change is not None:
+                # #7: a hard -2% stop-loss protects the trade throughout.
+                # On top of that, the full quantity exits the moment the
+                # UNDERLYING stock (not the option premium) confirms a
+                # reversal against the position - 2 consecutive candles
+                # closing beyond its own 5-EMA:
+                #   Buy:  2 red candles closing below EMA(5) of the LOWS
+                #   Sell: 2 green candles closing above EMA(5) of the HIGHS
+                # This trails the same clean pattern a trader would watch
+                # on the spot chart, rather than the option premium's own
+                # noisier candles.
+                if pct_change <= -2.0:
+                    exited, exit_price = True, last_price
+                    exit_reason = "Stop-loss (-2%)"
+                else:
+                    spot_exited, _ = check_exit(trade["direction"], spot_candles or [])
+                    if spot_exited:
+                        exited, exit_price = True, last_price
+                        exit_reason = "5-EMA (spot) reversal"
 
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
@@ -2744,6 +2778,32 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                     t["atr_value"] = round(current_atr, 2)
                     t["stop_info"] = f"ATR stop: {stop_price:.2f} ({stop_pct:+.2f}%)"
 
+        elif strategy == "EMA_SPOT_TRAIL":
+            # Informational only - unlike the others, this isn't a single
+            # stop price. Exit needs 2 consecutive spot candles closing
+            # beyond the current 5-EMA, so show the live 5-EMA(low/high)
+            # value as context, not something that fires the instant
+            # price touches it.
+            stop_price = entry * 0.98
+            spot_ema_note = ""
+            spot_key = t.get("symbol")
+            if spot_key and access_token:
+                try:
+                    resolved_key = get_instrument_key(spot_key)
+                    if resolved_key:
+                        spot_candles = fetch_5min_candles(resolved_key, access_token)
+                        if spot_candles:
+                            series = [c[2] for c in spot_candles] if t.get("direction") == "Buy" else [c[1] for c in spot_candles]
+                            ema_series = calculate_ema(series, 5)
+                            current_ema = ema_series[-1] if ema_series else None
+                            if current_ema is not None:
+                                label = "EMA5(low)" if t.get("direction") == "Buy" else "EMA5(high)"
+                                spot_ema_note = f" | spot {label}: {current_ema:.2f}"
+                except Exception:
+                    spot_ema_note = ""
+            t["stop_info"] = f"Stop: -2.0% ({stop_price:.2f}){spot_ema_note}"
+            t["atr_value"] = None
+
         else:
             t["stop_info"] = None
             t["atr_value"] = None
@@ -3064,7 +3124,7 @@ def paper_trading_live_toggle():
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
-VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL")
+VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL")
 
 STRATEGY_DESCRIPTIONS = {
     "EMA": "1) 5-EMA only, let it run - retired from selection (let losses run too deep waiting for a pattern reversal to confirm). Kept only for trades that already opened under it.",
@@ -3073,6 +3133,7 @@ STRATEGY_DESCRIPTIONS = {
     "FULL_AT_2": "4) Hard -2% stop-loss protects until +2%, then the full quantity exits at +2% - one fixed target, 1:1 risk-reward.",
     "FULL_AT_4": "5) Hard -2% stop-loss protects until +4%, then the full quantity exits at +4% - one fixed target, 1:2 risk-reward.",
     "ATR_TRAIL": "6) Hybrid ATR + trail: an ATR (Chandelier-style) stop protects the downside until +2% profit - stop = highest price since entry minus (ATR x multiplier), widening automatically in choppy conditions and tightening when calm. A -2% floor covers the trade until enough candle history exists for the first ATR reading. Once +2% is reached, hands off entirely to a plain 0.5% step trailing stop on the % gain, to lock in profit mechanically. Uses the ATR period/multiplier set below.",
+    "EMA_SPOT_TRAIL": "7) 5-EMA (spot) trail with -2% floor: a hard -2% stop-loss protects the trade throughout. On top of that, the full quantity exits the moment the UNDERLYING stock (not the option premium) closes 2 consecutive candles beyond its own 5-EMA - below EMA(5) of the lows for a Buy, above EMA(5) of the highs for a Sell. Tracks the same clean trend line you'd watch on the spot chart, instead of the option premium's noisier candles.",
 }
 
 
