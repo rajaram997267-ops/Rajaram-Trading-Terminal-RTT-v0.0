@@ -96,6 +96,56 @@
       font-weight: 600;
     }
     .btn-enter:hover { opacity: 0.85; }
+    .btn-chart {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 3px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 600;
+      margin-left: 6px;
+    }
+    .btn-chart:hover { opacity: 0.85; border-color: var(--green); }
+
+    .chart-modal-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    .chart-modal-overlay.open { display: flex; }
+    .chart-modal {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      width: min(900px, 92vw);
+      max-height: 85vh;
+      overflow: auto;
+    }
+    .chart-modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .chart-modal-header h3 { margin: 0; font-size: 16px; }
+    .chart-modal-close {
+      background: var(--border);
+      color: var(--text);
+      border: none;
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .chart-modal-body { position: relative; height: 400px; }
+    .chart-modal-status { color: var(--muted); font-size: 13px; text-align: center; padding: 40px 0; }
 
     /* --- List row (replaces the old card grid) --- */
     .category-list {
@@ -473,6 +523,9 @@
                     {% if category in ('Buy', 'Sell') and alert.get('id') %}
                     <button class="btn-enter" onclick="manualEnterAlert({{ alert['id'] }}, '{{ (alert['symbol'] or '')|escape }}', '{{ category }}')">Enter</button>
                     {% endif %}
+                    {% if alert.get('symbol') %}
+                    <button class="btn-chart" onclick="openChart('{{ (alert['symbol'] or '')|escape }}', '{{ category }}')">Chart</button>
+                    {% endif %}
                   </div>
                 </div>
                 {% endfor %}
@@ -487,6 +540,20 @@
     </div>
   </div>
 
+  <div class="chart-modal-overlay" id="chartModalOverlay" onclick="if(event.target===this) closeChart()">
+    <div class="chart-modal">
+      <div class="chart-modal-header">
+        <h3 id="chartModalTitle">Chart</h3>
+        <button class="chart-modal-close" onclick="closeChart()">Close</button>
+      </div>
+      <div class="chart-modal-body">
+        <canvas id="chartModalCanvas"></canvas>
+        <div class="chart-modal-status" id="chartModalStatus" style="display:none;"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.1/chart.umd.min.js"></script>
 
   <script>
     const SELECTED_DATE = {{ selected_date|tojson }};
@@ -524,6 +591,9 @@
       const enterBtn = (cat === "Buy" || cat === "Sell") && a.id
         ? `<button class="btn-enter" onclick="manualEnterAlert(${a.id}, '${escapeHtml(a.symbol || "")}', '${cat}')">Enter</button>`
         : "";
+      const chartBtn = a.symbol
+        ? `<button class="btn-chart" onclick="openChart('${escapeHtml(a.symbol)}', '${cat}')">Chart</button>`
+        : "";
       return `
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
@@ -534,6 +604,7 @@
             <span class="badges-inline">${badgesHtml}</span>
             <span class="time-inline">${escapeHtml(timeText)}</span>
             ${enterBtn}
+            ${chartBtn}
           </div>
         </div>
       `;
@@ -685,6 +756,89 @@
       } catch (err) {
         alert("Failed to enter trade - see console");
         console.error(err);
+      }
+    }
+
+    let chartInstance = null;
+
+    async function openChart(symbol, direction) {
+      const overlay = document.getElementById("chartModalOverlay");
+      const title = document.getElementById("chartModalTitle");
+      const canvas = document.getElementById("chartModalCanvas");
+      const statusEl = document.getElementById("chartModalStatus");
+
+      title.textContent = `${symbol} - 5m chart`;
+      overlay.classList.add("open");
+      canvas.style.display = "none";
+      statusEl.style.display = "block";
+      statusEl.textContent = "Loading...";
+
+      if (chartInstance) {
+        chartInstance.destroy();
+        chartInstance = null;
+      }
+
+      try {
+        const res = await fetch(`/api/chart/${encodeURIComponent(symbol)}?direction=${encodeURIComponent(direction || "Buy")}`);
+        const data = await res.json();
+        if (!res.ok || data.status !== "ok") {
+          statusEl.textContent = data.message || "Failed to load chart";
+          return;
+        }
+        if (typeof Chart === "undefined") {
+          statusEl.textContent = "Chart library failed to load - check your connection and reload.";
+          return;
+        }
+
+        statusEl.style.display = "none";
+        canvas.style.display = "block";
+        const ctx = canvas.getContext("2d");
+        chartInstance = new Chart(ctx, {
+          type: "line",
+          data: {
+            labels: data.labels,
+            datasets: [
+              {
+                label: "Close",
+                data: data.closes,
+                borderColor: "#00c896",
+                backgroundColor: "#00c89622",
+                fill: true,
+                tension: 0.15,
+                pointRadius: 0,
+              },
+              {
+                label: data.ema_label,
+                data: data.ema,
+                borderColor: "#ff5370",
+                borderDash: [4, 3],
+                fill: false,
+                tension: 0.15,
+                pointRadius: 0,
+              },
+            ],
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { labels: { color: "#e6e9f0" } } },
+            scales: {
+              x: { ticks: { color: "#6b7280", maxTicksLimit: 10 }, grid: { color: "#1e222d" } },
+              y: { ticks: { color: "#6b7280" }, grid: { color: "#1e222d" } },
+            },
+          },
+        });
+      } catch (err) {
+        statusEl.textContent = "Failed to load chart - see console";
+        console.error(err);
+      }
+    }
+
+    function closeChart() {
+      document.getElementById("chartModalOverlay").classList.remove("open");
+      if (chartInstance) {
+        chartInstance.destroy();
+        chartInstance = null;
       }
     }
   </script>
