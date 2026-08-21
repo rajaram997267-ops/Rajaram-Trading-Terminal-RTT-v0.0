@@ -1753,8 +1753,19 @@ def _ws_run(access_token: str) -> None:
 
     while True:
         try:
+            # Always use the freshest saved token, not the one this
+            # thread happened to be started with. If the DB already had
+            # a stale/expired token when this process booted (e.g. it
+            # spun up before today's token was pasted in), the token
+            # passed into this function at thread-start is permanently
+            # wrong - updating Settings afterward otherwise wouldn't do
+            # anything, since the process itself doesn't restart just
+            # because a setting changed. Re-reading on every reconnect
+            # attempt is what makes a fresh token actually take effect
+            # without needing a manual redeploy.
+            current_token = get_setting("upstox_access_token") or access_token
             configuration = upstox_client.Configuration()
-            configuration.access_token = access_token
+            configuration.access_token = current_token
             initial_keys = list(_ws_subscribed_keys) or ["NSE_INDEX|Nifty 50"]
             streamer = upstox_client.MarketDataStreamerV3(
                 upstox_client.ApiClient(configuration), initial_keys, "ltpc"
