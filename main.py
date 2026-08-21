@@ -1441,6 +1441,49 @@ def resample_1min_to_5min(candles_1min: list) -> list[tuple[float, float, float,
     return [tuple(buckets[k]) for k in order]
 
 
+def resample_1min_to_5min_with_time(candles_1min: list) -> list[tuple[str, float, float, float, float]]:
+    """Same bucketing as resample_1min_to_5min, but keeps each bucket's
+    start time (as 'HH:MM') - needed for charting, where the plain OHLC
+    tuples elsewhere in this file don't carry enough to label an x-axis."""
+    buckets: dict = {}
+    order = []
+    for c in candles_1min:
+        ts_str, o, h, l, cl = c[0], c[1], c[2], c[3], c[4]
+        dt = datetime.fromisoformat(ts_str)
+        bucket_minute = (dt.minute // 5) * 5
+        bucket_key = dt.replace(minute=bucket_minute, second=0, microsecond=0)
+        if bucket_key not in buckets:
+            buckets[bucket_key] = [o, h, l, cl]
+            order.append(bucket_key)
+        else:
+            b = buckets[bucket_key]
+            b[1] = max(b[1], h)
+            b[2] = min(b[2], l)
+            b[3] = cl
+    return [(k.strftime("%H:%M"), *buckets[k]) for k in order]
+
+
+def fetch_5min_candles_with_time(instrument_key: str, access_token: str) -> list[tuple[str, float, float, float, float]]:
+    """Same data source as fetch_5min_candles, but keeps each candle's
+    time label - used only by the dashboard's on-demand per-alert chart
+    (see /api/chart/<symbol>), fetched lazily on click, never for the
+    whole alert list at once."""
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/1minute"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode())
+    raw_candles = payload.get("data", {}).get("candles", [])
+    raw_candles = sorted(raw_candles, key=lambda c: c[0])
+    return resample_1min_to_5min_with_time(raw_candles)
+
+
 def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[float, float, float, float]]:
     """Fetches today's 1-minute candles from Upstox (their intraday API only
     supports 1minute or 30minute - not 5minute directly) and combines them
@@ -2803,6 +2846,50 @@ def api_manual_enter_alert(alert_id):
 
     open_trade_for_symbol(symbol, category, price_val)
     return jsonify({"status": "ok", "symbol": symbol, "category": category})
+
+
+@app.route("/api/chart/<symbol>")
+def api_chart(symbol):
+    """On-demand candle data for the dashboard's per-alert Chart button -
+    fetched only when a user actually clicks Chart on a specific alert,
+    never automatically for the whole alert list. Loading candles for
+    every alert on the page at once would genuinely slow the dashboard
+    and hammer Upstox's API for no reason - this keeps that cost at
+    exactly one API call per click, nothing more.
+
+    Also returns a 5-EMA overlay of the underlying's own lows (for a Buy
+    position) or highs (for a Sell position) - the same line the EMA_SPOT
+    strategies (#7/#8) trail, so this doubles as a quick visual check of
+    where that trail actually sits without leaving the terminal."""
+    access_token = get_setting("upstox_access_token")
+    if not access_token:
+        return jsonify({"status": "error", "message": "No Upstox access token saved yet."}), 400
+
+    instrument_key = get_instrument_key(symbol)
+    if not instrument_key:
+        return jsonify({"status": "error", "message": f"Could not resolve an instrument key for {symbol}"}), 404
+
+    try:
+        candles = fetch_5min_candles_with_time(instrument_key, access_token)
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Failed to fetch candles: {e}"}), 502
+
+    if not candles:
+        return jsonify({"status": "error", "message": "No candle data available yet for today"}), 404
+
+    direction = request.args.get("direction", "Buy")
+    closes = [c[4] for c in candles]
+    series = [c[3] for c in candles] if direction == "Buy" else [c[2] for c in candles]  # lows or highs
+    ema_series = calculate_ema(series, 5)
+
+    return jsonify({
+        "status": "ok",
+        "symbol": symbol,
+        "labels": [c[0] for c in candles],
+        "closes": closes,
+        "ema": ema_series,
+        "ema_label": "EMA5(low)" if direction == "Buy" else "EMA5(high)",
+    })
 
 
 @app.route("/clear", methods=["POST"])
