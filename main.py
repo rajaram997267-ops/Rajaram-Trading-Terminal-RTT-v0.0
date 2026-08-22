@@ -2589,6 +2589,47 @@ def run_paper_trade_check() -> dict:
             # normal software-driven market SELL when it's hit (which also
             # cancels the now-unneeded SL-M first, see
             # _close_live_position_if_any).
+
+            # Retry a still-missing fill price / SL-M stop. The initial
+            # attempt at entry time only retries for ~4.5 seconds
+            # (get_order_average_price) before giving up and falling back
+            # to app-side-only monitoring - if Upstox's order-details API
+            # is slower than that under real load, the position could sit
+            # with NO broker-side stop for its entire lifetime, which is
+            # exactly the gap this closes: every pass, if a live position
+            # is open but still missing its real fill price, try again.
+            # Once it succeeds, place the SL-M stop retroactively - this
+            # runs far more times (minutes, not seconds) than the initial
+            # attempt ever could.
+            if trade["live_status"] == "OPEN" and trade["live_entry_price"] is None and trade["live_entry_order_id"]:
+                retry_fill = get_order_average_price(trade["live_entry_order_id"], access_token)
+                if retry_fill:
+                    retry_sl_order_id = None
+                    retry_sl_trigger_price = round(retry_fill * 0.98, 1)
+                    retry_sl_note = None
+                    sl_result = place_live_order(
+                        trade["live_instrument_key"], "SELL", trade["live_quantity"] or 1, access_token,
+                        order_type="SL-M", trigger_price=retry_sl_trigger_price,
+                    )
+                    if sl_result["ok"]:
+                        retry_sl_order_id = sl_result["order_id"]
+                    else:
+                        retry_sl_note = f"Fill price recovered but broker SL-M stop failed to place: {sl_result['error']}"
+                    with get_db() as conn:
+                        conn.execute(
+                            """
+                            UPDATE paper_trades
+                            SET live_entry_price = ?, live_sl_order_id = ?, live_sl_trigger_price = ?, live_error = ?
+                            WHERE id = ?
+                            """,
+                            (retry_fill, retry_sl_order_id, retry_sl_trigger_price, retry_sl_note, trade["id"]),
+                        )
+                        conn.commit()
+                    # Use the freshly-recovered price for the REST of this
+                    # same pass too, not just future ones.
+                    trade["live_entry_price"] = retry_fill
+                    trade["live_sl_order_id"] = retry_sl_order_id
+
             live_exited = False
             live_exit_reason_val = None
             live_trail_update = None
@@ -2728,6 +2769,21 @@ def run_paper_trade_check() -> dict:
                     conn.execute(
                         "UPDATE paper_trades SET last_checked_price = ?, last_checked_time = ?, last_error = NULL WHERE id = ?",
                         (last_price, now, trade["id"]),
+                    )
+                elif trade["live_status"] == "OPEN":
+                    # Paper side already closed - none of the branches
+                    # above apply (they're all paper-side outcomes), but
+                    # live is still open and being actively priced every
+                    # pass via live_last_price above. Without this,
+                    # last_checked_price/last_checked_time would freeze
+                    # forever the moment paper closes, leaving the
+                    # dashboard showing blank "Last checked price" and
+                    # "Unrealized P&L" for a live position that's actually
+                    # still being monitored correctly underneath - exactly
+                    # what was happening before this fix.
+                    conn.execute(
+                        "UPDATE paper_trades SET last_checked_price = ?, last_checked_time = ?, last_error = NULL WHERE id = ?",
+                        (live_last_price, now, trade["id"]),
                     )
                 conn.commit()
         except urllib.error.HTTPError as e:
