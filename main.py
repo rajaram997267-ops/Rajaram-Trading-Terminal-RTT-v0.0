@@ -1182,31 +1182,93 @@ def get_instrument_key(symbol: str) -> str | None:
     return _instrument_cache.get((symbol or "").upper())
 
 
+def get_theta_switch_enabled() -> bool:
+    """On by default - when on, once the nearest monthly expiry crosses
+    into the back (higher-decay) half of its own trading-day cycle,
+    get_atm_option rolls new trades to the NEXT monthly expiry instead.
+    Rationale: theta decay is non-linear - the back half of a monthly
+    cycle bleeds extrinsic value far faster than the front half, so
+    staying in the current month during that window means theta (not
+    just being wrong on direction) eats the position. See the analysis
+    that led to this feature for the full reasoning."""
+    return get_setting("theta_switch_enabled", "true") == "true"
+
+
+def _count_weekdays_inclusive(start_date, end_date) -> int:
+    """Counts Mon-Fri days in [start_date, end_date], inclusive of both
+    ends. Used as a practical stand-in for NSE trading days, since this
+    app doesn't maintain a full exchange holiday calendar - this can be
+    off by a day or two around a holiday, which matters far less than
+    which half of the expiry cycle a trade actually sits in."""
+    if end_date < start_date:
+        return 0
+    days = 0
+    d = start_date
+    while d <= end_date:
+        if d.weekday() < 5:
+            days += 1
+        d += timedelta(days=1)
+    return days
+
+
 def get_atm_option(symbol: str, opt_type: str, reference_price: float) -> dict | None:
     """Finds the ATM (closest-strike) contract for this underlying's
-    nearest MONTHLY expiry. A monthly expiry is identified as the latest
-    expiry date that falls within a given calendar month among all this
-    underlying's expiries (matches how NSE's monthly contracts work: the
-    last expiry of the month is the monthly one, the rest are weeklies).
-    Returns None if no option chain data is available for this symbol."""
-    today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
-    if _instrument_cache_date != today or not _option_chain_cache:
+    nearest MONTHLY expiry - or the NEXT monthly expiry instead, once
+    get_theta_switch_enabled() is on and the nearest one has crossed into
+    the back (high-decay) half of its own trading-day cycle. A monthly
+    expiry is identified as the latest expiry date that falls within a
+    given calendar month among all this underlying's expiries (matches
+    how NSE's monthly contracts work: the last expiry of the month is
+    the monthly one, the rest are weeklies). Returns None if no option
+    chain data is available for this symbol."""
+    today_str = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    today_date = (datetime.utcnow() + IST_OFFSET).date()
+    if _instrument_cache_date != today_str or not _option_chain_cache:
         _load_instrument_master()
     contracts = _option_chain_cache.get((symbol or "").upper())
     if not contracts:
         return None
 
-    all_expiries = sorted({c["expiry"] for c in contracts if c["expiry"] >= today})
-    if not all_expiries:
-        return None
+    # Monthly expiries computed from the FULL contract list (not just
+    # expiries >= today) - the cycle-start calculation below needs the
+    # PREVIOUS monthly expiry too, which is necessarily in the past.
     monthly_by_month: dict[str, str] = {}
-    for exp in all_expiries:
+    for c in contracts:
+        exp = c["expiry"]
         month_key = exp[:7]  # "YYYY-MM"
         if month_key not in monthly_by_month or exp > monthly_by_month[month_key]:
             monthly_by_month[month_key] = exp
-    nearest_monthly = min(monthly_by_month.values())
+    all_monthlies = sorted(monthly_by_month.values())
+    upcoming_monthlies = [m for m in all_monthlies if m >= today_str]
+    if not upcoming_monthlies:
+        return None
 
-    candidates = [c for c in contracts if c["expiry"] == nearest_monthly and c["opt_type"] == opt_type]
+    nearest_monthly = upcoming_monthlies[0]
+    target_expiry = nearest_monthly
+
+    if get_theta_switch_enabled():
+        idx = all_monthlies.index(nearest_monthly)
+        prev_monthly = all_monthlies[idx - 1] if idx > 0 else None
+        next_monthly = all_monthlies[idx + 1] if idx + 1 < len(all_monthlies) else None
+
+        if next_monthly:
+            nearest_date = datetime.strptime(nearest_monthly, "%Y-%m-%d").date()
+            if prev_monthly:
+                cycle_start = datetime.strptime(prev_monthly, "%Y-%m-%d").date() + timedelta(days=1)
+            else:
+                # No earlier monthly expiry on record (e.g. right at the
+                # start of this instrument's data) - fall back to a
+                # ~22-trading-day cycle length assumption (~30 calendar
+                # days), rather than skip the check entirely.
+                cycle_start = nearest_date - timedelta(days=30)
+
+            total_trading_days = _count_weekdays_inclusive(cycle_start, nearest_date)
+            trading_days_remaining = _count_weekdays_inclusive(today_date, nearest_date)
+
+            if total_trading_days > 0 and trading_days_remaining <= total_trading_days / 2:
+                target_expiry = next_monthly
+
+    candidates = [c for c in contracts if c["expiry"] == target_expiry and c["opt_type"] == opt_type]
     if not candidates:
         return None
     best = min(candidates, key=lambda c: abs(c["strike"] - reference_price))
@@ -1461,6 +1523,37 @@ def resample_1min_to_5min_with_time(candles_1min: list) -> list[tuple[str, float
             b[2] = min(b[2], l)
             b[3] = cl
     return [(k.strftime("%H:%M"), *buckets[k]) for k in order]
+
+
+def fetch_previous_day_high_low(instrument_key: str, access_token: str) -> tuple[float | None, float | None]:
+    """The most recent COMPLETED trading day's high and low, for the
+    dashboard's per-alert chart PDH/PDL reference lines. Same day-candle
+    endpoint the sector prev-close loader already uses - just reading
+    high/low instead of close."""
+    today = _ist_today_str()
+    from_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=10)).strftime("%Y-%m-%d")
+    url = (
+        f"https://api.upstox.com/v2/historical-candle/"
+        f"{urllib.parse.quote(instrument_key, safe='|')}/day/{today}/{from_date}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+        candles = (payload.get("data") or {}).get("candles") or []
+        # Newest-first; the first entry is the most recent COMPLETED day.
+        if candles:
+            return candles[0][2], candles[0][3]
+    except Exception:
+        pass
+    return None, None
 
 
 def fetch_5min_candles_with_time(instrument_key: str, access_token: str) -> list[tuple[str, float, float, float, float]]:
@@ -2855,12 +2948,19 @@ def api_chart(symbol):
     never automatically for the whole alert list. Loading candles for
     every alert on the page at once would genuinely slow the dashboard
     and hammer Upstox's API for no reason - this keeps that cost at
-    exactly one API call per click, nothing more.
+    exactly one API call per click, nothing more (two, counting the
+    separate previous-day high/low lookup).
 
-    Also returns a 5-EMA overlay of the underlying's own lows (for a Buy
-    position) or highs (for a Sell position) - the same line the EMA_SPOT
-    strategies (#7/#8) trail, so this doubles as a quick visual check of
-    where that trail actually sits without leaving the terminal."""
+    Also returns:
+    - A 5-EMA overlay of the underlying's own lows (for a Buy position)
+      or highs (for a Sell position) - the same line the EMA_SPOT
+      strategies (#7/#8) trail.
+    - Which 5-min candles are "inside bars" (high <= previous candle's
+      high AND low >= previous candle's low) - the frontend highlights
+      these in dark blue, since the inside-bar pattern is part of the
+      user's own strategy.
+    - The previous COMPLETED trading day's high and low, for the PDH/PDL
+      reference lines - also part of the strategy."""
     access_token = get_setting("upstox_access_token")
     if not access_token:
         return jsonify({"status": "error", "message": "No Upstox access token saved yet."}), 400
@@ -2878,17 +2978,30 @@ def api_chart(symbol):
         return jsonify({"status": "error", "message": "No candle data available yet for today"}), 404
 
     direction = request.args.get("direction", "Buy")
-    closes = [c[4] for c in candles]
     series = [c[3] for c in candles] if direction == "Buy" else [c[2] for c in candles]  # lows or highs
     ema_series = calculate_ema(series, 5)
+
+    # Inside bar: current candle's whole range sits within the PRIOR
+    # candle's range. The first candle of the day has no prior candle to
+    # compare against, so it's never flagged.
+    is_inside_bar = [False]
+    for i in range(1, len(candles)):
+        _, _, prev_h, prev_l, _ = candles[i - 1]
+        _, _, h, l, _ = candles[i]
+        is_inside_bar.append(h <= prev_h and l >= prev_l)
+
+    prev_day_high, prev_day_low = fetch_previous_day_high_low(instrument_key, access_token)
 
     return jsonify({
         "status": "ok",
         "symbol": symbol,
         "labels": [c[0] for c in candles],
-        "closes": closes,
+        "ohlc": [{"o": c[1], "h": c[2], "l": c[3], "c": c[4]} for c in candles],
+        "is_inside_bar": is_inside_bar,
         "ema": ema_series,
         "ema_label": "EMA5(low)" if direction == "Buy" else "EMA5(high)",
+        "prev_day_high": prev_day_high,
+        "prev_day_low": prev_day_low,
     })
 
 
@@ -3217,6 +3330,7 @@ def settings_page():
         atr_period=get_atr_period(),
         atr_multiplier=get_atr_multiplier(),
         entry_time_filter=get_entry_time_filter() or "",
+        theta_switch_enabled=get_theta_switch_enabled(),
     )
     body = html.encode("utf-8")
     response = make_response(body)
@@ -3461,6 +3575,18 @@ def paper_trading_sector_filter_toggle():
         "sector_filter_enabled": enabled,
         "sector_filter_top_n": get_sector_filter_top_n(),
     })
+
+
+@app.route("/api/paper-trading/theta-switch-toggle", methods=["POST"])
+def paper_trading_theta_switch_toggle():
+    """Turns the next-month expiry auto-roll on/off. When on, new trades
+    whose nearest monthly expiry has crossed into the back (high-decay)
+    half of its own trading-day cycle open in the NEXT monthly expiry
+    instead - see get_atm_option for the actual trading-day math."""
+    data = request.get_json(silent=True) or {}
+    enabled = bool(data.get("enabled"))
+    set_setting("theta_switch_enabled", "true" if enabled else "false")
+    return jsonify({"status": "ok", "theta_switch_enabled": enabled})
 
 
 @app.route("/api/paper-trading/category-toggle", methods=["POST"])

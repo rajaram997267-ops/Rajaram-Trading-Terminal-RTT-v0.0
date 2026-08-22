@@ -553,8 +553,6 @@
     </div>
   </div>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.1/chart.umd.min.js"></script>
-
   <script>
     const SELECTED_DATE = {{ selected_date|tojson }};
     const TODAY_STR = {{ today_str|tojson }};
@@ -759,7 +757,7 @@
       }
     }
 
-    let chartInstance = null;
+    let lastChartData = null;
 
     async function openChart(symbol, direction) {
       const overlay = document.getElementById("chartModalOverlay");
@@ -772,11 +770,7 @@
       canvas.style.display = "none";
       statusEl.style.display = "block";
       statusEl.textContent = "Loading...";
-
-      if (chartInstance) {
-        chartInstance.destroy();
-        chartInstance = null;
-      }
+      lastChartData = null;
 
       try {
         const res = await fetch(`/api/chart/${encodeURIComponent(symbol)}?direction=${encodeURIComponent(direction || "Buy")}`);
@@ -785,49 +779,11 @@
           statusEl.textContent = data.message || "Failed to load chart";
           return;
         }
-        if (typeof Chart === "undefined") {
-          statusEl.textContent = "Chart library failed to load - check your connection and reload.";
-          return;
-        }
 
+        lastChartData = data;
         statusEl.style.display = "none";
         canvas.style.display = "block";
-        const ctx = canvas.getContext("2d");
-        chartInstance = new Chart(ctx, {
-          type: "line",
-          data: {
-            labels: data.labels,
-            datasets: [
-              {
-                label: "Close",
-                data: data.closes,
-                borderColor: "#00c896",
-                backgroundColor: "#00c89622",
-                fill: true,
-                tension: 0.15,
-                pointRadius: 0,
-              },
-              {
-                label: data.ema_label,
-                data: data.ema,
-                borderColor: "#ff5370",
-                borderDash: [4, 3],
-                fill: false,
-                tension: 0.15,
-                pointRadius: 0,
-              },
-            ],
-          },
-          options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: { legend: { labels: { color: "#e6e9f0" } } },
-            scales: {
-              x: { ticks: { color: "#6b7280", maxTicksLimit: 10 }, grid: { color: "#1e222d" } },
-              y: { ticks: { color: "#6b7280" }, grid: { color: "#1e222d" } },
-            },
-          },
-        });
+        drawCandlestickChart(canvas, data);
       } catch (err) {
         statusEl.textContent = "Failed to load chart - see console";
         console.error(err);
@@ -836,11 +792,166 @@
 
     function closeChart() {
       document.getElementById("chartModalOverlay").classList.remove("open");
-      if (chartInstance) {
-        chartInstance.destroy();
-        chartInstance = null;
-      }
+      lastChartData = null;
     }
+
+    // Hand-drawn candlestick chart - no external charting plugin. This
+    // is deliberate: the natural choice (chartjs-chart-financial) turns
+    // out to only ship an ESM build with no ready-to-use browser
+    // <script> version, which would mean guessing at a CDN setup we
+    // can't easily verify works. Drawing directly on canvas also makes
+    // the two custom asks (inside-bar highlighting, PDH/PDL lines)
+    // straightforward - just more pixels, not fighting a plugin's API.
+    function drawCandlestickChart(canvas, data) {
+      const dpr = window.devicePixelRatio || 1;
+      const cssWidth = canvas.parentElement.clientWidth;
+      const cssHeight = 400;
+      canvas.style.width = cssWidth + "px";
+      canvas.style.height = cssHeight + "px";
+      canvas.width = cssWidth * dpr;
+      canvas.height = cssHeight * dpr;
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+      const ohlc = data.ohlc || [];
+      const labels = data.labels || [];
+      const n = ohlc.length;
+      if (n === 0) return;
+
+      const leftPad = 55, rightPad = 15, topPad = 15, bottomPad = 30;
+      const plotW = cssWidth - leftPad - rightPad;
+      const plotH = cssHeight - topPad - bottomPad;
+
+      // Price range - includes candle highs/lows, the EMA line, and
+      // PDH/PDL if present, so nothing gets drawn outside the visible area.
+      let minP = Math.min(...ohlc.map(c => c.l));
+      let maxP = Math.max(...ohlc.map(c => c.h));
+      (data.ema || []).forEach(v => { if (v !== null && v !== undefined) { minP = Math.min(minP, v); maxP = Math.max(maxP, v); } });
+      if (data.prev_day_high) maxP = Math.max(maxP, data.prev_day_high);
+      if (data.prev_day_low) minP = Math.min(minP, data.prev_day_low);
+      const pad = (maxP - minP) * 0.08 || 1;
+      minP -= pad;
+      maxP += pad;
+
+      const xForIndex = (i) => leftPad + (plotW * (i + 0.5)) / n;
+      const yForPrice = (p) => topPad + plotH * (1 - (p - minP) / (maxP - minP));
+      const candleW = Math.max(2, Math.min(14, (plotW / n) * 0.6));
+
+      // Y-axis gridlines + labels
+      ctx.strokeStyle = "#1e222d";
+      ctx.fillStyle = "#6b7280";
+      ctx.font = "11px Arial";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      const gridLines = 6;
+      for (let g = 0; g <= gridLines; g++) {
+        const price = minP + ((maxP - minP) * g) / gridLines;
+        const y = yForPrice(price);
+        ctx.beginPath();
+        ctx.moveTo(leftPad, y);
+        ctx.lineTo(cssWidth - rightPad, y);
+        ctx.stroke();
+        ctx.fillText(price.toFixed(2), leftPad - 8, y);
+      }
+
+      // PDH / PDL reference lines
+      function drawRefLine(price, color, label) {
+        if (price === null || price === undefined) return;
+        const y = yForPrice(price);
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(leftPad, y);
+        ctx.lineTo(cssWidth - rightPad, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = color;
+        ctx.textAlign = "left";
+        ctx.font = "10px Arial";
+        ctx.fillText(`${label} ${price.toFixed(2)}`, leftPad + 4, y - 6);
+        ctx.restore();
+      }
+      drawRefLine(data.prev_day_high, "#ffb800", "PDH");
+      drawRefLine(data.prev_day_low, "#c792ea", "PDL");
+
+      // Candles - inside bars override to dark blue regardless of
+      // bullish/bearish, since that's the pattern being highlighted.
+      for (let i = 0; i < n; i++) {
+        const c = ohlc[i];
+        const x = xForIndex(i);
+        const isInside = data.is_inside_bar && data.is_inside_bar[i];
+        const bullish = c.c >= c.o;
+        const color = isInside ? "#0d47a1" : (bullish ? "#00c896" : "#ff5370");
+
+        // Wick
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, yForPrice(c.h));
+        ctx.lineTo(x, yForPrice(c.l));
+        ctx.stroke();
+
+        // Body
+        const bodyTop = yForPrice(Math.max(c.o, c.c));
+        const bodyBottom = yForPrice(Math.min(c.o, c.c));
+        const bodyH = Math.max(1, bodyBottom - bodyTop);
+        ctx.fillStyle = color;
+        ctx.fillRect(x - candleW / 2, bodyTop, candleW, bodyH);
+      }
+
+      // EMA overlay line
+      const ema = data.ema || [];
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < ema.length; i++) {
+        if (ema[i] === null || ema[i] === undefined) continue;
+        const x = xForIndex(i);
+        const y = yForPrice(ema[i]);
+        if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+      }
+      ctx.stroke();
+
+      // X-axis time labels (sparse, to avoid overlap)
+      ctx.fillStyle = "#6b7280";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      ctx.font = "10px Arial";
+      const maxLabels = Math.floor(plotW / 60) || 1;
+      const step = Math.max(1, Math.ceil(n / maxLabels));
+      for (let i = 0; i < n; i += step) {
+        ctx.fillText(labels[i] || "", xForIndex(i), cssHeight - bottomPad + 8);
+      }
+
+      // Legend
+      ctx.textAlign = "left";
+      ctx.font = "11px Arial";
+      let legendX = leftPad;
+      const legendY = 8;
+      const legendItems = [
+        { color: "#00c896", label: "Bullish" },
+        { color: "#ff5370", label: "Bearish" },
+        { color: "#0d47a1", label: "Inside bar" },
+        { color: "#ffffff", label: data.ema_label || "EMA5" },
+      ];
+      legendItems.forEach(item => {
+        ctx.fillStyle = item.color;
+        ctx.fillRect(legendX, legendY, 10, 10);
+        ctx.fillStyle = "#e6e9f0";
+        ctx.fillText(item.label, legendX + 14, legendY + 1);
+        legendX += ctx.measureText(item.label).width + 34;
+      });
+    }
+
+    window.addEventListener("resize", () => {
+      const canvas = document.getElementById("chartModalCanvas");
+      if (lastChartData && canvas.style.display !== "none") {
+        drawCandlestickChart(canvas, lastChartData);
+      }
+    });
   </script>
 </body>
 </html>
