@@ -205,6 +205,17 @@
     </span>
   </div>
 
+  <div class="settings-box">
+    <label class="switch">
+      <input type="checkbox" id="thetaSwitchToggle" {% if theta_switch_enabled %}checked{% endif %} onchange="toggleThetaSwitch()">
+      <span class="slider"></span>
+    </label>
+    <span>Auto-roll to next month expiry (theta protection)</span>
+    <span class="token-status" id="thetaSwitchStatus">
+      {% if theta_switch_enabled %}ON - once the nearest monthly expiry crosses into the back half of its trading-day cycle, new trades open in the NEXT monthly expiry instead{% else %}OFF - always uses the nearest monthly expiry, regardless of how close it is{% endif %}
+    </span>
+  </div>
+
   <script>
     async function saveToken() {
       const token = document.getElementById("tokenInput").value.trim();
@@ -348,6 +359,27 @@
           : "OFF - every alert can open a trade, regardless of its sector's performance";
       } catch (err) {
         statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function toggleThetaSwitch() {
+      const checkbox = document.getElementById("thetaSwitchToggle");
+      const statusEl = document.getElementById("thetaSwitchStatus");
+      const enabled = checkbox.checked;
+      try {
+        const res = await fetch("/api/paper-trading/theta-switch-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await res.json();
+        statusEl.textContent = result.theta_switch_enabled
+          ? "ON - once the nearest monthly expiry crosses into the back half of its trading-day cycle, new trades open in the NEXT monthly expiry instead"
+          : "OFF - always uses the nearest monthly expiry, regardless of how close it is";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        checkbox.checked = !enabled;
         console.error(err);
       }
     }
