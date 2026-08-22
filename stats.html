@@ -58,6 +58,32 @@
       text-align: center;
       padding: 60px 0;
     }
+    table.breakdown {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+    table.breakdown th, table.breakdown td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    table.breakdown th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    table.breakdown tr.best-row { background: #00c89614; }
+    .pnl-pos { color: var(--green); }
+    .pnl-neg { color: var(--red); }
+    .breakdown-note {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 10px;
+    }
+    .table-scroll { overflow-x: auto; }
   </style>
 </head>
 <body>
@@ -86,6 +112,25 @@
     <div class="sub">Real fill prices, starting at Rs 0 - independent of the paper account</div>
     <div class="chart-wrap"><canvas id="liveChart"></canvas></div>
     <div class="empty-state" id="liveEmpty" style="display:none;">No closed live trades yet.</div>
+  </div>
+
+  <div class="chart-box">
+    <h3>Performance by Alert Name</h3>
+    <div class="sub">Closed paper trades only, ranked by total P&amp;L - best performer highlighted</div>
+    <div class="table-scroll"><table class="breakdown" id="alertTable"></table></div>
+    <div class="breakdown-note" id="alertNote"></div>
+  </div>
+
+  <div class="chart-box">
+    <h3>Performance by Exit Strategy</h3>
+    <div class="sub">Closed paper trades only, ranked by total P&amp;L - best performer highlighted</div>
+    <div class="table-scroll"><table class="breakdown" id="strategyTable"></table></div>
+  </div>
+
+  <div class="chart-box">
+    <h3>Best Alert + Exit Strategy combinations</h3>
+    <div class="sub">Top 10 pairs by total P&amp;L</div>
+    <div class="table-scroll"><table class="breakdown" id="pairTable"></table></div>
   </div>
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.5.1/chart.umd.min.js"></script>
@@ -194,7 +239,65 @@
       }
     }
 
+    function escapeHtml(s) {
+      return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+      }[c]));
+    }
+
+    function pnlClass(v) {
+      if (v > 0) return "pnl-pos";
+      if (v < 0) return "pnl-neg";
+      return "";
+    }
+
+    function renderBreakdownTable(tableId, rows, extraCol) {
+      const table = document.getElementById(tableId);
+      if (!rows || rows.length === 0) {
+        table.innerHTML = `<tr><td class="sub">No closed trades yet in this category.</td></tr>`;
+        return;
+      }
+      const extraHeader = extraCol ? `<th>${extraCol}</th>` : "";
+      let html = `
+        <tr>
+          <th>Name</th><th>Trades</th><th>Win Rate</th><th>Total P&amp;L (Rs)</th>
+          <th>Avg P&amp;L (Rs)</th><th>Profit Factor</th>${extraHeader}
+        </tr>
+      `;
+      rows.forEach((r, i) => {
+        html += `
+          <tr class="${i === 0 ? "best-row" : ""}">
+            <td>${escapeHtml(r.name)}${i === 0 ? " 🏆" : ""}</td>
+            <td>${r.total_trades}</td>
+            <td>${r.win_rate}%</td>
+            <td class="${pnlClass(r.total_pnl)}">${r.total_pnl}</td>
+            <td class="${pnlClass(r.avg_pnl)}">${r.avg_pnl}</td>
+            <td>${r.profit_factor === null ? "-" : r.profit_factor}</td>
+            ${extraCol ? `<td class="${pnlClass(r.max_loss)}">${r.max_loss}</td>` : ""}
+          </tr>
+        `;
+      });
+      table.innerHTML = html;
+    }
+
+    async function loadBreakdown() {
+      try {
+        const res = await fetch("/api/stats/breakdown");
+        const data = await res.json();
+
+        renderBreakdownTable("alertTable", data.by_alert);
+        document.getElementById("alertNote").textContent = data.alert_tracking_note || "";
+
+        renderBreakdownTable("strategyTable", data.by_strategy, "Max Loss (Rs)");
+        renderBreakdownTable("pairTable", data.by_pair);
+      } catch (err) {
+        console.error("Failed to load breakdown", err);
+        document.getElementById("alertTable").innerHTML = `<tr><td class="sub">Failed to load - see console.</td></tr>`;
+      }
+    }
+
     loadStats();
+    loadBreakdown();
   </script>
 </body>
 </html>

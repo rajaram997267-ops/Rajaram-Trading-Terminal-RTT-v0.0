@@ -438,7 +438,9 @@ def init_db():
                 live_exit_time TEXT,
                 live_sl_order_id TEXT,
                 live_sl_trigger_price DOUBLE PRECISION,
-                atr_trail_peak_price DOUBLE PRECISION
+                atr_trail_peak_price DOUBLE PRECISION,
+                alert_name TEXT,
+                scan_name TEXT
             )
             """
         )
@@ -480,6 +482,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_sl_order_id TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_sl_trigger_price DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS atr_trail_peak_price DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS alert_name TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS scan_name TEXT",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -748,10 +752,10 @@ def create_paper_trades_for_batch(data: dict) -> None:
     if symbol is None:
         return
 
-    open_trade_for_symbol(symbol, category, price_val)
+    open_trade_for_symbol(symbol, category, price_val, alert_name=data.get("alert_name", ""), scan_name=data.get("scan_name", ""))
 
 
-def open_trade_for_symbol(symbol: str, category: str, price_val: float) -> None:
+def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_name: str = "", scan_name: str = "") -> None:
     """Opens exactly one paper trade (and, if live trading is on, a
     matching live order) for a single already-resolved symbol/category/
     price. This is the shared core used by both the normal webhook
@@ -817,12 +821,12 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float) -> None:
             INSERT INTO paper_trades
                 (symbol, direction, entry_price, entry_time, status, quantity,
                  paper_instrument_key, paper_option_label, last_error,
-                 strategy, original_quantity)
-            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?)
+                 strategy, original_quantity, alert_name, scan_name)
+            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (symbol, category, entry_price, now, quantity, paper_instrument_key, paper_option_label,
-             fallback_note, entry_strategy, quantity),
+             fallback_note, entry_strategy, quantity, alert_name or None, scan_name or None),
         ).fetchone()
         conn.commit()
 
@@ -2993,7 +2997,11 @@ def api_manual_enter_alert(alert_id):
     if not symbol or price_val <= 0:
         return jsonify({"status": "error", "message": "This alert doesn't have a usable symbol/price"}), 400
 
-    open_trade_for_symbol(symbol, category, price_val)
+    open_trade_for_symbol(
+        symbol, category, price_val,
+        alert_name=alert_dict.get("alert_name", ""),
+        scan_name=alert_dict.get("scan_name", ""),
+    )
     return jsonify({"status": "ok", "symbol": symbol, "category": category})
 
 
@@ -3367,6 +3375,86 @@ def api_stats_pnl_curve():
         live_points.append({"time": r["live_exit_time"], "pnl": round(running_live, 2)})
 
     return jsonify({"paper": paper_points, "live": live_points})
+
+
+def _summarize_group(rows: list[dict], group_key: str) -> list[dict]:
+    """Groups a list of closed-trade rows (each with at least 'pnl') by
+    group_key, computing the standard set of performance metrics used by
+    both the Alert Name and Exit Strategy breakdowns: total trades, win
+    rate, total P&L, average P&L per trade, profit factor (gross wins /
+    gross losses - undefined/None if there are no losses to divide by),
+    and max single-trade loss (used as the drawdown proxy for the exit
+    strategy table - a true equity-curve drawdown would need each
+    strategy's own running balance, which isn't a meaningful concept for
+    a shared single-position account split across groups)."""
+    groups: dict[str, list[float]] = {}
+    for r in rows:
+        key = r.get(group_key) or "(not recorded)"
+        groups.setdefault(key, []).append(r["pnl"] or 0)
+
+    summary = []
+    for key, pnls in groups.items():
+        total = sum(pnls)
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+        gross_win = sum(wins)
+        gross_loss = abs(sum(losses))
+        summary.append({
+            "name": key,
+            "total_trades": len(pnls),
+            "win_rate": round((len(wins) / len(pnls)) * 100, 1) if pnls else 0,
+            "total_pnl": round(total, 2),
+            "avg_pnl": round(total / len(pnls), 2) if pnls else 0,
+            "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
+            "max_loss": round(min(pnls), 2) if pnls else 0,
+        })
+    summary.sort(key=lambda s: s["total_pnl"], reverse=True)
+    return summary
+
+
+@app.route("/api/stats/breakdown")
+def api_stats_breakdown():
+    """Performance breakdown by Alert Name and by Exit Strategy, plus the
+    single best-performing (Alert, Exit Strategy) pair - all computed
+    from closed paper trades only (open trades have no final P&L yet).
+
+    Exit Strategy is answerable from day one - the 'strategy' column has
+    been recorded on every trade since early in this build. Alert Name
+    is only as complete as how far back alert_name/scan_name have been
+    recorded on paper_trades (added later) - trades from before that
+    will show up as '(not recorded)' rather than being silently dropped,
+    so the gap is visible instead of hidden."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT alert_name, scan_name, strategy, pnl FROM paper_trades "
+            "WHERE status = 'CLOSED' AND pnl IS NOT NULL"
+        ).fetchall()
+    rows = [dict(r) for r in rows]
+
+    by_alert = _summarize_group(rows, "alert_name")
+    by_strategy = _summarize_group(rows, "strategy")
+
+    # Combined (alert, strategy) pair breakdown.
+    pair_rows = []
+    for r in rows:
+        pair_rows.append({
+            "alert_name": f'{r.get("alert_name") or "(not recorded)"} + {r.get("strategy") or "(not recorded)"}',
+            "pnl": r["pnl"],
+        })
+    by_pair = _summarize_group(pair_rows, "alert_name")
+
+    return jsonify({
+        "by_alert": by_alert,
+        "by_strategy": by_strategy,
+        "by_pair": by_pair[:10],  # top 10 combos only - the full cross-product isn't useful to scan
+        "total_closed_trades": len(rows),
+        "alert_tracking_note": (
+            "alert_name/scan_name were only recently added to paper_trades - "
+            "trades opened before that will show as '(not recorded)' rather "
+            "than being excluded, so you can see how much of your history "
+            "predates this tracking."
+        ),
+    })
 
 
 @app.route("/settings")
