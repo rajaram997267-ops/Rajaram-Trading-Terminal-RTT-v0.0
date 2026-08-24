@@ -440,7 +440,9 @@ def init_db():
                 live_sl_trigger_price DOUBLE PRECISION,
                 atr_trail_peak_price DOUBLE PRECISION,
                 alert_name TEXT,
-                scan_name TEXT
+                scan_name TEXT,
+                live_gtt_order_id TEXT,
+                live_gtt_trailing_gap DOUBLE PRECISION
             )
             """
         )
@@ -484,6 +486,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS atr_trail_peak_price DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS alert_name TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS scan_name TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_gtt_order_id TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_gtt_trailing_gap DOUBLE PRECISION",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -549,6 +553,39 @@ def get_sector_filter_top_n() -> int:
         return int(get_setting("sector_filter_top_n", "5"))
     except (TypeError, ValueError):
         return 5
+
+
+def get_live_entry_mode() -> str:
+    """'SL' (default) - direct BUY entry, then a separate SL (Stop-Loss
+    Limit) order for protection, already confirmed exchange-compliant
+    for options.
+    'GTT' - the entry itself AND a trailing stop-loss are combined into
+    one GTT order, letting Upstox's own engine trail the stop server-
+    side instead of this app's polling loop. Structurally different
+    from SL mode (GTT requires the ENTRY leg to BE the actual order
+    placement, so the two modes are mutually exclusive per trade) -
+    defaults to SL since it's the longer-proven path in this app."""
+    return get_setting("live_entry_mode", "SL")
+
+
+def get_gtt_trailing_gap_mode() -> str:
+    """'percent' (default) or 'points'. The GTT API itself only accepts
+    an absolute trailing_gap in price points - 'percent' mode computes
+    that absolute value fresh off the actual entry fill price before
+    each GTT placement, so the effective gap scales with the option's
+    own premium instead of being a flat rupee amount that means very
+    different things on a Rs 5 option vs a Rs 200 one."""
+    return get_setting("gtt_trailing_gap_mode", "percent")
+
+
+def get_gtt_trailing_gap_value() -> float:
+    """The trailing gap itself - interpreted as points or percent
+    depending on get_gtt_trailing_gap_mode(). Defaults to 2 (i.e. 2% by
+    default, matching this app's usual -2% risk sizing elsewhere)."""
+    try:
+        return max(0.01, float(get_setting("gtt_trailing_gap_value", "2")))
+    except (TypeError, ValueError):
+        return 2.0
 
 
 def get_entry_time_filter() -> str | None:
@@ -871,66 +908,170 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                             )
                         else:
                             live_quantity = lots * lot_size
-                            result = place_live_order(option["instrument_key"], "BUY", live_quantity, access_token)
-                            if result["ok"]:
-                                # Fetch the REAL fill price - this is what
-                                # live P&L must be based on, not the
-                                # theoretical premium we used to size the
-                                # order (see get_order_average_price).
-                                live_entry_price = get_order_average_price(result["order_id"], access_token)
+                            label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
 
-                                # Immediately place a broker-side SL-M stop
-                                # at -2% from the real fill price. This is
-                                # what actually protects the position if
-                                # this app, the server, or the network goes
-                                # down - Upstox's own engine fires it, not
-                                # our polling loop. Best-effort: a failure
-                                # here doesn't fail the trade (the position
-                                # is already live and open), it's just
-                                # recorded so it's visible that this
-                                # position is running without a broker-side
-                                # net and needs the app's own monitoring.
-                                live_sl_order_id = None
-                                live_sl_trigger_price = None
-                                sl_note = None
-                                if live_entry_price:
-                                    live_sl_trigger_price = round(live_entry_price * 0.98, 1)
-                                    sl_result = place_live_order(
-                                        option["instrument_key"], "SELL", live_quantity, access_token,
-                                        order_type="SL-M", trigger_price=live_sl_trigger_price,
-                                    )
-                                    if sl_result["ok"]:
-                                        live_sl_order_id = sl_result["order_id"]
-                                    else:
-                                        sl_note = f"Entry filled but broker SL-M stop failed to place: {sl_result['error']}"
+                            if get_live_entry_mode() == "GTT":
+                                # GTT mode: entry AND trailing stop-loss are
+                                # ONE combined order - Upstox's engine
+                                # places the entry when the ENTRY leg fires
+                                # (IMMEDIATE = right away) and then trails
+                                # the STOPLOSS leg itself via trailing_gap,
+                                # entirely server-side. See
+                                # get_live_entry_mode()'s docstring for why
+                                # this can't just be "attach a stop to an
+                                # existing position" - the entry itself has
+                                # to be part of the same GTT.
+                                gap_mode = get_gtt_trailing_gap_mode()
+                                gap_value = get_gtt_trailing_gap_value()
+                                trailing_gap = round(premium * (gap_value / 100), 2) if gap_mode == "percent" else gap_value
+                                stop_trigger = round(premium * 0.98, 2)
+
+                                gtt_result = place_gtt_order(
+                                    option["instrument_key"], "BUY", live_quantity, "D",
+                                    rules=[
+                                        {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": premium},
+                                        {
+                                            "strategy": "STOPLOSS", "trigger_type": "IMMEDIATE",
+                                            "trigger_price": stop_trigger, "trailing_gap": trailing_gap,
+                                        },
+                                    ],
+                                    access_token=access_token,
+                                )
+
+                                if not gtt_result["ok"]:
+                                    with get_db() as conn:
+                                        conn.execute(
+                                            """
+                                            UPDATE paper_trades
+                                            SET live_status = 'FAILED', live_error = ?, live_quantity = ?,
+                                                live_option_label = ?
+                                            WHERE id = ?
+                                            """,
+                                            (f"GTT entry+stop placement failed: {gtt_result['error']}", live_quantity, label, trade_id),
+                                        )
+                                        conn.commit()
                                 else:
-                                    sl_note = "Entry filled but no fill price yet - broker SL-M stop skipped, app-side monitoring only"
+                                    # The GTT's ENTRY leg fires asynchronously
+                                    # even with IMMEDIATE trigger - there's
+                                    # no synchronous fill confirmation the way
+                                    # a direct order gives one. Best-effort
+                                    # attempt to read a fill price back from
+                                    # the GTT's own details; if the response
+                                    # shape doesn't expose one cleanly (this
+                                    # hasn't been verified against a real
+                                    # filled GTT leg yet), fall back to the
+                                    # reference premium and flag it clearly
+                                    # rather than silently guess at a wrong
+                                    # field name.
+                                    gtt_details = get_gtt_order_details(gtt_result["gtt_order_id"], access_token)
+                                    live_entry_price = premium
+                                    gtt_note = (
+                                        "GTT entry+trailing-stop placed - fill price not yet independently "
+                                        "confirmed from GTT order details (using reference premium until verified); "
+                                        "check this trade's actual fill in your Upstox order book."
+                                    )
+                                    try:
+                                        if gtt_details:
+                                            for leg in gtt_details.get("rules", []):
+                                                if leg.get("strategy") == "ENTRY" and leg.get("average_price"):
+                                                    live_entry_price = leg["average_price"]
+                                                    gtt_note = None
+                                    except Exception:
+                                        pass
 
-                                with get_db() as conn:
-                                    conn.execute(
-                                        """
-                                        UPDATE paper_trades
-                                        SET live_status = 'OPEN', live_entry_order_id = ?, live_quantity = ?,
-                                            live_instrument_key = ?, live_option_label = ?, live_entry_price = ?,
-                                            live_sl_order_id = ?, live_sl_trigger_price = ?, live_error = ?
-                                        WHERE id = ?
-                                        """,
-                                        (result["order_id"], live_quantity, option["instrument_key"], label,
-                                         live_entry_price, live_sl_order_id, live_sl_trigger_price, sl_note, trade_id),
-                                    )
-                                    conn.commit()
+                                    with get_db() as conn:
+                                        conn.execute(
+                                            """
+                                            UPDATE paper_trades
+                                            SET live_status = 'OPEN', live_quantity = ?,
+                                                live_instrument_key = ?, live_option_label = ?, live_entry_price = ?,
+                                                live_gtt_order_id = ?, live_gtt_trailing_gap = ?, live_error = ?
+                                            WHERE id = ?
+                                            """,
+                                            (live_quantity, option["instrument_key"], label, live_entry_price,
+                                             gtt_result["gtt_order_id"], trailing_gap, gtt_note, trade_id),
+                                        )
+                                        conn.commit()
+
                             else:
-                                with get_db() as conn:
-                                    conn.execute(
-                                        """
-                                        UPDATE paper_trades
-                                        SET live_status = 'FAILED', live_error = ?, live_quantity = ?,
-                                            live_option_label = ?
-                                        WHERE id = ?
-                                        """,
-                                        (result["error"], live_quantity, label, trade_id),
-                                    )
-                                    conn.commit()
+                                result = place_live_order(option["instrument_key"], "BUY", live_quantity, access_token)
+                                if result["ok"]:
+                                    # Fetch the REAL fill price - this is what
+                                    # live P&L must be based on, not the
+                                    # theoretical premium we used to size the
+                                    # order (see get_order_average_price).
+                                    live_entry_price = get_order_average_price(result["order_id"], access_token)
+
+                                    # Immediately place a broker-side SL (Stop-
+                                    # Loss LIMIT) stop at -2% from the real fill
+                                    # price. This is what actually protects the
+                                    # position if this app, the server, or the
+                                    # network goes down - Upstox's own engine
+                                    # fires it, not our polling loop.
+                                    #
+                                    # Deliberately 'SL', not 'SL-M': NSE
+                                    # rejects Stop-Loss MARKET orders on index
+                                    # and stock options outright (has since
+                                    # Sept 2021, NSE circular NSE/FAOP/49677) -
+                                    # every SL-M attempt on an option contract
+                                    # fails at the exchange, every time. SL
+                                    # needs both a trigger price and a limit
+                                    # price; the limit sits a further 2% out so
+                                    # the order still fills like a market order
+                                    # under normal conditions, while capping
+                                    # the worst case if price truly gaps past
+                                    # it (SL-M's whole appeal - fire at any
+                                    # price - is also exactly the freak-trade
+                                    # risk the exchange banned it over).
+                                    #
+                                    # Best-effort: a failure here doesn't fail
+                                    # the trade (the position is already live
+                                    # and open), it's just recorded so it's
+                                    # visible that this position is running
+                                    # without a broker-side net and needs the
+                                    # app's own monitoring.
+                                    live_sl_order_id = None
+                                    live_sl_trigger_price = None
+                                    sl_note = None
+                                    if live_entry_price:
+                                        live_sl_trigger_price = round(live_entry_price * 0.98, 1)
+                                        live_sl_limit_price = round(live_entry_price * 0.96, 1)
+                                        sl_result = place_live_order(
+                                            option["instrument_key"], "SELL", live_quantity, access_token,
+                                            order_type="SL", trigger_price=live_sl_trigger_price, price=live_sl_limit_price,
+                                        )
+                                        if sl_result["ok"]:
+                                            live_sl_order_id = sl_result["order_id"]
+                                        else:
+                                            sl_note = f"Entry filled but broker SL stop failed to place: {sl_result['error']}"
+                                    else:
+                                        sl_note = "Entry filled but no fill price yet - broker SL stop skipped, app-side monitoring only"
+
+                                    with get_db() as conn:
+                                        conn.execute(
+                                            """
+                                            UPDATE paper_trades
+                                            SET live_status = 'OPEN', live_entry_order_id = ?, live_quantity = ?,
+                                                live_instrument_key = ?, live_option_label = ?, live_entry_price = ?,
+                                                live_sl_order_id = ?, live_sl_trigger_price = ?, live_error = ?
+                                            WHERE id = ?
+                                            """,
+                                            (result["order_id"], live_quantity, option["instrument_key"], label,
+                                             live_entry_price, live_sl_order_id, live_sl_trigger_price, sl_note, trade_id),
+                                        )
+                                        conn.commit()
+                                else:
+                                    with get_db() as conn:
+                                        conn.execute(
+                                            """
+                                            UPDATE paper_trades
+                                            SET live_status = 'FAILED', live_error = ?, live_quantity = ?,
+                                                live_option_label = ?
+                                            WHERE id = ?
+                                            """,
+                                            (result["error"], live_quantity, label, trade_id),
+                                        )
+                                        conn.commit()
 
 
 def calculate_ema(values: list[float], period: int = 5) -> list[float | None]:
@@ -2027,15 +2168,25 @@ def place_live_order(
     access_token: str,
     order_type: str = "MARKET",
     trigger_price: float = 0.0,
+    price: float = 0.0,
 ) -> dict:
     """Places a real order on Upstox: CNC (Delivery) product, DAY validity -
     matching the decisions for this app (live trading only ever goes long,
     so transaction_type is effectively always 'BUY' to open and 'SELL' to
     close the same delivery position). order_type defaults to 'MARKET' (the
-    original behavior); pass order_type='SL-M' with a trigger_price to
-    place a stop-loss-market order instead - used to protect a fresh
-    position with a broker-side stop that fires even if this app/server is
-    down, rather than relying only on our own polling.
+    original behavior).
+
+    For the protective stop, pass order_type='SL' (Stop-Loss LIMIT) with
+    both trigger_price and price - NOT 'SL-M'. NSE discontinued Stop-Loss
+    MARKET orders for index and stock options back in Sept 2021 (NSE
+    circular NSE/FAOP/49677) - any SL-M order on an option contract gets
+    rejected outright by the exchange, every time, with no partial
+    protection at all. 'SL' still fires from the exchange/broker side even
+    if this app/server is down (the whole point), it just needs a limit
+    price alongside the trigger - conventionally set a bit further out
+    than the trigger so the order still behaves like a market fill under
+    normal conditions, while capping the worst case if price truly gaps
+    past it.
 
     Never raises - a live-order failure must not be able to crash paper
     trade creation or the exit-check loop. Returns:
@@ -2046,7 +2197,7 @@ def place_live_order(
         "quantity": quantity,
         "product": "D",  # CNC / Delivery
         "validity": "DAY",
-        "price": 0,  # ignored by Upstox for MARKET/SL-M orders
+        "price": price,  # ignored by Upstox for MARKET orders; required for SL/LIMIT
         "tag": "chartink-auto",
         "instrument_token": instrument_key,
         "order_type": order_type,
@@ -2130,7 +2281,7 @@ def get_order_status(order_id: str, access_token: str) -> dict | None:
     """Fetches an order's current status/fields from Upstox (status,
     average_price, filled_quantity, trigger_price, etc.) without the
     retry-and-wait behavior of get_order_average_price - used to poll
-    whether a resting SL-M stop order has fired on its own. Returns None
+    whether a resting SL stop order has fired on its own. Returns None
     (never raises) on any failure."""
     url = "https://api.upstox.com/v2/order/details?order_id=" + urllib.parse.quote(order_id)
     req = urllib.request.Request(
@@ -2152,19 +2303,127 @@ def get_order_status(order_id: str, access_token: str) -> dict | None:
 
 
 def cancel_order(order_id: str, access_token: str) -> bool:
-    """Cancels a resting order on Upstox (used to pull the protective SL-M
+    """Cancels a resting order on Upstox (used to pull the protective SL
     stop the moment software decides to exit the position some other way -
     a trailing stop firing, a target hit, etc. - so the two exit paths can
     never both fill and double-sell the position). Returns True on a
     successful cancel request; never raises. Treats 'already
     filled/cancelled' errors as a non-fatal no-op, since that's exactly
-    what happens when the SL-M itself already fired first."""
+    what happens when the SL itself already fired first."""
     url = "https://api.upstox.com/v2/order/cancel?order_id=" + urllib.parse.quote(order_id)
     req = urllib.request.Request(
         url,
         method="DELETE",
         headers={
             "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        opener = _get_order_proxy_opener()
+        opener_fn = opener.open if opener else urllib.request.urlopen
+        with opener_fn(req, timeout=10) as resp:
+            resp.read()
+        return True
+    except Exception:
+        return False
+
+
+def place_gtt_order(
+    instrument_key: str,
+    transaction_type: str,
+    quantity: int,
+    product: str,
+    rules: list[dict],
+    access_token: str,
+) -> dict:
+    """Places a GTT (Good Till Triggered) order via the v3 endpoint - used
+    for the GTT live-entry mode, where the position's own entry AND its
+    trailing stop-loss are one combined order instead of two separate
+    ones. rules is a list of 2-3 dicts, each with 'strategy'
+    (ENTRY/TARGET/STOPLOSS), 'trigger_type', 'trigger_price', and
+    optionally 'trailing_gap' (STOPLOSS leg only). Exactly one ENTRY rule
+    is required by the API even when protecting an existing intent to
+    enter immediately - TARGET/STOPLOSS legs only activate once ENTRY
+    itself has been triggered and filled.
+
+    Never raises. Returns {"ok": True, "gtt_order_id": "..."} on success,
+    {"ok": False, "error": "..."} on failure."""
+    body = {
+        "type": "MULTIPLE" if len(rules) > 1 else "SINGLE",
+        "quantity": quantity,
+        "product": product,
+        "instrument_token": instrument_key,
+        "transaction_type": transaction_type,
+        "rules": rules,
+    }
+    req = urllib.request.Request(
+        "https://api.upstox.com/v3/order/gtt/place",
+        data=json.dumps(body).encode(),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        opener = _get_order_proxy_opener()
+        opener_fn = opener.open if opener else urllib.request.urlopen
+        with opener_fn(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+        gtt_ids = (payload.get("data") or {}).get("gtt_order_ids") or []
+        if gtt_ids:
+            return {"ok": True, "gtt_order_id": gtt_ids[0]}
+        return {"ok": False, "error": f"No gtt_order_id in response: {payload}"}
+    except urllib.error.HTTPError as e:
+        try:
+            body_text = e.read().decode()
+        except Exception:
+            body_text = ""
+        return {"ok": False, "error": f"HTTP {e.code}: {body_text}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def get_gtt_order_details(gtt_order_id: str, access_token: str) -> dict | None:
+    """Fetches a GTT order's current status and legs (v3). Used to detect
+    whether the STOPLOSS or TARGET leg has fired on its own since the
+    last check, so the app can reconcile status instead of treating the
+    position as still open. Returns None on any failure - never raises."""
+    url = "https://api.upstox.com/v3/order/gtt?gtt_order_id=" + urllib.parse.quote(gtt_order_id)
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        opener = _get_order_proxy_opener()
+        opener_fn = opener.open if opener else urllib.request.urlopen
+        with opener_fn(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+        return payload.get("data")
+    except Exception:
+        return None
+
+
+def cancel_gtt_order(gtt_order_id: str, access_token: str) -> bool:
+    """Cancels a resting GTT order before a software-driven exit (EMA
+    reversal, +2% handoff to %-trailing, etc.), so the GTT's own
+    STOPLOSS/TARGET legs can never also fire and double-sell the
+    position. Returns True on success; never raises."""
+    req = urllib.request.Request(
+        "https://api.upstox.com/v3/order/gtt/cancel",
+        data=json.dumps({"gtt_order_id": gtt_order_id}).encode(),
+        method="DELETE",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": BROWSER_USER_AGENT,
         },
@@ -2199,15 +2458,22 @@ def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[
     if not instrument_key:
         return None, "No live_instrument_key recorded on this trade - could not close live position", None
 
-    # Pull the resting broker-side SL-M stop first, if one exists - a
+    # Pull the resting broker-side SL stop first, if one exists - a
     # software-driven exit (trailing stop, target hit, manual close) and
-    # the SL-M firing on its own must never both go through, or the
+    # the SL firing on its own must never both go through, or the
     # position gets double-sold. Best-effort: if the cancel fails because
-    # the SL-M already fired, the subsequent SELL below will simply fail
+    # the SL already fired, the subsequent SELL below will simply fail
     # or oversell-protect at the broker, and get picked up as an error.
     sl_order_id = trade.get("live_sl_order_id")
     if sl_order_id:
         cancel_order(sl_order_id, access_token)
+
+    # Same idea for GTT mode - pull the resting GTT (whose STOPLOSS leg
+    # is what would otherwise fire on its own) before placing our own
+    # software-driven closing order.
+    gtt_order_id = trade.get("live_gtt_order_id")
+    if gtt_order_id:
+        cancel_gtt_order(gtt_order_id, access_token)
 
     qty = trade.get("live_quantity") or 1
     result = place_live_order(instrument_key, "SELL", qty, access_token)
@@ -2331,7 +2597,7 @@ def run_paper_trade_check() -> dict:
             # contract, not paper's. Only does the extra work when they
             # actually differ - the common case reuses last_price with no
             # extra call. Live no longer needs a candle series at all
-            # (its downside is now a broker-side SL-M order, not a
+            # (its downside is now a broker-side SL order, not a
             # software 5-EMA check - see run_paper_trade_check's live
             # section below), so this is just a price lookup.
             live_instrument_key = trade["live_instrument_key"]
@@ -2583,18 +2849,18 @@ def run_paper_trade_check() -> dict:
             # Live trading runs its OWN, independent exit rule from the
             # paper strategy chosen in Settings - full quantity, no half
             # booking. Downside is now protected by a REAL broker-side
-            # SL-M stop order placed at entry (see place_live_order call
+            # SL stop order placed at entry (see place_live_order call
             # above) instead of a software-checked rule, so it fires from
             # Upstox's own engine even if this app/server is down. This
-            # loop's job on the downside is just to notice when that SL-M
+            # loop's job on the downside is just to notice when that SL
             # has already fired and reconcile our own status - never to
             # place a second closing order on top of it. From +2%, the
             # stop trails the whole position in 0.5% steps, closed via a
             # normal software-driven market SELL when it's hit (which also
-            # cancels the now-unneeded SL-M first, see
+            # cancels the now-unneeded SL first, see
             # _close_live_position_if_any).
 
-            # Retry a still-missing fill price / SL-M stop. The initial
+            # Retry a still-missing fill price / SL stop. The initial
             # attempt at entry time only retries for ~4.5 seconds
             # (get_order_average_price) before giving up and falling back
             # to app-side-only monitoring - if Upstox's order-details API
@@ -2602,7 +2868,7 @@ def run_paper_trade_check() -> dict:
             # with NO broker-side stop for its entire lifetime, which is
             # exactly the gap this closes: every pass, if a live position
             # is open but still missing its real fill price, try again.
-            # Once it succeeds, place the SL-M stop retroactively - this
+            # Once it succeeds, place the SL stop retroactively - this
             # runs far more times (minutes, not seconds) than the initial
             # attempt ever could.
             if trade["live_status"] == "OPEN" and trade["live_entry_price"] is None and trade["live_entry_order_id"]:
@@ -2610,15 +2876,16 @@ def run_paper_trade_check() -> dict:
                 if retry_fill:
                     retry_sl_order_id = None
                     retry_sl_trigger_price = round(retry_fill * 0.98, 1)
+                    retry_sl_limit_price = round(retry_fill * 0.96, 1)
                     retry_sl_note = None
                     sl_result = place_live_order(
                         trade["live_instrument_key"], "SELL", trade["live_quantity"] or 1, access_token,
-                        order_type="SL-M", trigger_price=retry_sl_trigger_price,
+                        order_type="SL", trigger_price=retry_sl_trigger_price, price=retry_sl_limit_price,
                     )
                     if sl_result["ok"]:
                         retry_sl_order_id = sl_result["order_id"]
                     else:
-                        retry_sl_note = f"Fill price recovered but broker SL-M stop failed to place: {sl_result['error']}"
+                        retry_sl_note = f"Fill price recovered but broker SL stop failed to place: {sl_result['error']}"
                     with get_db() as conn:
                         conn.execute(
                             """
@@ -2639,15 +2906,38 @@ def run_paper_trade_check() -> dict:
             live_trail_update = None
             live_sl_fired_price = None
 
-            # Check whether the resting SL-M stop already fired on its own
+            # Check whether the resting SL stop already fired on its own
             # since the last pass - if so, the broker closed the position
             # for us; reconcile status instead of treating it as still open.
             if trade["live_status"] == "OPEN" and trade["live_sl_order_id"]:
                 sl_status = get_order_status(trade["live_sl_order_id"], access_token)
                 if sl_status and sl_status.get("status") == "complete":
                     live_exited = True
-                    live_exit_reason_val = "Stoploss (-2%, broker SL-M order)"
+                    live_exit_reason_val = "Stoploss (-2%, broker SL order)"
                     live_sl_fired_price = sl_status.get("average_price")
+
+            # Same check for GTT mode - has the GTT's own STOPLOSS
+            # (trailing) leg fired on its own? Written defensively: the
+            # exact response shape for a fired leg hasn't been verified
+            # against a real triggered GTT order yet, so this tries a
+            # couple of plausible status values and does nothing (leaves
+            # live_exited False, retries next pass) rather than risk a
+            # false positive - wrongly marking a still-open real position
+            # as closed would be a much worse failure than checking again
+            # in 5 seconds.
+            elif trade["live_status"] == "OPEN" and trade["live_gtt_order_id"]:
+                gtt_status = get_gtt_order_details(trade["live_gtt_order_id"], access_token)
+                if gtt_status:
+                    try:
+                        for leg in gtt_status.get("rules", []):
+                            leg_status = str(leg.get("status", "")).lower()
+                            if leg.get("strategy") == "STOPLOSS" and leg_status in ("triggered", "complete", "executed"):
+                                live_exited = True
+                                live_exit_reason_val = "Stoploss (GTT trailing stop)"
+                                live_sl_fired_price = leg.get("average_price") or leg.get("trigger_price")
+                                break
+                    except Exception:
+                        pass
 
             # Must use the REAL fill price (live_entry_price), not the
             # paper trade's theoretical entry_price - a market order can
@@ -2672,7 +2962,7 @@ def run_paper_trade_check() -> dict:
                             live_exit_reason_val = f"Trailing stop ({live_stop_pct:g}%) after +2%"
 
             if live_exited and live_sl_fired_price is not None:
-                # The SL-M already filled at the broker - nothing left to
+                # The SL already filled at the broker - nothing left to
                 # place, just record it. Skip _close_live_position_if_any
                 # entirely (it would try to cancel/sell an already-closed
                 # position).
@@ -3475,6 +3765,9 @@ def settings_page():
         atr_multiplier=get_atr_multiplier(),
         entry_time_filter=get_entry_time_filter() or "",
         theta_switch_enabled=get_theta_switch_enabled(),
+        live_entry_mode=get_live_entry_mode(),
+        gtt_trailing_gap_mode=get_gtt_trailing_gap_mode(),
+        gtt_trailing_gap_value=get_gtt_trailing_gap_value(),
     )
     body = html.encode("utf-8")
     response = make_response(body)
@@ -3731,6 +4024,37 @@ def paper_trading_theta_switch_toggle():
     enabled = bool(data.get("enabled"))
     set_setting("theta_switch_enabled", "true" if enabled else "false")
     return jsonify({"status": "ok", "theta_switch_enabled": enabled})
+
+
+@app.route("/api/paper-trading/live-entry-mode", methods=["POST"])
+def paper_trading_live_entry_mode():
+    """Sets the live entry mode - 'SL' (direct entry + separate SL stop,
+    default) or 'GTT' (entry + trailing stop combined into one GTT
+    order). Takes effect on the next live trade only; doesn't touch
+    anything already open."""
+    data = request.get_json(silent=True) or {}
+    mode = (data.get("mode") or "").upper()
+    if mode not in ("SL", "GTT"):
+        return jsonify({"status": "error", "message": "mode must be 'SL' or 'GTT'"}), 400
+    set_setting("live_entry_mode", mode)
+    return jsonify({"status": "ok", "live_entry_mode": mode})
+
+
+@app.route("/api/paper-trading/gtt-trailing-settings", methods=["POST"])
+def paper_trading_gtt_trailing_settings():
+    """Sets the GTT trailing gap mode ('points' or 'percent') and value.
+    Only used when live_entry_mode is 'GTT'."""
+    data = request.get_json(silent=True) or {}
+    mode = (data.get("gap_mode") or "").lower()
+    if mode not in ("points", "percent"):
+        return jsonify({"status": "error", "message": "gap_mode must be 'points' or 'percent'"}), 400
+    try:
+        value = max(0.01, float(data.get("gap_value")))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "gap_value must be a positive number"}), 400
+    set_setting("gtt_trailing_gap_mode", mode)
+    set_setting("gtt_trailing_gap_value", str(value))
+    return jsonify({"status": "ok", "gap_mode": mode, "gap_value": value})
 
 
 @app.route("/api/paper-trading/category-toggle", methods=["POST"])
