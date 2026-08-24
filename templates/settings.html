@@ -156,7 +156,30 @@
     </label>
     <span>Live trading (real Upstox orders)</span>
     <span class="token-status" id="liveStatus" style="{% if live_trading_enabled %}color: var(--red);{% endif %}">
-      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. A real -2% SL-M stop order is placed with Upstox at entry, so it protects the position even if this app is down{% else %}OFF - paper trading only{% endif %}
+      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. A real -2% SL (Stop-Loss Limit) order is placed with Upstox at entry, so it protects the position even if this app is down{% else %}OFF - paper trading only{% endif %}
+    </span>
+  </div>
+
+  <div class="settings-box">
+    <span>Live entry mode:</span>
+    <select id="liveEntryModeSelect" onchange="saveLiveEntryMode()">
+      <option value="SL" {% if live_entry_mode == "SL" %}selected{% endif %}>SL - direct entry + separate Stop-Loss Limit order (default, battle-tested)</option>
+      <option value="GTT" {% if live_entry_mode == "GTT" %}selected{% endif %}>GTT - entry + broker-side trailing stop combined into one order (newer, verify carefully)</option>
+    </select>
+    <span class="token-status" id="liveEntryModeStatus">
+      {% if live_entry_mode == "GTT" %}GTT mode - Upstox's own engine trails the stop server-side using the gap below. Recommended: verify your first GTT trade's fill and stop behavior directly in your Upstox order book before relying on it.{% else %}SL mode - this app polls and manages the exit itself every 5s, with the broker-side SL order as a downside floor.{% endif %}
+    </span>
+  </div>
+
+  <div class="settings-box">
+    <span>GTT trailing gap (used only in GTT mode):</span>
+    <select id="gttGapModeSelect" onchange="saveGttTrailingSettings()">
+      <option value="percent" {% if gtt_trailing_gap_mode == "percent" %}selected{% endif %}>Percent of entry price</option>
+      <option value="points" {% if gtt_trailing_gap_mode == "points" %}selected{% endif %}>Fixed points</option>
+    </select>
+    <input type="text" id="gttGapValueInput" value="{{ gtt_trailing_gap_value }}" style="max-width: 80px; text-align: center;" onchange="saveGttTrailingSettings()">
+    <span class="token-status" id="gttTrailingStatus">
+      Current: {{ gtt_trailing_gap_value }}{% if gtt_trailing_gap_mode == "percent" %}% of entry price{% else %} points{% endif %}, computed fresh at entry time
     </span>
   </div>
 
@@ -243,7 +266,7 @@
       if (enabled && !confirm(
         "This turns ON live trading. The NEXT Buy alert will place a real " +
         "ATM option order on Upstox (Call for Buy alerts, Put for Sell alerts), sized off your actual available funds, " +
-        "with a -2% SL-M stop order placed right after entry. Continue?"
+        "with a -2% SL (Stop-Loss Limit) order placed right after entry. Continue?"
       )) {
         checkbox.checked = false;
         return;
@@ -256,7 +279,7 @@
         });
         const result = await res.json();
         statusEl.textContent = result.live_trading_enabled
-          ? "ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. A real -2% SL-M stop order is placed with Upstox at entry, so it protects the position even if this app is down"
+          ? "ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. A real -2% SL (Stop-Loss Limit) order is placed with Upstox at entry, so it protects the position even if this app is down"
           : "OFF - paper trading only";
         statusEl.style.color = result.live_trading_enabled ? "var(--red)" : "";
       } catch (err) {
@@ -380,6 +403,64 @@
       } catch (err) {
         statusEl.textContent = "Failed to update - see console";
         checkbox.checked = !enabled;
+        console.error(err);
+      }
+    }
+
+    async function saveLiveEntryMode() {
+      const select = document.getElementById("liveEntryModeSelect");
+      const statusEl = document.getElementById("liveEntryModeStatus");
+      const mode = select.value;
+      if (mode === "GTT" && !confirm(
+        "GTT entry mode combines your entry order and trailing stop into one broker-managed order. " +
+        "This is newer and less battle-tested than SL mode in this app - verify your first trade's " +
+        "fill and stop behavior directly in your Upstox order book. Continue?"
+      )) {
+        select.value = "SL";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/live-entry-mode", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = result.live_entry_mode === "GTT"
+            ? "GTT mode - Upstox's own engine trails the stop server-side using the gap below. Recommended: verify your first GTT trade's fill and stop behavior directly in your Upstox order book before relying on it."
+            : "SL mode - this app polls and manages the exit itself every 5s, with the broker-side SL order as a downside floor.";
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveGttTrailingSettings() {
+      const gapMode = document.getElementById("gttGapModeSelect").value;
+      const gapValue = parseFloat(document.getElementById("gttGapValueInput").value);
+      const statusEl = document.getElementById("gttTrailingStatus");
+      if (!gapValue || gapValue <= 0) {
+        statusEl.textContent = "Enter a valid positive gap value";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/gtt-trailing-settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gap_mode: gapMode, gap_value: gapValue }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = `Current: ${result.gap_value}${result.gap_mode === "percent" ? "% of entry price" : " points"}, computed fresh at entry time`;
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
         console.error(err);
       }
     }
