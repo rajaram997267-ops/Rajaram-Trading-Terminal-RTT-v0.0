@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - WS Speed</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: #131722;
+      --border: #1e222d;
+      --text: #e6e9f0;
+      --muted: #6b7280;
+      --green: #00c896;
+      --gold: #ffb800;
+      --red: #ff5370;
+      --orange: #ff9f43;
+      --yellow: #ffd93d;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+    }
+    a { color: var(--green); text-decoration: none; }
+    h2 { margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 13px; }
+    .tabbar {
+      display: flex;
+      gap: 4px;
+      margin: 20px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .tabbar a {
+      padding: 10px 18px;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+    }
+    .tabbar a.active { color: var(--text); border-bottom-color: var(--green); }
+    .tabbar a:hover { color: var(--text); }
+
+    .hero {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 28px;
+      text-align: center;
+      margin-bottom: 20px;
+    }
+    .hero-status {
+      font-size: 22px;
+      font-weight: 700;
+      margin-bottom: 14px;
+    }
+    .hero-age {
+      font-size: 48px;
+      font-weight: 800;
+      line-height: 1;
+    }
+    .hero-age-label {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .stat-box {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px 16px;
+    }
+    .stat-label {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      margin-bottom: 6px;
+    }
+    .stat-value {
+      font-size: 22px;
+      font-weight: 700;
+    }
+
+    table.detail {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+    }
+    table.detail th, table.detail td {
+      text-align: left;
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    table.detail th {
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      width: 40%;
+    }
+    table.detail tr:last-child th, table.detail tr:last-child td { border-bottom: none; }
+
+    .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+    .dot-green { background: var(--green); }
+    .dot-yellow { background: var(--yellow); }
+    .dot-orange { background: var(--orange); }
+    .dot-red { background: var(--red); }
+    .dot-gray { background: var(--muted); }
+
+    .error-box {
+      background: #2a0f14;
+      border: 1px solid var(--red);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin-bottom: 20px;
+      font-size: 13px;
+      color: var(--red);
+      word-break: break-word;
+    }
+
+    .section-title { font-size: 14px; font-weight: 600; margin: 24px 0 10px; }
+  </style>
+</head>
+<body>
+  <div>
+    <h2>WebSocket Speed <span style="color: var(--muted); font-weight: 400; font-size: 14px;">RTT v0.0</span></h2>
+    <div class="sub">Live feed health - auto-refreshes every 2 seconds, no more manually re-checking the raw debug endpoint</div>
+  </div>
+
+  <div class="tabbar">
+    <a href="/">Dashboard</a>
+    <a href="/paper-trading">Paper Trading</a>
+    <a href="/live-trading">Live Trading</a>
+    <a href="/stats">Stats</a>
+    <a href="/websocket-stats" class="active">WS Speed</a>
+    <a href="/settings">Settings</a>
+  </div>
+
+  <div id="errorBox" class="error-box" style="display:none;"></div>
+
+  <div class="hero">
+    <div class="hero-status" id="heroStatus">Loading...</div>
+    <div class="hero-age" id="heroAge">-</div>
+    <div class="hero-age-label">Last Tick Age</div>
+  </div>
+
+  <div class="grid">
+    <div class="stat-box">
+      <div class="stat-label">Connection Attempts</div>
+      <div class="stat-value" id="statConnectAttempts">-</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Reconnects</div>
+      <div class="stat-value" id="statReconnects">-</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Stale Reconnects</div>
+      <div class="stat-value" id="statStaleReconnects">-</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Subscribed Symbols</div>
+      <div class="stat-value" id="statSubscribed">-</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Cached Prices</div>
+      <div class="stat-value" id="statCached">-</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Total Ticks</div>
+      <div class="stat-value" id="statTotalTicks">-</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Ticks / min</div>
+      <div class="stat-value" id="statTicksPerMin">-</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-label">Connection Uptime</div>
+      <div class="stat-value" id="statUptime">-</div>
+    </div>
+  </div>
+
+  <div class="section-title">Tick Timing</div>
+  <table class="detail" id="tickTimingTable"></table>
+
+  <div class="section-title">Connection Details</div>
+  <table class="detail" id="connectionTable"></table>
+
+  <div class="section-title">Sample Live Prices</div>
+  <table class="detail" id="pricesTable"></table>
+
+  <script>
+    function dotFor(ok) {
+      if (ok === true) return '<span class="dot dot-green"></span>';
+      if (ok === false) return '<span class="dot dot-red"></span>';
+      return '<span class="dot dot-gray"></span>';
+    }
+
+    function qualityMeta(quality) {
+      const map = {
+        EXCELLENT: { color: "var(--green)", dot: "dot-green", label: "🟢 Excellent" },
+        GOOD:      { color: "var(--green)", dot: "dot-green", label: "🟢 Good" },
+        DELAYED:   { color: "var(--yellow)", dot: "dot-yellow", label: "🟡 Delayed" },
+        SLOW:      { color: "var(--orange)", dot: "dot-orange", label: "🟠 Slow" },
+        STALE:     { color: "var(--red)", dot: "dot-red", label: "🔴 Stale" },
+        NO_DATA:   { color: "var(--muted)", dot: "dot-gray", label: "⚪ No data yet" },
+      };
+      return map[quality] || map.NO_DATA;
+    }
+
+    function statusMeta(status) {
+      const map = {
+        streaming: { color: "var(--green)", label: "🟢 Streaming" },
+        connecting: { color: "var(--yellow)", label: "🟡 Connecting" },
+        stale_reconnecting: { color: "var(--orange)", label: "🟠 Reconnecting (stale)" },
+        error: { color: "var(--red)", label: "🔴 Error" },
+        disconnected: { color: "var(--red)", label: "🔴 Disconnected" },
+        not_started: { color: "var(--muted)", label: "⚪ Not started" },
+      };
+      return map[status] || { color: "var(--muted)", label: status || "Unknown" };
+    }
+
+    function fmtDuration(seconds) {
+      if (seconds === null || seconds === undefined) return "-";
+      if (seconds < 60) return `${seconds}s`;
+      const mins = Math.floor(seconds / 60);
+      const secs = seconds % 60;
+      if (mins < 60) return `${mins}m ${secs}s`;
+      const hrs = Math.floor(mins / 60);
+      return `${hrs}h ${mins % 60}m`;
+    }
+
+    function row(label, valueHtml) {
+      return `<tr><th>${label}</th><td>${valueHtml}</td></tr>`;
+    }
+
+    async function refresh() {
+      let data;
+      try {
+        const res = await fetch("/api/paper-trading/websocket-stats");
+        data = await res.json();
+      } catch (err) {
+        document.getElementById("errorBox").style.display = "block";
+        document.getElementById("errorBox").textContent = "Failed to load stats - see console.";
+        console.error(err);
+        return;
+      }
+
+      const errorBox = document.getElementById("errorBox");
+      if (data.error) {
+        errorBox.style.display = "block";
+        errorBox.textContent = data.error;
+      } else {
+        errorBox.style.display = "none";
+      }
+
+      const sMeta = statusMeta(data.status);
+      document.getElementById("heroStatus").innerHTML = sMeta.label;
+      document.getElementById("heroStatus").style.color = sMeta.color;
+
+      const qMeta = qualityMeta(data.feed_quality);
+      const ageEl = document.getElementById("heroAge");
+      ageEl.textContent = data.current_tick_age !== null && data.current_tick_age !== undefined
+        ? `${data.current_tick_age}s`
+        : "-";
+      ageEl.style.color = qMeta.color;
+
+      document.getElementById("statConnectAttempts").textContent = data.connect_attempts ?? "-";
+      document.getElementById("statReconnects").textContent = data.reconnect_count ?? "-";
+      document.getElementById("statStaleReconnects").textContent = data.stale_reconnect_count ?? "-";
+      document.getElementById("statSubscribed").textContent = data.subscribed_count ?? "-";
+      document.getElementById("statCached").textContent = data.cached_price_count ?? "-";
+      document.getElementById("statTotalTicks").textContent = data.total_ticks ?? "-";
+      document.getElementById("statTicksPerMin").textContent = data.ticks_per_min ?? "-";
+      document.getElementById("statUptime").textContent = fmtDuration(data.uptime_seconds);
+
+      document.getElementById("tickTimingTable").innerHTML =
+        row("Current Tick Age", `${dotFor(data.current_tick_age !== null && data.current_tick_age <= 5)}${data.current_tick_age ?? "-"} sec - ${qMeta.label}`) +
+        row("Average Tick Gap", `${data.avg_tick_gap ?? "-"} sec`) +
+        row("Minimum Tick Gap", `${data.min_tick_gap ?? "-"} sec`) +
+        row("Maximum Tick Gap", `${data.max_tick_gap ?? "-"} sec`) +
+        row("Ticks Received / sec", `${data.ticks_per_sec ?? "-"}`) +
+        row("Ticks Received / min", `${data.ticks_per_min ?? "-"}`);
+
+      document.getElementById("connectionTable").innerHTML =
+        row("SDK Available", `${dotFor(data.sdk_available)}${data.sdk_available ? "Yes" : "No"}`) +
+        row("WebSocket Thread", `${dotFor(data.thread_started)}${data.thread_started ? "Running" : "Not running"}`) +
+        row("Connected Since", data.connected_since ? new Date(data.connected_since + "Z").toLocaleTimeString() : "-") +
+        row("Connection Uptime", fmtDuration(data.uptime_seconds)) +
+        row("Last Message At", data.status ? (data.current_tick_age !== null ? `${data.current_tick_age}s ago` : "never") : "-") +
+        row("WebSocket Error", data.error ? `<span style="color:var(--red);">${data.error}</span>` : `${dotFor(true)}None`);
+
+      const pricesTable = document.getElementById("pricesTable");
+      const prices = data.sample_prices || {};
+      const keys = Object.keys(prices);
+      if (keys.length === 0) {
+        pricesTable.innerHTML = row("No live prices cached yet", "-");
+      } else {
+        pricesTable.innerHTML = keys.map(k => {
+          const p = prices[k];
+          const stale = p.age_seconds > 5;
+          return row(k, `${dotFor(!stale)}₹${p.ltp} <span class="sub">(${p.age_seconds}s old)</span>`);
+        }).join("");
+      }
+    }
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
