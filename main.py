@@ -7,6 +7,7 @@ import json
 import math
 import os
 import threading
+from collections import deque
 import time
 import urllib.error
 import urllib.parse
@@ -1962,7 +1963,19 @@ _ws_lock = threading.Lock()
 _ws_streamer = None
 _ws_subscribed_keys: set[str] = set()
 _ws_thread_started = False
-_ws_debug: dict = {"status": "not_started", "error": None, "last_message_at": None, "sdk_available": None, "connect_attempts": 0}
+_ws_debug: dict = {
+    "status": "not_started", "error": None, "last_message_at": None,
+    "sdk_available": None, "connect_attempts": 0,
+    "connected_since": None, "reconnect_count": 0, "stale_reconnect_count": 0,
+    "total_ticks": 0,
+}
+# Rolling tick-timing history for the WebSocket Speed Statistics page -
+# kept separate from _ws_debug since these are lists, not simple values.
+# maxlen bounds memory automatically; 300 entries is several minutes of
+# history at a typical multi-tick-per-second rate, more than enough for
+# the avg/min/max/ticks-per-min stats without growing unbounded.
+_ws_tick_history: deque = deque(maxlen=300)  # tick arrival unix timestamps
+_ws_tick_gaps: deque = deque(maxlen=300)  # inter-tick gaps, in seconds
 
 WS_PRICE_MAX_AGE_SECONDS = 5  # a cached tick older than this is treated as stale, not used
 
@@ -2011,6 +2024,17 @@ def _ws_on_message(message) -> None:
                 ltp = ltpc.get("ltp")
                 if ltp:
                     _ws_price_cache[instrument_key] = {"ltp": float(ltp), "updated_at": now}
+            # Tick-level timing stats, once per message (not per
+            # instrument within it) - feeds the WebSocket Speed
+            # Statistics page's avg/min/max gap and ticks-per-min numbers,
+            # instead of only ever showing a single current age_seconds.
+            prev_last = _ws_debug.get("last_message_at")
+            if prev_last:
+                gap = (now - datetime.fromisoformat(prev_last)).total_seconds()
+                if 0 < gap < 300:  # skip the huge gap that spans a reconnect
+                    _ws_tick_gaps.append(gap)
+            _ws_tick_history.append(now.timestamp())
+            _ws_debug["total_ticks"] = _ws_debug.get("total_ticks", 0) + 1
         _ws_debug["last_message_at"] = now.isoformat()
         _ws_debug["status"] = "streaming"
     except Exception as e:
@@ -2056,7 +2080,10 @@ def _ws_run(access_token: str) -> None:
             # SDK exposes them - wrapped individually since it's unverified
             # which events this particular SDK version supports.
             try:
-                streamer.on("open", lambda *a: _ws_debug.update({"status": "streaming", "error": None}))
+                streamer.on("open", lambda *a: _ws_debug.update({
+                    "status": "streaming", "error": None,
+                    "connected_since": datetime.utcnow().isoformat(),
+                }))
             except Exception:
                 pass
             try:
@@ -2070,6 +2097,8 @@ def _ws_run(access_token: str) -> None:
             _ws_streamer = streamer
             _ws_debug["status"] = "connecting"
             _ws_debug["connect_attempts"] += 1
+            if _ws_debug["connect_attempts"] > 1:
+                _ws_debug["reconnect_count"] = _ws_debug.get("reconnect_count", 0) + 1
             streamer.connect()
             # connect() may block for the life of the connection (a
             # typical run_forever pattern), or may return quickly after
@@ -2116,8 +2145,10 @@ def _ws_run(access_token: str) -> None:
             quiet_checks += 1
             if quiet_checks >= 3:  # ~30s of silence
                 _ws_debug["status"] = "stale_reconnecting"
+                _ws_debug["stale_reconnect_count"] = _ws_debug.get("stale_reconnect_count", 0) + 1
                 break
         _ws_streamer = None
+        _ws_debug["connected_since"] = None
         time.sleep(5)  # brief pause before reconnecting, avoid a hot retry loop
 
 
@@ -3635,6 +3666,16 @@ def stats_page():
     return response
 
 
+@app.route("/websocket-stats")
+def websocket_stats_page():
+    html = render_template("websocket_stats.html", active_tab="websocket_stats")
+    body = html.encode("utf-8")
+    response = make_response(body)
+    response.headers["Content-Type"] = "text/html; charset=utf-8"
+    response.headers["Content-Length"] = str(len(body))
+    return response
+
+
 @app.route("/api/stats/pnl-curve")
 def api_stats_pnl_curve():
     """Two independent equity/P&L curves - paper and live are fully
@@ -4262,6 +4303,87 @@ def debug_websocket():
             for k, v in sample_prices.items()
         },
     })
+
+
+@app.route("/api/paper-trading/websocket-stats")
+def api_websocket_stats():
+    """Derived, human-readable WebSocket health stats for the WS Speed
+    page - built on top of the same raw counters debug-websocket exposes,
+    plus the tick-timing history (_ws_tick_history/_ws_tick_gaps) that
+    endpoint doesn't compute. Never requires manually re-hitting a raw
+    JSON URL - this is meant to be polled by the page's own auto-refresh."""
+    access_token = get_setting("upstox_access_token")
+    if access_token:
+        ensure_websocket_started(access_token)
+
+    now = datetime.utcnow()
+    with _ws_lock:
+        sample_prices = {
+            k: {"ltp": v["ltp"], "age_seconds": round((now - v["updated_at"]).total_seconds(), 1)}
+            for k, v in _ws_price_cache.items()
+        }
+        tick_gaps = list(_ws_tick_gaps)
+        tick_history = list(_ws_tick_history)
+        debug_snapshot = dict(_ws_debug)
+
+    last_message_at = debug_snapshot.get("last_message_at")
+    current_tick_age = None
+    if last_message_at:
+        current_tick_age = round((now - datetime.fromisoformat(last_message_at)).total_seconds(), 2)
+
+    avg_gap = round(sum(tick_gaps) / len(tick_gaps), 2) if tick_gaps else None
+    min_gap = round(min(tick_gaps), 2) if tick_gaps else None
+    max_gap = round(max(tick_gaps), 2) if tick_gaps else None
+
+    one_min_ago = now.timestamp() - 60
+    ticks_last_min = sum(1 for t in tick_history if t >= one_min_ago)
+    ticks_per_sec = round(ticks_last_min / 60, 2) if ticks_last_min else 0.0
+
+    connected_since = debug_snapshot.get("connected_since")
+    uptime_seconds = None
+    if connected_since:
+        uptime_seconds = round((now - datetime.fromisoformat(connected_since)).total_seconds())
+
+    # Feed quality classification, off the CURRENT tick's age - the
+    # single most actionable number for live trading execution safety
+    # (a stale feed means every strategy is deciding off old prices).
+    if current_tick_age is None:
+        quality = "NO_DATA"
+    elif current_tick_age <= 1:
+        quality = "EXCELLENT"
+    elif current_tick_age <= 2:
+        quality = "GOOD"
+    elif current_tick_age <= 5:
+        quality = "DELAYED"
+    elif current_tick_age <= 10:
+        quality = "SLOW"
+    else:
+        quality = "STALE"
+
+    return jsonify({
+        "status": debug_snapshot.get("status"),
+        "error": debug_snapshot.get("error"),
+        "sdk_available": debug_snapshot.get("sdk_available"),
+        "thread_started": _ws_thread_started,
+        "connect_attempts": debug_snapshot.get("connect_attempts", 0),
+        "reconnect_count": debug_snapshot.get("reconnect_count", 0),
+        "stale_reconnect_count": debug_snapshot.get("stale_reconnect_count", 0),
+        "subscribed_count": len(_ws_subscribed_keys),
+        "subscribed_keys": list(_ws_subscribed_keys),
+        "cached_price_count": len(sample_prices),
+        "sample_prices": sample_prices,
+        "current_tick_age": current_tick_age,
+        "avg_tick_gap": avg_gap,
+        "min_tick_gap": min_gap,
+        "max_tick_gap": max_gap,
+        "ticks_per_min": ticks_last_min,
+        "ticks_per_sec": ticks_per_sec,
+        "total_ticks": debug_snapshot.get("total_ticks", 0),
+        "connected_since": connected_since,
+        "uptime_seconds": uptime_seconds,
+        "feed_quality": quality,
+    })
+
 
 
 @app.route("/api/paper-trading/debug-atm")
