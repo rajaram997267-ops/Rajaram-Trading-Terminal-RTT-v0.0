@@ -2100,10 +2100,21 @@ def _ws_run(access_token: str) -> None:
                 if age < 60:
                     quiet_checks = 0
                     continue
-            if not _ws_subscribed_keys:
-                continue  # nothing subscribed yet - silence is expected, not staleness
+            # No early-exit for "nothing subscribed yet" - the streamer
+            # always connects with at least the Nifty 50 fallback key (see
+            # initial_keys above), so ticks should be flowing within
+            # seconds of a genuinely successful connection regardless of
+            # whether any real trade is open. Silence here almost always
+            # means the connection itself never actually succeeded (a
+            # rejected handshake that fired a 'close' event instead of an
+            # 'error' event, for instance) - gating this on
+            # _ws_subscribed_keys being non-empty meant a dead connection
+            # with no open trade could sit stuck forever, never retrying,
+            # never picking up a freshly-saved token. That's exactly what
+            # was happening: connect_attempts staying frozen at 1 no
+            # matter how long the actual connection had been dead.
             quiet_checks += 1
-            if quiet_checks >= 3:  # ~30s of silence despite active subscriptions
+            if quiet_checks >= 3:  # ~30s of silence
                 _ws_debug["status"] = "stale_reconnecting"
                 break
         _ws_streamer = None
