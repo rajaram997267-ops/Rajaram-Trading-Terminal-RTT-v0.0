@@ -157,7 +157,7 @@
     </label>
     <span>Live trading (real Upstox orders)</span>
     <span class="token-status" id="liveStatus" style="{% if live_trading_enabled %}color: var(--red);{% endif %}">
-      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. A real -2% SL (Stop-Loss Limit) order is placed with Upstox at entry, so it protects the position even if this app is down{% else %}OFF - paper trading only{% endif %}
+      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. {% if live_entry_mode == "GTT" %}Entry + a trailing stop are combined into one GTT order at entry (GTT mode - see below).{% else %}A real -2% SL (Stop-Loss Limit) order is placed with Upstox at entry, so it protects the position even if this app is down.{% endif %}{% else %}OFF - paper trading only{% endif %}
     </span>
   </div>
 
