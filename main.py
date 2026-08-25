@@ -3837,9 +3837,13 @@ def live_trading_page():
         closed_trades = conn.execute(
             "SELECT * FROM paper_trades WHERE live_status = 'CLOSED' ORDER BY id DESC LIMIT 200"
         ).fetchall()
+        failed_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE live_status = 'FAILED' ORDER BY id DESC LIMIT 50"
+        ).fetchall()
 
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
+    failed_trades = [dict(t) for t in failed_trades]
     attach_live_unrealized_pnl(open_trades)
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
@@ -3859,6 +3863,7 @@ def live_trading_page():
         active_tab="live",
         open_trades=open_trades,
         closed_trades=closed_trades,
+        failed_trades=failed_trades,
         closed_by_date=closed_by_date,
         live_trading_enabled=get_live_trading_enabled(),
         live_open=live_stats["live_open"],
@@ -3887,6 +3892,9 @@ def live_trading_data():
         closed_trades = conn.execute(
             "SELECT * FROM paper_trades WHERE live_status = 'CLOSED' ORDER BY id DESC LIMIT 200"
         ).fetchall()
+        failed_trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE live_status = 'FAILED' ORDER BY id DESC LIMIT 50"
+        ).fetchall()
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
     attach_live_unrealized_pnl(open_trades)
@@ -3895,6 +3903,7 @@ def live_trading_data():
         entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
         exit_p = t.get("live_exit_price") if t.get("live_exit_price") is not None else (t.get("exit_price") or 0)
         t["live_pnl_value"] = round((exit_p - entry) * qty, 2)
+    failed_trades = [dict(t) for t in failed_trades]
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     access_token = get_setting("upstox_access_token")
@@ -3903,6 +3912,7 @@ def live_trading_data():
     return jsonify({
         "open": open_trades,
         "closed": closed_trades,
+        "failed": failed_trades,
         "live_open": live_stats["live_open"],
         "live_closed": live_stats["live_closed"],
         "live_pnl": live_stats["live_pnl"],
