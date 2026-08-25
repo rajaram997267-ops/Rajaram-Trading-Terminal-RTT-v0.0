@@ -924,13 +924,22 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                 # to be part of the same GTT.
                                 gap_mode = get_gtt_trailing_gap_mode()
                                 gap_value = get_gtt_trailing_gap_value()
-                                trailing_gap = round(premium * (gap_value / 100), 2) if gap_mode == "percent" else gap_value
-                                stop_trigger = round(premium * 0.98, 2)
+                                raw_gap = premium * (gap_value / 100) if gap_mode == "percent" else gap_value
+                                # Both the trigger AND the gap need to be
+                                # tick-aligned - the gap defines the
+                                # increments the trigger will move by as
+                                # Upstox trails it, so a non-tick-aligned
+                                # gap could just push the same rejection
+                                # further down the line on the first trail
+                                # update instead of at placement time.
+                                trailing_gap = max(0.05, _round_to_tick(raw_gap))
+                                stop_trigger = _round_to_tick(premium * 0.98)
+                                entry_trigger = _round_to_tick(premium)
 
                                 gtt_result = place_gtt_order(
                                     option["instrument_key"], "BUY", live_quantity, "D",
                                     rules=[
-                                        {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": premium},
+                                        {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": entry_trigger},
                                         {
                                             "strategy": "STOPLOSS", "trigger_type": "IMMEDIATE",
                                             "trigger_price": stop_trigger, "trailing_gap": trailing_gap,
@@ -2370,6 +2379,16 @@ def cancel_order(order_id: str, access_token: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _round_to_tick(price: float, tick_size: float = 0.05) -> float:
+    """Rounds a price to the nearest valid exchange tick - required for
+    GTT trigger prices. NSE options trade in 0.05 ticks, and a GTT
+    stoploss trigger that isn't an exact multiple gets rejected outright
+    (confirmed: 'stoploss trigger must be multiple of tick size: 0.05',
+    UDAPI100500) - plain 2-decimal rounding isn't enough, since e.g.
+    92.83 rounds fine to 2 decimals but still isn't a multiple of 0.05."""
+    return round(round(price / tick_size) * tick_size, 2)
 
 
 def place_gtt_order(
