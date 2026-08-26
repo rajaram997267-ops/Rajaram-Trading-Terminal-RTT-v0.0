@@ -2046,6 +2046,18 @@ def _ws_on_message(message) -> None:
             _ws_debug["total_ticks"] = _ws_debug.get("total_ticks", 0) + 1
         _ws_debug["last_message_at"] = now.isoformat()
         _ws_debug["status"] = "streaming"
+        _ws_debug["error"] = None
+        # A successfully received tick is definitive proof the connection
+        # is healthy right now, regardless of what a PRIOR attempt did -
+        # without this, an error from an earlier failed reconnect (or a
+        # transient 403/401 that resolved itself on the next try) would
+        # sit displayed forever even while ticks are actively flowing,
+        # which is exactly backwards for a page meant to show live health.
+        # Also covers connected_since, since the "open" SDK event this
+        # would otherwise rely on doesn't fire reliably on every version -
+        # first tick after a (re)connect is a safe substitute signal.
+        if not _ws_debug.get("connected_since"):
+            _ws_debug["connected_since"] = now.isoformat()
     except Exception as e:
         _ws_debug["error"] = f"on_message error: {e}"
 
