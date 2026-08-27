@@ -187,6 +187,14 @@
       flex-shrink: 0;
     }
     .row-top .price::before { content: "Rs "; opacity: 0.7; font-weight: 400; }
+    .pct-change {
+      font-size: 11px;
+      font-weight: 600;
+      margin-left: 6px;
+      white-space: nowrap;
+    }
+    .pct-change.pos { color: var(--green); }
+    .pct-change.neg { color: var(--red); }
     .row-bottom {
       display: flex;
       justify-content: space-between;
@@ -512,7 +520,7 @@
                 <div class="list-row{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}{% if alert['confirmed_count'] and alert['confirmed_count'] >= 3 %} triple-confirmed{% endif %}" data-sector="{{ alert['sector'] }}" {% if alert["alert_name"] %}title="{{ alert['alert_name'] }}"{% endif %}>
                   <div class="row-top">
                     <span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>
-                    <span class="price">{{ alert["trigger_price"] or "-" }}</span>
+                    <span class="price">{{ alert["trigger_price"] or "-" }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}
                   </div>
                   <div class="row-bottom">
                     <span class="badges-inline">
@@ -593,11 +601,14 @@
       const chartBtn = a.symbol
         ? `<button class="btn-chart" onclick="openChart('${escapeHtml(a.symbol)}', '${cat}')">Chart</button>`
         : "";
+      const pctBadge = (a.pct_change_today !== null && a.pct_change_today !== undefined)
+        ? `<span class="pct-change ${a.pct_change_today >= 0 ? "pos" : "neg"}">${a.pct_change_today >= 0 ? "+" : ""}${a.pct_change_today}%</span>`
+        : "";
       return `
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
             <span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>
-            <span class="price">${escapeHtml(String(a.trigger_price || "-"))}</span>
+            <span class="price">${escapeHtml(String(a.trigger_price || "-"))}</span>${pctBadge}
           </div>
           <div class="row-bottom">
             <span class="badges-inline">${badgesHtml}</span>

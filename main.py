@@ -3245,9 +3245,20 @@ def index():
         alerts = [
             dict(a) for a in all_alerts if ist_date_str(a["created_at"]) == selected_date
         ]
+        access_token = get_setting("upstox_access_token")
+        prev_closes = _get_prev_closes(access_token) if access_token else {}
         for a in alerts:
             a["category"] = categorize(a)
             a["sector"] = get_sector(a.get("symbol", ""))
+            prev_close = prev_closes.get((a.get("symbol") or "").strip().upper())
+            try:
+                trigger_price = float(a.get("trigger_price") or 0)
+            except (TypeError, ValueError):
+                trigger_price = 0
+            a["pct_change_today"] = (
+                round((trigger_price - prev_close) / prev_close * 100, 2)
+                if prev_close and trigger_price else None
+            )
         all_sectors = sorted({a["sector"] for a in alerts})
         grouped = group_by_category(alerts)
         merged_count = sum(len(items) for _, items in grouped)
@@ -3298,9 +3309,27 @@ def api_alerts():
     alerts = [
         dict(a) for a in all_alerts if ist_date_str(a["created_at"]) == selected_date
     ]
+    access_token = get_setting("upstox_access_token")
+    # Reuses the SAME prev-close cache the sector momentum filter already
+    # maintains in the background - this costs nothing extra per alert.
+    # No live price fetch happens here at all: the % shown is the
+    # alert's own trigger_price (already stored, from Chartink itself)
+    # against yesterday's close, not a live-updating number. That's a
+    # deliberate tradeoff for zero added API calls per page load/refresh,
+    # regardless of how many alerts are showing.
+    prev_closes = _get_prev_closes(access_token) if access_token else {}
     for a in alerts:
         a["category"] = categorize(a)
         a["sector"] = get_sector(a.get("symbol", ""))
+        prev_close = prev_closes.get((a.get("symbol") or "").strip().upper())
+        try:
+            trigger_price = float(a.get("trigger_price") or 0)
+        except (TypeError, ValueError):
+            trigger_price = 0
+        a["pct_change_today"] = (
+            round((trigger_price - prev_close) / prev_close * 100, 2)
+            if prev_close and trigger_price else None
+        )
 
     by_category: dict[str, list[dict]] = {}
     for a in alerts:
