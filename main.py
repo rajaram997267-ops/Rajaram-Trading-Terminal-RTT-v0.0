@@ -3942,6 +3942,7 @@ def live_trading_page():
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     closed_by_date = group_trades_by_date(closed_trades, date_field="live_exit_time", pnl_field="live_pnl_value")
+    failed_by_date = group_trades_by_date(failed_trades, date_field="entry_time", pnl_field="pnl")
     token_saved = bool(get_setting("upstox_access_token"))
     live_available_funds = None
     if token_saved:
@@ -3953,6 +3954,7 @@ def live_trading_page():
         open_trades=open_trades,
         closed_trades=closed_trades,
         failed_trades=failed_trades,
+        failed_by_date=failed_by_date,
         closed_by_date=closed_by_date,
         live_trading_enabled=get_live_trading_enabled(),
         live_open=live_stats["live_open"],

@@ -245,20 +245,35 @@
 
   <h3 class="section-title">Failed live entries <span class="sub" style="font-weight:400;">(live order never placed - reason shown below)</span></h3>
   <div id="failedTradesContainer">
-    {% if failed_trades %}
-    <table>
-      <tr>
-        <th>Symbol</th><th>Direction</th><th>Entry time</th><th>Reason</th>
-      </tr>
-      {% for t in failed_trades %}
-      <tr>
-        <td>{{ t.symbol }}</td>
-        <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
-        <td>{{ t.entry_time[:19] if t.entry_time else "-" }}</td>
-        <td class="error-note">{{ t.live_error or "Unknown reason" }}</td>
-      </tr>
+    {% if failed_by_date %}
+      {% for group in failed_by_date %}
+      <div class="date-group{% if loop.first %} expanded{% endif %}">
+        <div class="date-header" onclick="this.parentElement.classList.toggle('expanded')">
+          <div class="date-left">
+            <span class="date-label">{{ group.date }}</span>
+            <span class="date-count">{{ group.trades|length }} failed</span>
+          </div>
+          <div class="date-right">
+            <span class="chevron">&#9660;</span>
+          </div>
+        </div>
+        <div class="date-trades">
+          <table>
+            <tr>
+              <th>Symbol</th><th>Direction</th><th>Entry time</th><th>Reason</th>
+            </tr>
+            {% for t in group.trades %}
+            <tr>
+              <td>{{ t.symbol }}</td>
+              <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
+              <td>{{ t.entry_time[:19] if t.entry_time else "-" }}</td>
+              <td class="error-note">{{ t.live_error or "Unknown reason" }}</td>
+            </tr>
+            {% endfor %}
+          </table>
+        </div>
+      </div>
       {% endfor %}
-    </table>
     {% else %}
     <div class="empty">No failed live entries - good sign.</div>
     {% endif %}
@@ -323,20 +338,44 @@
         container.innerHTML = '<div class="empty">No failed live entries - good sign.</div>';
         return;
       }
-      const rows = trades.map(t => `
-        <tr>
-          <td>${escapeHtml(t.symbol)}</td>
-          <td class="direction-${(t.direction || "").toLowerCase()}">${t.direction || "-"}</td>
-          <td>${(t.entry_time || "").slice(0, 19) || "-"}</td>
-          <td class="error-note">${escapeHtml(t.live_error || "Unknown reason")}</td>
-        </tr>
-      `).join("");
-      container.innerHTML = `
-        <table>
-          <tr><th>Symbol</th><th>Direction</th><th>Entry time</th><th>Reason</th></tr>
-          ${rows}
-        </table>
-      `;
+      const expandedDates = new Set();
+      container.querySelectorAll(".date-group.expanded .date-label").forEach(el => {
+        expandedDates.add(el.textContent);
+      });
+      const isFirstRender = expandedDates.size === 0 && container.querySelector(".date-group") === null;
+
+      const groups = groupTradesByDate(trades, "entry_time", "pnl");
+      const html = groups.map((g, idx) => {
+        const expanded = expandedDates.has(g.date) || (isFirstRender && idx === 0);
+        const rows = g.trades.map(t => `
+          <tr>
+            <td>${escapeHtml(t.symbol)}</td>
+            <td class="direction-${(t.direction || "").toLowerCase()}">${t.direction || "-"}</td>
+            <td>${(t.entry_time || "").slice(0, 19) || "-"}</td>
+            <td class="error-note">${escapeHtml(t.live_error || "Unknown reason")}</td>
+          </tr>
+        `).join("");
+        return `
+          <div class="date-group${expanded ? " expanded" : ""}">
+            <div class="date-header" onclick="this.parentElement.classList.toggle('expanded')">
+              <div class="date-left">
+                <span class="date-label">${g.date}</span>
+                <span class="date-count">${g.trades.length} failed</span>
+              </div>
+              <div class="date-right">
+                <span class="chevron">&#9660;</span>
+              </div>
+            </div>
+            <div class="date-trades">
+              <table>
+                <tr><th>Symbol</th><th>Direction</th><th>Entry time</th><th>Reason</th></tr>
+                ${rows}
+              </table>
+            </div>
+          </div>
+        `;
+      }).join("");
+      container.innerHTML = html;
     }
 
     function renderOpenTrades(trades) {
