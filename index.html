@@ -195,6 +195,19 @@
     }
     .pct-change.pos { color: var(--green); }
     .pct-change.neg { color: var(--red); }
+    .btn-refresh-price {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 1px 6px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 11px;
+      margin-left: 6px;
+      line-height: 1.4;
+    }
+    .btn-refresh-price:hover { color: var(--text); border-color: var(--green); }
+    .btn-refresh-price:disabled { opacity: 0.4; cursor: default; }
     .row-bottom {
       display: flex;
       justify-content: space-between;
@@ -520,7 +533,7 @@
                 <div class="list-row{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}{% if alert['confirmed_count'] and alert['confirmed_count'] >= 3 %} triple-confirmed{% endif %}" data-sector="{{ alert['sector'] }}" {% if alert["alert_name"] %}title="{{ alert['alert_name'] }}"{% endif %}>
                   <div class="row-top">
                     <span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>
-                    <span class="price">{{ alert["trigger_price"] or "-" }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}
+                    <span class="price-wrap"><span class="price">{{ alert["trigger_price"] or "-" }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '{{ (alert['symbol'] or '')|escape }}')" title="Fetch live price">&#8635;</button>
                   </div>
                   <div class="row-bottom">
                     <span class="badges-inline">
@@ -608,7 +621,7 @@
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
             <span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>
-            <span class="price">${escapeHtml(String(a.trigger_price || "-"))}</span>${pctBadge}
+            <span class="price-wrap"><span class="price">${escapeHtml(String(a.trigger_price || "-"))}</span>${pctBadge}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '${escapeHtml(a.symbol || "")}')" title="Fetch live price">&#8635;</button>
           </div>
           <div class="row-bottom">
             <span class="badges-inline">${badgesHtml}</span>
@@ -770,6 +783,36 @@
     }
 
     let lastChartData = null;
+
+    async function refreshLivePrice(btn, symbol) {
+      // On-demand only - fetches exactly one symbol's price, exactly
+      // once, only when this button is clicked. No WebSocket
+      // subscription, no polling, no effect on the trading-critical
+      // connection - see /api/live-price/<symbol> on the backend.
+      const wrap = btn.parentElement.querySelector(".price-wrap");
+      const originalHtml = wrap.innerHTML;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/live-price/${encodeURIComponent(symbol)}`);
+        const data = await res.json();
+        if (res.ok && data.status === "ok") {
+          let html = `<span class="price">${data.ltp}</span>`;
+          if (data.pct_change_today !== null && data.pct_change_today !== undefined) {
+            const cls = data.pct_change_today >= 0 ? "pos" : "neg";
+            const sign = data.pct_change_today >= 0 ? "+" : "";
+            html += `<span class="pct-change ${cls}">${sign}${data.pct_change_today}%</span>`;
+          }
+          wrap.innerHTML = html;
+        } else {
+          alert(data.message || "Failed to fetch live price");
+        }
+      } catch (err) {
+        alert("Failed to fetch live price - see console");
+        console.error(err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
 
     async function openChart(symbol, direction) {
       const overlay = document.getElementById("chartModalOverlay");

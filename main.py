@@ -3397,6 +3397,35 @@ def api_manual_enter_alert(alert_id):
     return jsonify({"status": "ok", "symbol": symbol, "category": category})
 
 
+@app.route("/api/live-price/<symbol>")
+def api_live_price(symbol):
+    """On-demand current price + %-change-today for a single symbol -
+    fetched only when the user taps the refresh button on that specific
+    alert. One REST call (get_ltp), no WebSocket subscription involved
+    at all - deliberately kept off the WebSocket entirely, since that
+    connection is what live trading's exit checks and order placement
+    depend on, and adding 50+ dashboard-cosmetic subscriptions to it
+    would compete with that for no good reason. Costs nothing unless
+    clicked, and even then it's a single cheap request, never a batch."""
+    access_token = get_setting("upstox_access_token")
+    if not access_token:
+        return jsonify({"status": "error", "message": "No Upstox access token saved yet."}), 400
+
+    instrument_key = get_instrument_key(symbol)
+    if not instrument_key:
+        return jsonify({"status": "error", "message": f"Could not resolve an instrument key for {symbol}"}), 404
+
+    ltp = get_ltp(instrument_key, access_token)
+    if ltp is None:
+        return jsonify({"status": "error", "message": "Could not fetch a live price right now"}), 502
+
+    prev_closes = _get_prev_closes(access_token)
+    prev_close = prev_closes.get(symbol.strip().upper())
+    pct_change = round((ltp - prev_close) / prev_close * 100, 2) if prev_close else None
+
+    return jsonify({"status": "ok", "symbol": symbol, "ltp": ltp, "pct_change_today": pct_change})
+
+
 @app.route("/api/chart/<symbol>")
 def api_chart(symbol):
     """On-demand candle data for the dashboard's per-alert Chart button -
