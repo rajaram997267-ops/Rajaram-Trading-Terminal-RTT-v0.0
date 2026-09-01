@@ -194,6 +194,9 @@
       <option value="ATR_TRAIL" {% if exit_strategy == "ATR_TRAIL" %}selected{% endif %}>6) ATR stop until +2%, then trail 0.5% steps</option>
       <option value="EMA_SPOT_TRAIL" {% if exit_strategy == "EMA_SPOT_TRAIL" %}selected{% endif %}>7) 5-EMA (spot) trail, -2% floor</option>
       <option value="EMA_SPOT_PURE" {% if exit_strategy == "EMA_SPOT_PURE" %}selected{% endif %}>8) Pure 5-EMA (spot) trail, no floor</option>
+      <option value="JOAT_HYBRID" {% if exit_strategy == "JOAT_HYBRID" %}selected{% endif %}>9) JOAT Hybrid: spot ATR -&gt; book 50% -&gt; spot 5-EMA trail</option>
+      <option value="JOAT_TEST_B" {% if exit_strategy == "JOAT_TEST_B" %}selected{% endif %}>Test-B: spot ATR (shared) -&gt; spot 5-EMA trail</option>
+      <option value="JOAT_TEST_C" {% if exit_strategy == "JOAT_TEST_C" %}selected{% endif %}>Test-C: spot ATR (own period) -&gt; spot 5-EMA trail</option>
     </select>
     <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
   </div>
@@ -205,7 +208,17 @@
     <span>Multiplier:</span>
     <input type="text" id="atrMultiplierInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_multiplier }}">
     <button class="secondary" onclick="saveAtrSettings()">Save</button>
-    <span class="token-status" id="atrSettingsStatus">Used by the "6) ATR trailing stop" exit strategy above - stop = highest price since entry &minus; (ATR &times; multiplier). Changes apply immediately to any open ATR trade too, not just new ones.</span>
+    <span class="token-status" id="atrSettingsStatus">Used by "6) ATR trailing stop", "9) JOAT Hybrid", and "Test-B" above. Changes apply immediately to any open trade using them too, not just new ones.</span>
+  </div>
+
+  <div class="settings-box">
+    <span>ATR settings for Test-C only:</span>
+    <span>Period:</span>
+    <input type="text" id="atrPeriodCInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_period_c }}">
+    <span>Multiplier:</span>
+    <input type="text" id="atrMultiplierCInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_multiplier_c }}">
+    <button class="secondary" onclick="saveAtrSettingsC()">Save</button>
+    <span class="token-status" id="atrSettingsCStatus">Kept separate from the shared ATR settings above specifically so Test-C's results stay distinct from Test-B's in the Stats breakdown.</span>
   </div>
 
   <div class="settings-box">
@@ -323,6 +336,32 @@
         const result = await res.json();
         if (res.ok) {
           statusEl.textContent = `Saved - ATR period ${result.atr_period}, multiplier ${result.atr_multiplier}`;
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveAtrSettingsC() {
+      const statusEl = document.getElementById("atrSettingsCStatus");
+      const period = parseInt(document.getElementById("atrPeriodCInput").value, 10);
+      const multiplier = parseFloat(document.getElementById("atrMultiplierCInput").value);
+      if (!period || period < 2 || !multiplier || multiplier < 0.1) {
+        statusEl.textContent = "Enter a valid period (>=2) and multiplier (>=0.1)";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/atr-settings-c", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ atr_period: period, atr_multiplier: multiplier }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = `Saved - Test-C ATR period ${result.atr_period}, multiplier ${result.atr_multiplier}`;
         } else {
           statusEl.textContent = result.message || "Failed to save";
         }

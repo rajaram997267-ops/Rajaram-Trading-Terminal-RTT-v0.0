@@ -443,7 +443,9 @@ def init_db():
                 alert_name TEXT,
                 scan_name TEXT,
                 live_gtt_order_id TEXT,
-                live_gtt_trailing_gap DOUBLE PRECISION
+                live_gtt_trailing_gap DOUBLE PRECISION,
+                spot_entry_price DOUBLE PRECISION,
+                spot_atr_trail_peak_price DOUBLE PRECISION
             )
             """
         )
@@ -489,6 +491,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS scan_name TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_gtt_order_id TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_gtt_trailing_gap DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS spot_entry_price DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS spot_atr_trail_peak_price DOUBLE PRECISION",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -626,6 +630,51 @@ def get_atr_multiplier() -> float:
         return max(0.1, float(get_setting("atr_multiplier", "2")))
     except (TypeError, ValueError):
         return 2.0
+
+
+def get_atr_period_c() -> int:
+    """Separate ATR period specifically for Test-C (JOAT_TEST_C) - kept
+    distinct from the shared get_atr_period() used by ATR_TRAIL/Test-B so
+    that C's results are tagged under its own strategy name even if the
+    shared ATR settings get changed later for a different test batch.
+    Defaults to 14 (vs. 8 for the shared setting), matching the 'wider
+    initial protection' comparison this variant is for."""
+    try:
+        return max(2, int(get_setting("atr_period_c", "14")))
+    except (TypeError, ValueError):
+        return 14
+
+
+def get_atr_multiplier_c() -> float:
+    """Multiplier for Test-C's ATR - see get_atr_period_c(). Defaults to 2.0."""
+    try:
+        return max(0.1, float(get_setting("atr_multiplier_c", "2")))
+    except (TypeError, ValueError):
+        return 2.0
+
+
+# Spot-based thresholds shared by the JOAT-inspired strategies (#9, Test-B,
+# Test-C) - NOT the same numbers as the option-premium-based -2%/+2%/+4%
+# used elsewhere in this file. A % move in the underlying is a much bigger
+# deal than the same % move in a leveraged option premium, so reusing the
+# old numbers here would make the floor far too loose and the targets far
+# too rare to ever fire. These were set deliberately smaller to match how
+# far a stock/index actually tends to move intraday.
+SPOT_FLOOR_PCT = -0.3
+SPOT_BOOK_PCT = 0.5
+SPOT_TARGET_PCT = 1.0
+
+
+def get_spot_pct_change(direction: str, spot_entry_price: float | None, spot_last_price: float | None) -> float | None:
+    """% move of the UNDERLYING since entry, sign-flipped so a positive
+    number always means the trade is currently favorable regardless of
+    Call vs Put direction - a Buy alert (long Call) profits when spot
+    rises, a Sell alert (long Put) profits when spot falls. Returns None
+    if either price is missing (not yet available)."""
+    if not spot_entry_price or spot_last_price is None:
+        return None
+    raw = (spot_last_price - spot_entry_price) / spot_entry_price * 100
+    return raw if direction == "Buy" else -raw
 
 
 def sector_qualifies(symbol: str, category: str, access_token: str | None) -> bool:
@@ -853,18 +902,30 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
 
     now = datetime.utcnow().isoformat()
     entry_strategy = get_exit_strategy()
+
+    # Needed by the JOAT-inspired spot-based strategies (#9, Test-B,
+    # Test-C) - their whole exit decision runs off the UNDERLYING's own
+    # price move, not the option premium, so a reference point at entry
+    # is required. Harmless/unused for every other strategy - just one
+    # extra LTP lookup, only when a token is available.
+    spot_entry_price = None
+    if access_token:
+        spot_instrument_key = get_instrument_key(symbol)
+        if spot_instrument_key:
+            spot_entry_price = get_ltp(spot_instrument_key, access_token)
+
     with get_db() as conn:
         row = conn.execute(
             """
             INSERT INTO paper_trades
                 (symbol, direction, entry_price, entry_time, status, quantity,
                  paper_instrument_key, paper_option_label, last_error,
-                 strategy, original_quantity, alert_name, scan_name)
-            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?)
+                 strategy, original_quantity, alert_name, scan_name, spot_entry_price)
+            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (symbol, category, entry_price, now, quantity, paper_instrument_key, paper_option_label,
-             fallback_note, entry_strategy, quantity, alert_name or None, scan_name or None),
+             fallback_note, entry_strategy, quantity, alert_name or None, scan_name or None, spot_entry_price),
         ).fetchone()
         conn.commit()
 
@@ -2658,10 +2719,16 @@ def run_paper_trade_check() -> dict:
             # strategy - it's a second Upstox call on top of the option's
             # own, so no reason to pay for it otherwise.
             spot_candles = None
-            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE"):
+            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C"):
                 spot_key = get_instrument_key(symbol)
                 if spot_key:
                     spot_candles = fetch_5min_candles(spot_key, access_token)
+            # Current spot price - only the JOAT-inspired strategies need
+            # this as a standalone value (for their spot-%-change and ATR
+            # peak-tracking math); #7/#8 only ever needed the candle
+            # series itself (check_exit reads closes directly), so this
+            # didn't exist as a variable until now.
+            spot_last_price = spot_candles[-1][3] if spot_candles else None
 
             # Paper and live each resolve their own ATM contract at entry
             # time (both from the same alert price, moments apart) - in
@@ -2869,6 +2936,119 @@ def run_paper_trade_check() -> dict:
                 if spot_exited:
                     exited, exit_price = True, last_price
                     exit_reason = "5-EMA (spot) reversal"
+
+            elif strategy == "JOAT_HYBRID" and last_price is not None:
+                # #9 (JOAT-inspired Adaptive Hybrid Runner): every trigger
+                # here runs off the UNDERLYING's own price move, not the
+                # option premium - option premium is noisy (theta, IV,
+                # spread) where the actual trend/reversal signal lives in
+                # the stock itself. Thresholds are spot-scaled
+                # (SPOT_FLOOR_PCT/SPOT_BOOK_PCT), not the old -2%/+2%/+4%
+                # option-premium numbers - a 2% move in the underlying is
+                # a much bigger deal than a 2% move in a leveraged option.
+                #
+                # Stage 1 (pre-book): a spot ATR (Chandelier-style)
+                # structural stop protects the trade, floored at
+                # SPOT_FLOOR_PCT before there's enough candle history for
+                # the first ATR reading. At SPOT_BOOK_PCT, book half the
+                # qty (Target-1).
+                # Stage 2 (post-book): the remaining half is protected at
+                # spot breakeven, then trailed via the underlying's own
+                # 5-EMA reversal pattern (same rule as #7/#8) rather than
+                # a further ATR/percentage trail - this is the "let the
+                # runner run using structure, not a fixed number" piece.
+                spot_pct = get_spot_pct_change(trade["direction"], trade["spot_entry_price"], spot_last_price)
+                if spot_pct is not None:
+                    if trade["target1_hit_time"] is None:
+                        if spot_pct >= SPOT_BOOK_PCT:
+                            original_qty = trade["original_quantity"] or trade["quantity"] or 1
+                            half_qty = max(1, original_qty // 2)
+                            remaining_qty = max(0, original_qty - half_qty)
+                            partial = {
+                                "exit_price": last_price,
+                                "qty": half_qty,
+                                "pnl": round((last_price - entry_price) * half_qty, 2),
+                                "remaining_qty": remaining_qty,
+                            }
+                        else:
+                            atr_series = calculate_atr(spot_candles or [], get_atr_period())
+                            current_atr = atr_series[-1] if atr_series else None
+                            if current_atr is None:
+                                if spot_pct <= SPOT_FLOOR_PCT:
+                                    exited, exit_price = True, last_price
+                                    exit_reason = f"Stop-loss ({SPOT_FLOOR_PCT:g}% spot, ATR not ready yet)"
+                            else:
+                                atr_mult = get_atr_multiplier()
+                                prev_peak = trade["spot_atr_trail_peak_price"]
+                                if trade["direction"] == "Buy":
+                                    peak = max(prev_peak, spot_last_price) if prev_peak is not None else max(trade["spot_entry_price"], spot_last_price)
+                                    spot_stop = peak - (current_atr * atr_mult)
+                                    spot_hit_stop = spot_last_price <= spot_stop
+                                else:
+                                    peak = min(prev_peak, spot_last_price) if prev_peak is not None else min(trade["spot_entry_price"], spot_last_price)
+                                    spot_stop = peak + (current_atr * atr_mult)
+                                    spot_hit_stop = spot_last_price >= spot_stop
+                                if spot_hit_stop:
+                                    exited, exit_price = True, last_price
+                                    exit_reason = f"ATR structural stop (spot, {get_atr_period()}p x{atr_mult:g})"
+                                else:
+                                    trail_update = {"spot_atr_trail_peak_price": peak}
+                    else:
+                        if spot_pct <= 0:
+                            exited, exit_price = True, last_price
+                            exit_reason = "Breakeven protection (spot) after Target-1"
+                        else:
+                            spot_exited, _ = check_exit(trade["direction"], spot_candles or [])
+                            if spot_exited:
+                                exited, exit_price = True, last_price
+                                exit_reason = "5-EMA (spot) reversal after Target-1"
+
+            elif strategy in ("JOAT_TEST_B", "JOAT_TEST_C") and last_price is not None:
+                # Test-B / Test-C: simpler 2-stage spot-based comparison
+                # variants (no half-booking) - both use a spot ATR
+                # structural stop until SPOT_BOOK_PCT, then hand off
+                # entirely to the underlying's 5-EMA reversal trail. The
+                # ONLY difference between B and C is which ATR
+                # period/multiplier they read (shared global settings for
+                # B, a separate dedicated pair for C) - kept as two
+                # distinctly-named strategies specifically so their
+                # results never get mixed together in the Stats
+                # breakdown, even if the shared ATR settings get changed
+                # later for some other test.
+                spot_pct = get_spot_pct_change(trade["direction"], trade["spot_entry_price"], spot_last_price)
+                if spot_pct is not None:
+                    if trade["trail_high_pct"] is None:
+                        if spot_pct >= SPOT_BOOK_PCT:
+                            trail_update = {"trail_high_pct": 1.0}  # sentinel: phase switch to spot-EMA trail
+                        else:
+                            atr_period = get_atr_period_c() if strategy == "JOAT_TEST_C" else get_atr_period()
+                            atr_mult = get_atr_multiplier_c() if strategy == "JOAT_TEST_C" else get_atr_multiplier()
+                            atr_series = calculate_atr(spot_candles or [], atr_period)
+                            current_atr = atr_series[-1] if atr_series else None
+                            if current_atr is None:
+                                if spot_pct <= SPOT_FLOOR_PCT:
+                                    exited, exit_price = True, last_price
+                                    exit_reason = f"Stop-loss ({SPOT_FLOOR_PCT:g}% spot, ATR not ready yet)"
+                            else:
+                                prev_peak = trade["spot_atr_trail_peak_price"]
+                                if trade["direction"] == "Buy":
+                                    peak = max(prev_peak, spot_last_price) if prev_peak is not None else max(trade["spot_entry_price"], spot_last_price)
+                                    spot_stop = peak - (current_atr * atr_mult)
+                                    spot_hit_stop = spot_last_price <= spot_stop
+                                else:
+                                    peak = min(prev_peak, spot_last_price) if prev_peak is not None else min(trade["spot_entry_price"], spot_last_price)
+                                    spot_stop = peak + (current_atr * atr_mult)
+                                    spot_hit_stop = spot_last_price >= spot_stop
+                                if spot_hit_stop:
+                                    exited, exit_price = True, last_price
+                                    exit_reason = f"ATR structural stop (spot, {atr_period}p x{atr_mult:g})"
+                                else:
+                                    trail_update = {"spot_atr_trail_peak_price": peak}
+                    else:
+                        spot_exited, _ = check_exit(trade["direction"], spot_candles or [])
+                        if spot_exited:
+                            exited, exit_price = True, last_price
+                            exit_reason = "5-EMA (spot) reversal after ATR phase"
 
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
@@ -3109,6 +3289,16 @@ def run_paper_trade_check() -> dict:
                         WHERE id = ?
                         """,
                         (trail_update["atr_trail_peak_price"], last_price, now, trade["id"]),
+                    )
+                elif trail_update and "spot_atr_trail_peak_price" in trail_update:
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET spot_atr_trail_peak_price = ?, last_checked_price = ?,
+                            last_checked_time = ?, last_error = NULL
+                        WHERE id = ?
+                        """,
+                        (trail_update["spot_atr_trail_peak_price"], last_price, now, trade["id"]),
                     )
                 elif exited:
                     qty = trade["quantity"] or 1
@@ -3597,6 +3787,63 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                 t["stop_info"] = f"No floor - pattern exit only{spot_ema_note}"
             t["atr_value"] = None
 
+        elif strategy in ("JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C"):
+            # All three run off the underlying's price, not the option's -
+            # recompute fresh off the latest spot candles, same pattern as
+            # ATR_TRAIL/EMA_SPOT_TRAIL above, just using spot-scaled
+            # thresholds (SPOT_FLOOR_PCT/SPOT_BOOK_PCT) instead of -2%/+2%.
+            spot_entry = t.get("spot_entry_price")
+            direction = t.get("direction")
+            spot_candles = None
+            spot_key = t.get("symbol")
+            if spot_key and access_token:
+                try:
+                    resolved_key = get_instrument_key(spot_key)
+                    if resolved_key:
+                        spot_candles = fetch_5min_candles(resolved_key, access_token)
+                except Exception:
+                    spot_candles = None
+            spot_last = spot_candles[-1][3] if spot_candles else None
+            spot_pct = get_spot_pct_change(direction, spot_entry, spot_last)
+
+            if spot_pct is None:
+                t["stop_info"] = "Waiting for spot price data"
+                t["atr_value"] = None
+            elif strategy == "JOAT_HYBRID" and t.get("target1_hit_time"):
+                # Post-book: breakeven protection + spot 5-EMA trail info.
+                series = [c[2] for c in spot_candles] if direction == "Buy" else [c[1] for c in spot_candles]
+                ema_series = calculate_ema(series, 5) if spot_candles else []
+                current_ema = ema_series[-1] if ema_series else None
+                ema_note = f" | spot EMA5: {current_ema:.2f}" if current_ema is not None else ""
+                t["stop_info"] = f"Breakeven (spot 0%) + 5-EMA trail{ema_note}"
+                t["atr_value"] = None
+            elif strategy in ("JOAT_TEST_B", "JOAT_TEST_C") and t.get("trail_high_pct") is not None:
+                series = [c[2] for c in spot_candles] if direction == "Buy" else [c[1] for c in spot_candles]
+                ema_series = calculate_ema(series, 5) if spot_candles else []
+                current_ema = ema_series[-1] if ema_series else None
+                ema_note = f" | spot EMA5: {current_ema:.2f}" if current_ema is not None else ""
+                t["stop_info"] = f"5-EMA (spot) trail only{ema_note}"
+                t["atr_value"] = None
+            else:
+                # Pre-book/pre-threshold: ATR structural stop phase.
+                atr_period = get_atr_period_c() if strategy == "JOAT_TEST_C" else get_atr_period()
+                atr_mult = get_atr_multiplier_c() if strategy == "JOAT_TEST_C" else get_atr_multiplier()
+                atr_series = calculate_atr(spot_candles or [], atr_period)
+                current_atr = atr_series[-1] if atr_series else None
+                if current_atr is None:
+                    t["stop_info"] = f"Stop: {SPOT_FLOOR_PCT:g}% spot (ATR warming up)"
+                    t["atr_value"] = None
+                else:
+                    prev_peak = t.get("spot_atr_trail_peak_price")
+                    if direction == "Buy":
+                        peak = max(prev_peak, spot_last) if prev_peak is not None else max(spot_entry, spot_last)
+                        stop_price_spot = peak - (current_atr * atr_mult)
+                    else:
+                        peak = min(prev_peak, spot_last) if prev_peak is not None else min(spot_entry, spot_last)
+                        stop_price_spot = peak + (current_atr * atr_mult)
+                    t["atr_value"] = round(current_atr, 2)
+                    t["stop_info"] = f"ATR structural stop (spot): {stop_price_spot:.2f}"
+
         else:
             t["stop_info"] = None
             t["atr_value"] = None
@@ -3909,6 +4156,8 @@ def settings_page():
         live_entry_mode=get_live_entry_mode(),
         gtt_trailing_gap_mode=get_gtt_trailing_gap_mode(),
         gtt_trailing_gap_value=get_gtt_trailing_gap_value(),
+        atr_period_c=get_atr_period_c(),
+        atr_multiplier_c=get_atr_multiplier_c(),
     )
     body = html.encode("utf-8")
     response = make_response(body)
@@ -4077,7 +4326,7 @@ def paper_trading_live_toggle():
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
-VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE")
+VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C")
 
 STRATEGY_DESCRIPTIONS = {
     "EMA": "1) 5-EMA only, let it run - retired from selection (let losses run too deep waiting for a pattern reversal to confirm). Kept only for trades that already opened under it.",
@@ -4088,6 +4337,9 @@ STRATEGY_DESCRIPTIONS = {
     "ATR_TRAIL": "6) Hybrid ATR + trail: an ATR (Chandelier-style) stop protects the downside until +2% profit - stop = highest price since entry minus (ATR x multiplier), widening automatically in choppy conditions and tightening when calm. A -2% floor covers the trade until enough candle history exists for the first ATR reading. Once +2% is reached, hands off entirely to a plain 0.5% step trailing stop on the % gain, to lock in profit mechanically. Uses the ATR period/multiplier set below.",
     "EMA_SPOT_TRAIL": "7) 5-EMA (spot) trail with -2% floor: a hard -2% stop-loss protects the trade throughout. On top of that, the full quantity exits the moment the UNDERLYING stock (not the option premium) closes 2 consecutive candles beyond its own 5-EMA - below EMA(5) of the lows for a Buy, above EMA(5) of the highs for a Sell. Tracks the same clean trend line you'd watch on the spot chart, instead of the option premium's noisier candles.",
     "EMA_SPOT_PURE": "8) Pure 5-EMA (spot) trail, NO floor: same underlying-based 5-EMA rule as #7 (2 consecutive candles closing beyond EMA(5) of lows/highs), but with no -2% stop underneath it. The trade is never cut off before the EMA itself gets a chance to trail - deliberately unprotected on the downside, so a losing trade can run further than any other strategy here before this fires.",
+    "JOAT_HYBRID": f"9) JOAT-inspired Adaptive Hybrid Runner: everything runs off the UNDERLYING's own price move, not the option premium. A spot ATR (Chandelier-style) structural stop protects the trade, floored at {SPOT_FLOOR_PCT:g}% until enough candle history exists for the first ATR reading. At {SPOT_BOOK_PCT:g}% (spot), books half the qty and moves the rest to spot breakeven. The remaining half then trails via the underlying's own 5-EMA reversal pattern (same rule as #7/#8) instead of a further percentage trail. Uses the shared ATR period/multiplier set below.",
+    "JOAT_TEST_B": f"Test-B (JOAT-inspired): spot ATR structural stop (shared ATR period/multiplier, same as #6) until {SPOT_BOOK_PCT:g}% spot, then hands off entirely to the underlying's 5-EMA reversal trail - no half-booking. For comparing against #6's option-premium-based version and Test-C's wider ATR period.",
+    "JOAT_TEST_C": "Test-C (JOAT-inspired, wider ATR): identical to Test-B, but reads its OWN separate ATR period/multiplier (set below, defaults to 14x2 vs Test-B's 8x2) - kept as a distinct strategy specifically so its results never mix with Test-B's in the Stats breakdown, even if the shared ATR settings change later.",
 }
 
 
@@ -4123,6 +4375,25 @@ def paper_trading_atr_settings():
         return jsonify({"status": "error", "message": "atr_multiplier must be a number >= 0.1"}), 400
     set_setting("atr_period", str(period))
     set_setting("atr_multiplier", str(multiplier))
+    return jsonify({"status": "ok", "atr_period": period, "atr_multiplier": multiplier})
+
+
+@app.route("/api/paper-trading/atr-settings-c", methods=["POST"])
+def paper_trading_atr_settings_c():
+    """Same as atr-settings, but for Test-C's own dedicated ATR
+    period/multiplier - kept separate on purpose (see JOAT_TEST_C's
+    strategy description)."""
+    data = request.get_json(silent=True) or {}
+    try:
+        period = max(2, int(data.get("atr_period")))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "atr_period must be a whole number >= 2"}), 400
+    try:
+        multiplier = max(0.1, float(data.get("atr_multiplier")))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "atr_multiplier must be a number >= 0.1"}), 400
+    set_setting("atr_period_c", str(period))
+    set_setting("atr_multiplier_c", str(multiplier))
     return jsonify({"status": "ok", "atr_period": period, "atr_multiplier": multiplier})
 
 
