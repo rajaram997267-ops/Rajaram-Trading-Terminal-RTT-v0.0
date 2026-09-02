@@ -5,535 +5,91 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>RTT v0.0 - Settings</title>
   <style>
-    :root {
-      --bg: #0b0e14;
-      --panel: #131722;
-      --border: #1e222d;
-      --text: #e6e9f0;
-      --muted: #6b7280;
-      --green: #00c896;
-      --gold: #ffb800;
-      --red: #ff5370;
-    }
+    :root { --bg: #0b0e14; --panel: #131722; --border: #1e222d; --text: #e6e9f0; --muted: #6b7280; --green: #00c896; --gold: #ffb800; --red: #ff5370; }
     * { box-sizing: border-box; }
-    body {
-      font-family: 'Segoe UI', Arial, sans-serif;
-      background: var(--bg);
-      color: var(--text);
-      margin: 0;
-      padding: 24px;
-    }
-    a { color: var(--green); text-decoration: none; }
-    h2 { margin: 0 0 4px; }
-    .sub { color: var(--muted); font-size: 13px; }
-    .tabbar {
-      display: flex;
-      gap: 4px;
-      margin: 20px 0;
-      border-bottom: 1px solid var(--border);
-    }
-    .tabbar a {
-      padding: 10px 18px;
-      color: var(--muted);
-      font-size: 14px;
-      font-weight: 600;
-      border-bottom: 2px solid transparent;
-      margin-bottom: -1px;
-    }
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 24px; }
+    .tabbar { display: flex; gap: 4px; margin: 20px 0; border-bottom: 1px solid var(--border); }
+    .tabbar a { padding: 10px 18px; color: var(--muted); font-size: 14px; font-weight: 600; border-bottom: 2px solid transparent; margin-bottom: -1px; text-decoration: none; }
     .tabbar a.active { color: var(--text); border-bottom-color: var(--green); }
-    .tabbar a:hover { color: var(--text); }
-    .settings-box {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px;
-      margin-bottom: 20px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-      flex-wrap: wrap;
-    }
-    .settings-box input[type=text] {
-      flex: 1;
-      min-width: 240px;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 8px 12px;
-      border-radius: 6px;
-      font-family: monospace;
-    }
-    button {
-      background: var(--green);
-      color: #06110d;
-      border: none;
-      padding: 9px 16px;
-      border-radius: 8px;
-      cursor: pointer;
-      font-size: 13px;
-      font-weight: 600;
-    }
-    button.secondary {
-      background: var(--panel);
-      color: var(--text);
-      border: 1px solid var(--border);
-    }
-    button:hover { opacity: 0.9; }
-    select {
-      background: var(--bg);
-      border: 1px solid var(--border);
-      color: var(--text);
-      padding: 8px 12px;
-      border-radius: 6px;
-      font-size: 13px;
-    }
+    .settings-box { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 20px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .settings-box input[type=text] { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 6px; font-family: monospace; }
+    button { background: var(--green); color: #06110d; border: none; padding: 9px 16px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; }
+    button.secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
     .token-status { font-size: 12px; color: var(--muted); }
-    .token-status.saved { color: var(--green); }
-    .switch {
-      position: relative;
-      display: inline-block;
-      width: 40px;
-      height: 22px;
-      flex: none;
-    }
+    .switch { position: relative; display: inline-block; width: 40px; height: 22px; flex: none; }
     .switch input { opacity: 0; width: 0; height: 0; }
-    .slider {
-      position: absolute;
-      cursor: pointer;
-      top: 0; left: 0; right: 0; bottom: 0;
-      background-color: var(--border);
-      transition: .2s;
-      border-radius: 22px;
-    }
-    .slider:before {
-      position: absolute;
-      content: "";
-      height: 16px; width: 16px;
-      left: 3px; bottom: 3px;
-      background-color: var(--text);
-      transition: .2s;
-      border-radius: 50%;
-    }
-    input:checked + .slider { background-color: var(--red); }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: var(--border); transition: .2s; border-radius: 22px; }
+    .slider:before { position: absolute; content: ""; height: 16px; width: 16px; left: 3px; bottom: 3px; background-color: var(--text); transition: .2s; border-radius: 50%; }
+    input:checked + .slider { background-color: var(--green); }
     input:checked + .slider:before { transform: translateX(18px); }
   </style>
 </head>
 <body>
   <div>
     <h2>Settings <span style="color: var(--muted); font-weight: 400; font-size: 14px;">RTT v0.0</span></h2>
-    <div class="sub">Token, capital, live trading, exit strategy, and sector filter all live here</div>
   </div>
 
   <div class="tabbar">
-    <a href="/" class="{% if active_tab == 'dashboard' %}active{% endif %}">Dashboard</a>
-    <a href="/paper-trading" class="{% if active_tab == 'paper' %}active{% endif %}">Paper Trading</a>
-    <a href="/live-trading" class="{% if active_tab == 'live' %}active{% endif %}">Live Trading</a>
-    <a href="/stats" class="{% if active_tab == 'stats' %}active{% endif %}">Stats</a>
-    <a href="/websocket-stats" class="{% if active_tab == 'websocket_stats' %}active{% endif %}">WS Speed</a>
-    <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
+    <a href="/">Dashboard</a>
+    <a href="/paper-trading">Paper Trading</a>
+    <a href="/live-trading">Live Trading</a>
+    <a href="/settings" class="active">Settings</a>
   </div>
 
-  <div class="settings-box">
-    <span>Upstox access token:</span>
-    <input type="text" id="tokenInput" placeholder="Paste today's Upstox access token here">
-    <button class="secondary" onclick="saveToken()">Save token</button>
-    <span class="token-status {% if token_saved %}saved{% endif %}" id="tokenStatus">
-      {% if token_saved %}Token saved for today{% else %}No token saved yet{% endif %}
-    </span>
-  </div>
-
-  <div class="settings-box">
-    <span>Starting capital (Rs):</span>
-    <input type="text" id="capitalInput" style="max-width: 160px; flex: none;" value="{{ capital|int }}">
-    <button class="secondary" onclick="saveCapital()">Save amount</button>
-    <span class="token-status" id="capitalStatus">Only used to seed the account - once trades start closing, the balance compounds automatically</span>
-    <button style="background: var(--red); margin-left: auto;" onclick="resetPaperTrading()">Reset paper trading</button>
-  </div>
-
-  <div class="settings-box" style="border-color: {% if live_trading_enabled %}var(--red){% else %}var(--border){% endif %};">
-    <label class="switch">
-      <input type="checkbox" id="liveToggle" {% if live_trading_enabled %}checked{% endif %} onchange="toggleLiveTrading()">
-      <span class="slider"></span>
-    </label>
-    <span>Live trading (real Upstox orders)</span>
-    <span class="token-status" id="liveStatus" style="{% if live_trading_enabled %}color: var(--red);{% endif %}">
-      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. {% if live_entry_mode == "GTT" %}Entry + a trailing stop are combined into one GTT order at entry (GTT mode - see below).{% else %}A real -2% SL (Stop-Loss Limit) order is placed with Upstox at entry, so it protects the position even if this app is down.{% endif %}{% else %}OFF - paper trading only{% endif %}
-    </span>
-  </div>
-
-  <div class="settings-box">
-    <span>Live entry mode:</span>
-    <select id="liveEntryModeSelect" onchange="saveLiveEntryMode()">
-      <option value="SL" {% if live_entry_mode == "SL" %}selected{% endif %}>SL - direct entry + separate Stop-Loss Limit order (default, battle-tested)</option>
-      <option value="GTT" {% if live_entry_mode == "GTT" %}selected{% endif %}>GTT - entry + broker-side trailing stop combined into one order (newer, verify carefully)</option>
-    </select>
-    <span class="token-status" id="liveEntryModeStatus">
-      {% if live_entry_mode == "GTT" %}GTT mode - Upstox's own engine trails the stop server-side using the gap below. Recommended: verify your first GTT trade's fill and stop behavior directly in your Upstox order book before relying on it.{% else %}SL mode - this app polls and manages the exit itself every 5s, with the broker-side SL order as a downside floor.{% endif %}
-    </span>
-  </div>
-
-  <div class="settings-box">
-    <span>GTT trailing gap (used only in GTT mode):</span>
-    <select id="gttGapModeSelect" onchange="saveGttTrailingSettings()">
-      <option value="percent" {% if gtt_trailing_gap_mode == "percent" %}selected{% endif %}>Percent of entry price</option>
-      <option value="points" {% if gtt_trailing_gap_mode == "points" %}selected{% endif %}>Fixed points</option>
-    </select>
-    <input type="text" id="gttGapValueInput" value="{{ gtt_trailing_gap_value }}" style="max-width: 80px; text-align: center;" onchange="saveGttTrailingSettings()">
-    <span class="token-status" id="gttTrailingStatus">
-      Current: {{ gtt_trailing_gap_value }}{% if gtt_trailing_gap_mode == "percent" %}% of entry price{% else %} points{% endif %}, computed fresh at entry time
-    </span>
-  </div>
-
+  <!-- EXIT STRATEGY SELECTION -->
   <div class="settings-box">
     <span>Exit strategy for new trades:</span>
-    <select id="strategySelect" onchange="setStrategy(this.value)">
-      <option value="HALF_HALF_HARD4" {% if exit_strategy == "HALF_HALF_HARD4" %}selected{% endif %}>2) -2% SL, 2% half book, 4% full exit</option>
-      <option value="TRAIL_FROM_2" {% if exit_strategy == "TRAIL_FROM_2" %}selected{% endif %}>3) -2% SL, trail 100% qty from 2% (0.2% steps)</option>
-      <option value="FULL_AT_2" {% if exit_strategy == "FULL_AT_2" %}selected{% endif %}>4) -2% SL, full exit at 2%</option>
-      <option value="FULL_AT_4" {% if exit_strategy == "FULL_AT_4" %}selected{% endif %}>5) -2% SL, full exit at 4%</option>
-      <option value="ATR_TRAIL" {% if exit_strategy == "ATR_TRAIL" %}selected{% endif %}>6) ATR stop until +2%, then trail 0.5% steps</option>
-      <option value="EMA_SPOT_TRAIL" {% if exit_strategy == "EMA_SPOT_TRAIL" %}selected{% endif %}>7) 5-EMA (spot) trail, -2% floor</option>
-      <option value="EMA_SPOT_PURE" {% if exit_strategy == "EMA_SPOT_PURE" %}selected{% endif %}>8) Pure 5-EMA (spot) trail, no floor</option>
-      <option value="JOAT_HYBRID" {% if exit_strategy == "JOAT_HYBRID" %}selected{% endif %}>9) JOAT Hybrid: spot ATR -&gt; book 50% -&gt; spot 5-EMA trail</option>
-      <option value="JOAT_TEST_B" {% if exit_strategy == "JOAT_TEST_B" %}selected{% endif %}>Test-B: spot ATR (shared) -&gt; spot 5-EMA trail</option>
-      <option value="JOAT_TEST_C" {% if exit_strategy == "JOAT_TEST_C" %}selected{% endif %}>Test-C: spot ATR (own period) -&gt; spot 5-EMA trail</option>
+    <select id="strategySelect" style="background: var(--bg); color: var(--text); padding: 8px; border-radius: 6px;" onchange="setStrategy(this.value)">
+      <option value="TRAIL_FROM_2" {% if exit_strategy == "TRAIL_FROM_2" %}selected{% endif %}>Standard Trailing Stop</option>
+      <option value="MOMENTUM_CONFIRMED" {% if exit_strategy == "MOMENTUM_CONFIRMED" %}selected{% endif %}>10) RSI-EMA Dual Momentum</option>
     </select>
-    <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
   </div>
 
-  <div class="settings-box">
-    <span>ATR trailing stop settings:</span>
+  <!-- MOMENTUM CONFIGURATION BOX -->
+  <div class="settings-box" style="border: 1px solid var(--gold);">
+    <strong style="color: var(--gold); margin-right: 10px;">Momentum Config (Strategy #10):</strong>
     <span>Period:</span>
-    <input type="text" id="atrPeriodInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_period }}">
-    <span>Multiplier:</span>
-    <input type="text" id="atrMultiplierInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_multiplier }}">
-    <button class="secondary" onclick="saveAtrSettings()">Save</button>
-    <span class="token-status" id="atrSettingsStatus">Used by "6) ATR trailing stop", "9) JOAT Hybrid", and "Test-B" above. Changes apply immediately to any open trade using them too, not just new ones.</span>
-  </div>
-
-  <div class="settings-box">
-    <span>ATR settings for Test-C only:</span>
-    <span>Period:</span>
-    <input type="text" id="atrPeriodCInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_period_c }}">
-    <span>Multiplier:</span>
-    <input type="text" id="atrMultiplierCInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_multiplier_c }}">
-    <button class="secondary" onclick="saveAtrSettingsC()">Save</button>
-    <span class="token-status" id="atrSettingsCStatus">Kept separate from the shared ATR settings above specifically so Test-C's results stay distinct from Test-B's in the Stats breakdown.</span>
-  </div>
-
-  <div class="settings-box">
-    <span>Earliest entry time (IST):</span>
-    <input type="text" id="entryTimeFilterInput" placeholder="e.g. 09:45" style="max-width: 100px; flex: none; text-align: center;" value="{{ entry_time_filter }}">
-    <button class="secondary" onclick="saveEntryTimeFilter()">Save</button>
-    <button class="secondary" onclick="clearEntryTimeFilter()">Clear</button>
-    <span class="token-status" id="entryTimeFilterStatus">{% if entry_time_filter %}ON - no new trades open before {{ entry_time_filter }} IST{% else %}OFF - trades can open any time the market's open{% endif %}</span>
-  </div>
-
-  <div class="settings-box">
-    <label class="switch">
-      <input type="checkbox" id="sectorFilterToggle" {% if sector_filter_enabled %}checked{% endif %} onchange="toggleSectorFilter()">
+    <input type="text" id="momoRsiPeriod" style="width: 45px; text-align: center;" value="{{ momo_rsi_period }}">
+    <span>Call RSI < :</span>
+    <input type="text" id="momoRsiUpper" style="width: 45px; text-align: center;" value="{{ momo_rsi_upper }}">
+    <span>Put RSI > :</span>
+    <input type="text" id="momoRsiLower" style="width: 45px; text-align: center;" value="{{ momo_rsi_lower }}">
+    <span>EMA:</span>
+    <input type="text" id="momoEmaPeriod" style="width: 45px; text-align: center;" value="{{ momo_ema_period }}">
+    
+    <label class="switch" style="margin-left: 15px;">
+      <input type="checkbox" id="momoEmergToggle" {% if momo_emergency_enabled %}checked{% endif %}>
       <span class="slider"></span>
     </label>
-    <span>Sector momentum filter</span>
-    <span>Top</span>
-    <input type="text" id="sectorFilterTopN" value="{{ sector_filter_top_n }}" style="width: 40px; text-align: center;" onchange="toggleSectorFilter()">
-    <span class="token-status" id="sectorFilterStatus">
-      {% if sector_filter_enabled %}ON - Buy needs a top-{{ sector_filter_top_n }} sector, Sell needs a bottom-{{ sector_filter_top_n }} sector; everything else is skipped{% else %}OFF - every alert can open a trade, regardless of its sector's performance{% endif %}
-    </span>
-  </div>
-
-  <div class="settings-box">
-    <label class="switch">
-      <input type="checkbox" id="thetaSwitchToggle" {% if theta_switch_enabled %}checked{% endif %} onchange="toggleThetaSwitch()">
-      <span class="slider"></span>
-    </label>
-    <span>Auto-roll to next month expiry (theta protection)</span>
-    <span class="token-status" id="thetaSwitchStatus">
-      {% if theta_switch_enabled %}ON - once the nearest monthly expiry crosses into the back half of its trading-day cycle, new trades open in the NEXT monthly expiry instead{% else %}OFF - always uses the nearest monthly expiry, regardless of how close it is{% endif %}
-    </span>
+    <span style="font-size: 13px;">Enable Emergency RSI 50/55 & EMA 20 Overrides</span>
+    
+    <button class="secondary" style="margin-left: auto;" onclick="saveMomoSettings()">Save Configuration</button>
   </div>
 
   <script>
-    async function saveToken() {
-      const token = document.getElementById("tokenInput").value.trim();
-      if (!token) return;
-      const res = await fetch("/api/paper-trading/settings", {
+    async function saveMomoSettings() {
+      const payload = {
+        rsi_period: document.getElementById("momoRsiPeriod").value,
+        rsi_upper: document.getElementById("momoRsiUpper").value,
+        rsi_lower: document.getElementById("momoRsiLower").value,
+        ema_period: document.getElementById("momoEmaPeriod").value,
+        emergency_enabled: document.getElementById("momoEmergToggle").checked
+      };
+      const res = await fetch("/api/paper-trading/momo-settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ access_token: token }),
+        body: JSON.stringify(payload)
       });
-      const statusEl = document.getElementById("tokenStatus");
-      if (res.ok) {
-        statusEl.textContent = "Token saved for today";
-        statusEl.classList.add("saved");
-        document.getElementById("tokenInput").value = "";
-      } else {
-        statusEl.textContent = "Failed to save token";
-        statusEl.classList.remove("saved");
-      }
-    }
-
-    async function toggleLiveTrading() {
-      const checkbox = document.getElementById("liveToggle");
-      const statusEl = document.getElementById("liveStatus");
-      const enabled = checkbox.checked;
-      if (enabled && !confirm(
-        "This turns ON live trading. The NEXT Buy alert will place a real " +
-        "ATM option order on Upstox (Call for Buy alerts, Put for Sell alerts), sized off your actual available funds, " +
-        "with a -2% SL (Stop-Loss Limit) order placed right after entry. Continue?"
-      )) {
-        checkbox.checked = false;
-        return;
-      }
-      try {
-        const res = await fetch("/api/paper-trading/live-toggle", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled }),
-        });
-        const result = await res.json();
-        statusEl.textContent = result.live_trading_enabled
-          ? "ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. A real -2% SL (Stop-Loss Limit) order is placed with Upstox at entry, so it protects the position even if this app is down"
-          : "OFF - paper trading only";
-        statusEl.style.color = result.live_trading_enabled ? "var(--red)" : "";
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        checkbox.checked = !enabled;
-        console.error(err);
-      }
+      if (res.ok) alert("Momentum exit settings updated successfully!");
     }
 
     async function setStrategy(strategy) {
-      const statusEl = document.getElementById("strategyStatus");
-      try {
-        const res = await fetch("/api/paper-trading/strategy-toggle", {
+        await fetch("/api/paper-trading/strategy-toggle", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ strategy }),
+          body: JSON.stringify({ strategy })
         });
-        const result = await res.json();
-        statusEl.textContent = result.description || "";
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        console.error(err);
-      }
-    }
-
-    async function saveAtrSettings() {
-      const statusEl = document.getElementById("atrSettingsStatus");
-      const period = parseInt(document.getElementById("atrPeriodInput").value, 10);
-      const multiplier = parseFloat(document.getElementById("atrMultiplierInput").value);
-      if (!period || period < 2 || !multiplier || multiplier < 0.1) {
-        statusEl.textContent = "Enter a valid period (>=2) and multiplier (>=0.1)";
-        return;
-      }
-      try {
-        const res = await fetch("/api/paper-trading/atr-settings", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ atr_period: period, atr_multiplier: multiplier }),
-        });
-        const result = await res.json();
-        if (res.ok) {
-          statusEl.textContent = `Saved - ATR period ${result.atr_period}, multiplier ${result.atr_multiplier}`;
-        } else {
-          statusEl.textContent = result.message || "Failed to save";
-        }
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        console.error(err);
-      }
-    }
-
-    async function saveAtrSettingsC() {
-      const statusEl = document.getElementById("atrSettingsCStatus");
-      const period = parseInt(document.getElementById("atrPeriodCInput").value, 10);
-      const multiplier = parseFloat(document.getElementById("atrMultiplierCInput").value);
-      if (!period || period < 2 || !multiplier || multiplier < 0.1) {
-        statusEl.textContent = "Enter a valid period (>=2) and multiplier (>=0.1)";
-        return;
-      }
-      try {
-        const res = await fetch("/api/paper-trading/atr-settings-c", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ atr_period: period, atr_multiplier: multiplier }),
-        });
-        const result = await res.json();
-        if (res.ok) {
-          statusEl.textContent = `Saved - Test-C ATR period ${result.atr_period}, multiplier ${result.atr_multiplier}`;
-        } else {
-          statusEl.textContent = result.message || "Failed to save";
-        }
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        console.error(err);
-      }
-    }
-
-    async function saveEntryTimeFilter() {
-      const statusEl = document.getElementById("entryTimeFilterStatus");
-      const raw = document.getElementById("entryTimeFilterInput").value.trim();
-      if (raw && !/^\d{1,2}:\d{2}$/.test(raw)) {
-        statusEl.textContent = "Enter time as HH:MM, e.g. 09:45";
-        return;
-      }
-      try {
-        const res = await fetch("/api/paper-trading/entry-time-filter", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ entry_time_filter: raw }),
-        });
-        const result = await res.json();
-        if (res.ok) {
-          statusEl.textContent = result.entry_time_filter
-            ? `ON - no new trades open before ${result.entry_time_filter} IST`
-            : "OFF - trades can open any time the market's open";
-        } else {
-          statusEl.textContent = result.message || "Failed to save";
-        }
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        console.error(err);
-      }
-    }
-
-    async function clearEntryTimeFilter() {
-      document.getElementById("entryTimeFilterInput").value = "";
-      await saveEntryTimeFilter();
-    }
-
-    async function toggleSectorFilter() {
-      const checkbox = document.getElementById("sectorFilterToggle");
-      const topNInput = document.getElementById("sectorFilterTopN");
-      const statusEl = document.getElementById("sectorFilterStatus");
-      const enabled = checkbox.checked;
-      const topN = parseInt(topNInput.value, 10) || 5;
-      try {
-        const res = await fetch("/api/paper-trading/sector-filter-toggle", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled, top_n: topN }),
-        });
-        const result = await res.json();
-        topNInput.value = result.sector_filter_top_n;
-        statusEl.textContent = result.sector_filter_enabled
-          ? `ON - Buy needs a top-${result.sector_filter_top_n} sector, Sell needs a bottom-${result.sector_filter_top_n} sector; everything else is skipped`
-          : "OFF - every alert can open a trade, regardless of its sector's performance";
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        console.error(err);
-      }
-    }
-
-    async function toggleThetaSwitch() {
-      const checkbox = document.getElementById("thetaSwitchToggle");
-      const statusEl = document.getElementById("thetaSwitchStatus");
-      const enabled = checkbox.checked;
-      try {
-        const res = await fetch("/api/paper-trading/theta-switch-toggle", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ enabled }),
-        });
-        const result = await res.json();
-        statusEl.textContent = result.theta_switch_enabled
-          ? "ON - once the nearest monthly expiry crosses into the back half of its trading-day cycle, new trades open in the NEXT monthly expiry instead"
-          : "OFF - always uses the nearest monthly expiry, regardless of how close it is";
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        checkbox.checked = !enabled;
-        console.error(err);
-      }
-    }
-
-    async function saveLiveEntryMode() {
-      const select = document.getElementById("liveEntryModeSelect");
-      const statusEl = document.getElementById("liveEntryModeStatus");
-      const mode = select.value;
-      if (mode === "GTT" && !confirm(
-        "GTT entry mode combines your entry order and trailing stop into one broker-managed order. " +
-        "This is newer and less battle-tested than SL mode in this app - verify your first trade's " +
-        "fill and stop behavior directly in your Upstox order book. Continue?"
-      )) {
-        select.value = "SL";
-        return;
-      }
-      try {
-        const res = await fetch("/api/paper-trading/live-entry-mode", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ mode }),
-        });
-        const result = await res.json();
-        if (res.ok) {
-          statusEl.textContent = result.live_entry_mode === "GTT"
-            ? "GTT mode - Upstox's own engine trails the stop server-side using the gap below. Recommended: verify your first GTT trade's fill and stop behavior directly in your Upstox order book before relying on it."
-            : "SL mode - this app polls and manages the exit itself every 5s, with the broker-side SL order as a downside floor.";
-        } else {
-          statusEl.textContent = result.message || "Failed to save";
-        }
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        console.error(err);
-      }
-    }
-
-    async function saveGttTrailingSettings() {
-      const gapMode = document.getElementById("gttGapModeSelect").value;
-      const gapValue = parseFloat(document.getElementById("gttGapValueInput").value);
-      const statusEl = document.getElementById("gttTrailingStatus");
-      if (!gapValue || gapValue <= 0) {
-        statusEl.textContent = "Enter a valid positive gap value";
-        return;
-      }
-      try {
-        const res = await fetch("/api/paper-trading/gtt-trailing-settings", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ gap_mode: gapMode, gap_value: gapValue }),
-        });
-        const result = await res.json();
-        if (res.ok) {
-          statusEl.textContent = `Current: ${result.gap_value}${result.gap_mode === "percent" ? "% of entry price" : " points"}, computed fresh at entry time`;
-        } else {
-          statusEl.textContent = result.message || "Failed to save";
-        }
-      } catch (err) {
-        statusEl.textContent = "Failed to update - see console";
-        console.error(err);
-      }
-    }
-
-    async function saveCapital() {
-      const amount = parseFloat(document.getElementById("capitalInput").value);
-      const statusEl = document.getElementById("capitalStatus");
-      if (!amount || amount <= 0) {
-        statusEl.textContent = "Enter a valid amount greater than 0";
-        return;
-      }
-      const res = await fetch("/api/paper-trading/capital", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ capital: amount }),
-      });
-      if (res.ok) {
-        statusEl.textContent = `Saved - Rs ${amount} starting capital`;
-      } else {
-        statusEl.textContent = "Failed to save amount";
-      }
-    }
-
-    async function resetPaperTrading() {
-      if (!confirm("This deletes ALL paper trades (open and closed) and restarts from your starting capital. Continue?")) {
-        return;
-      }
-      const res = await fetch("/api/paper-trading/reset", { method: "POST" });
-      if (res.ok) {
         location.reload();
-      } else {
-        alert("Reset failed - see console");
-      }
     }
   </script>
 </body>
