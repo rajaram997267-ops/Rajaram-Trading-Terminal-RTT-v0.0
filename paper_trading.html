@@ -284,8 +284,8 @@
     {% if open_trades %}
     <table>
       <tr>
-        <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-        <th>Last checked price</th><th>Stop</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th>
+        <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry RSI</th><th>Entry time</th>
+        <th>Last checked price</th><th>Stop</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Last checked</th><th>Note</th><th></th>
       </tr>
       {% for t in open_trades %}
       <tr>
@@ -293,11 +293,13 @@
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
         <td>{{ t.quantity }}{% if t.target1_hit_time %}<div class="sub" style="font-size:11px; color: var(--gold);">T1: {{ t.target1_qty }} @ {{ t.target1_exit_price }}</div>{% endif %}</td>
         <td>{{ t.entry_price }}</td>
+        <td>{{ t.entry_rsi if t.entry_rsi is not none else "-" }}</td>
         <td>{{ t.entry_time[:19] }}</td>
         <td>{{ t.last_checked_price or "-" }}</td>
-        <td>{% if t.stop_info %}<div style="font-size:12px; color: var(--green);">{{ t.stop_info }}</div>{% endif %}{% if t.atr_value is not none %}<div class="sub" style="font-size:11px; color: var(--muted);">ATR: {{ t.atr_value }}</div>{% endif %}</td>
+        <td>{% if t.stop_info %}<div style="font-size:12px; color: var(--green);">{{ t.stop_info }}</div>{% endif %}{% if t.atr_value is not none %}<div class="sub" style="font-size:11px; color: var(--muted);">ATR: {{ t.atr_value }}</div>{% endif %}{% if t.rsi_value is not none %}<div class="sub" style="font-size:11px; color: var(--muted);">RSI: {{ t.rsi_value }}</div>{% endif %}</td>
         <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl if t.unrealized_pnl is not none else "-" }}</td>
         <td class="{% if t.unrealized_pnl_pct and t.unrealized_pnl_pct > 0 %}pnl-pos{% elif t.unrealized_pnl_pct and t.unrealized_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl_pct if t.unrealized_pnl_pct is not none else "-" }}{% if t.unrealized_pnl_pct is not none %}%{% endif %}</td>
+        <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
         <td>{{ (t.last_checked_time or "")[:19] }}</td>
         <td class="error-note">{{ t.last_error or "" }}</td>
         <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit({{ t.id }})">Exit Now</button></td>
@@ -329,8 +331,8 @@
         <div class="date-trades">
           <table>
             <tr>
-              <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Exit</th>
-              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th>
+              <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Entry RSI</th><th>Exit</th><th>Exit RSI</th>
+              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th>
             </tr>
             {% for t in group.trades %}
             <tr>
@@ -338,9 +340,12 @@
               <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
               <td>{{ t.quantity }}</td>
               <td>{{ t.entry_price }}</td>
+              <td>{{ t.entry_rsi if t.entry_rsi is not none else "-" }}</td>
               <td>{{ t.exit_price }}</td>
+              <td>{{ t.exit_rsi if t.exit_rsi is not none else "-" }}</td>
               <td class="{% if t.pnl and t.pnl > 0 %}pnl-pos{% elif t.pnl and t.pnl < 0 %}pnl-neg{% endif %}">{{ t.pnl }}</td>
               <td class="{% if t.pnl_pct and t.pnl_pct > 0 %}pnl-pos{% elif t.pnl_pct and t.pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.pnl_pct if t.pnl_pct is not none else "-" }}{% if t.pnl_pct is not none %}%{% endif %}</td>
+              <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
               <td>{{ t.balance_after }}</td>
               <td>{{ t.exit_reason }}</td>
               <td>{{ (t.exit_time or "")[:19] }}</td>
@@ -397,6 +402,13 @@
       return div.innerHTML;
     }
 
+    function rrClass(t) {
+      return (t.rr_multiple || 0) > 0 ? "pnl-pos" : ((t.rr_multiple || 0) < 0 ? "pnl-neg" : "");
+    }
+    function rrText(t) {
+      return (t.rr_multiple === null || t.rr_multiple === undefined) ? "-" : (t.rr_multiple >= 0 ? "+" : "") + t.rr_multiple.toFixed(2) + "R";
+    }
+
     function renderOpenTrades(trades) {
       const container = document.getElementById("openTradesContainer");
       if (trades.length === 0) {
@@ -407,17 +419,20 @@
         const pnlClass = t.unrealized_pnl > 0 ? "pnl-pos" : (t.unrealized_pnl < 0 ? "pnl-neg" : "");
         const pnlText = (t.unrealized_pnl === null || t.unrealized_pnl === undefined) ? "-" : t.unrealized_pnl;
         const pctText = (t.unrealized_pnl_pct === null || t.unrealized_pnl_pct === undefined) ? "-" : t.unrealized_pnl_pct + "%";
+        const entryRsiText = (t.entry_rsi === null || t.entry_rsi === undefined) ? "-" : t.entry_rsi;
         return `
         <tr>
           <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
           <td>${t.quantity}${t.target1_hit_time ? `<div class="sub" style="font-size:11px; color: var(--gold);">T1: ${t.target1_qty} @ ${t.target1_exit_price}</div>` : ""}</td>
           <td>${t.entry_price}</td>
+          <td>${entryRsiText}</td>
           <td>${(t.entry_time || "").slice(0, 19)}</td>
           <td>${t.last_checked_price || "-"}</td>
-          <td>${t.stop_info ? `<div style="font-size:12px; color: var(--green);">${escapeHtml(t.stop_info)}</div>` : ""}${(t.atr_value !== null && t.atr_value !== undefined) ? `<div class="sub" style="font-size:11px; color: var(--muted);">ATR: ${t.atr_value}</div>` : ""}</td>
+          <td>${t.stop_info ? `<div style="font-size:12px; color: var(--green);">${escapeHtml(t.stop_info)}</div>` : ""}${(t.atr_value !== null && t.atr_value !== undefined) ? `<div class="sub" style="font-size:11px; color: var(--muted);">ATR: ${t.atr_value}</div>` : ""}${(t.rsi_value !== null && t.rsi_value !== undefined) ? `<div class="sub" style="font-size:11px; color: var(--muted);">RSI: ${t.rsi_value}</div>` : ""}</td>
           <td class="${pnlClass}">${pnlText}</td>
           <td class="${pnlClass}">${pctText}</td>
+          <td class="${rrClass(t)}">${rrText(t)}</td>
           <td>${(t.last_checked_time || "").slice(0, 19)}</td>
           <td class="error-note">${escapeHtml(t.last_error || "")}</td>
           <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit(${t.id})">Exit Now</button></td>
@@ -426,8 +441,8 @@
       }).join("");
       container.innerHTML = `
         <table>
-          <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry time</th>
-              <th>Last checked price</th><th>Stop</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>Last checked</th><th>Note</th><th></th></tr>
+          <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry RSI</th><th>Entry time</th>
+              <th>Last checked price</th><th>Stop</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Last checked</th><th>Note</th><th></th></tr>
           ${rows}
         </table>
       `;
@@ -475,15 +490,20 @@
         const rows = g.trades.map(t => {
           const rowPnlClass = t.pnl > 0 ? "pnl-pos" : (t.pnl < 0 ? "pnl-neg" : "");
           const pctText = (t.pnl_pct === null || t.pnl_pct === undefined) ? "-" : t.pnl_pct + "%";
+          const entryRsiText = (t.entry_rsi === null || t.entry_rsi === undefined) ? "-" : t.entry_rsi;
+          const exitRsiText = (t.exit_rsi === null || t.exit_rsi === undefined) ? "-" : t.exit_rsi;
           return `
             <tr>
               <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}</td>
               <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
               <td>${t.quantity}</td>
               <td>${t.entry_price}</td>
+              <td>${entryRsiText}</td>
               <td>${t.exit_price}</td>
+              <td>${exitRsiText}</td>
               <td class="${rowPnlClass}">${t.pnl}</td>
               <td class="${rowPnlClass}">${pctText}</td>
+              <td class="${rrClass(t)}">${rrText(t)}</td>
               <td>${t.balance_after}</td>
               <td>${escapeHtml(t.exit_reason || "")}</td>
               <td>${(t.exit_time || "").slice(0, 19)}</td>
@@ -504,8 +524,8 @@
             </div>
             <div class="date-trades">
               <table>
-                <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Exit</th>
-                    <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th></tr>
+                <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Entry RSI</th><th>Exit</th><th>Exit RSI</th>
+                    <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th></tr>
                 ${rows}
               </table>
             </div>

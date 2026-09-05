@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import re
 import threading
 from collections import deque
 import time
@@ -445,7 +446,14 @@ def init_db():
                 live_gtt_order_id TEXT,
                 live_gtt_trailing_gap DOUBLE PRECISION,
                 spot_entry_price DOUBLE PRECISION,
-                spot_atr_trail_peak_price DOUBLE PRECISION
+                spot_atr_trail_peak_price DOUBLE PRECISION,
+                paper_strike DOUBLE PRECISION,
+                entry_rsi DOUBLE PRECISION,
+                exit_rsi DOUBLE PRECISION,
+                live_entry_rsi DOUBLE PRECISION,
+                live_exit_rsi DOUBLE PRECISION,
+                mae_pct DOUBLE PRECISION,
+                live_mae_pct DOUBLE PRECISION
             )
             """
         )
@@ -493,6 +501,14 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_gtt_trailing_gap DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS spot_entry_price DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS spot_atr_trail_peak_price DOUBLE PRECISION",
+            # RSI Momentum Exit strategy (#10) + system-wide R:R/RSI logging.
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS paper_strike DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_rsi DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_rsi DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_entry_rsi DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_rsi DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS mae_pct DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_mae_pct DOUBLE PRECISION",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -651,6 +667,128 @@ def get_atr_multiplier_c() -> float:
         return max(0.1, float(get_setting("atr_multiplier_c", "2")))
     except (TypeError, ValueError):
         return 2.0
+
+
+# ---------------------------------------------------------------------------
+# RSI Momentum Exit (#10) settings - every number here is user-editable from
+# Settings (see /api/paper-trading/rsi-settings) specifically so different
+# RSI/EMA/threshold combinations can be A/B tested against each other, same
+# spirit as the ATR period/multiplier above. All apply to the UNDERLYING's
+# own 5-min candles, not the option premium - see check_rsi_momentum_exit().
+def get_rsi_period() -> int:
+    """RSI lookback period (in 5-min candles). Defaults to 14 (standard)."""
+    try:
+        return max(2, int(get_setting("rsi_period", "14")))
+    except (TypeError, ValueError):
+        return 14
+
+
+def get_rsi_ema_period() -> int:
+    """EMA period used for the 'structure confirmation' leg (Close vs
+    EMA of Close, on the underlying). Defaults to 9."""
+    try:
+        return max(2, int(get_setting("rsi_ema_period", "9")))
+    except (TypeError, ValueError):
+        return 9
+
+
+def get_rsi_call_threshold() -> float:
+    """CALL side: momentum warning triggers once RSI drops below this.
+    ('Strong momentum' is simply RSI at/above this same line.) Defaults
+    to 70."""
+    try:
+        return float(get_setting("rsi_call_threshold", "70"))
+    except (TypeError, ValueError):
+        return 70.0
+
+
+def get_rsi_put_strong_threshold() -> float:
+    """PUT side: RSI at/below this counts as 'strong momentum' - purely
+    informational (shown in stop_info), not itself an exit trigger.
+    Defaults to 35."""
+    try:
+        return float(get_setting("rsi_put_strong_threshold", "35"))
+    except (TypeError, ValueError):
+        return 35.0
+
+
+def get_rsi_put_warning_threshold() -> float:
+    """PUT side: momentum warning triggers once RSI rises above this.
+    Deliberately a different number from the strong threshold (35) per
+    the original method - there's an intentional 35-45 neutral band that
+    counts as neither. Defaults to 45."""
+    try:
+        return float(get_setting("rsi_put_warning_threshold", "45"))
+    except (TypeError, ValueError):
+        return 45.0
+
+
+def get_rsi_confirm_candles() -> int:
+    """How many consecutive 5-min candles must hold the warning condition
+    before it counts as 'momentum confirmation'. Defaults to 2, per the
+    original method. Checked statelessly against the last N candles each
+    pass (same style as check_exit's 2-candle rule), not via a persisted
+    streak counter - so a missed poll or restart never desyncs it."""
+    try:
+        return max(1, int(get_setting("rsi_confirm_candles", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
+def get_rsi_deep_itm_moneyness_pct() -> float:
+    """How far spot must sit beyond the option's strike (as a % of
+    strike) before that option counts as 'Deep ITM' for enhancement #2's
+    widened threshold. Defaults to 3.0%."""
+    try:
+        return max(0.0, float(get_setting("rsi_deep_itm_moneyness_pct", "3.0")))
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def get_rsi_deep_itm_call_threshold() -> float:
+    """Widened CALL threshold used instead of get_rsi_call_threshold()
+    once the option is Deep ITM (needs a bigger RSI drop before exiting,
+    since a Deep ITM premium moves less per point of underlying than an
+    ATM/OTM one - see the doc's enhancement #2). Defaults to 60."""
+    try:
+        return float(get_setting("rsi_deep_itm_call_threshold", "60"))
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def get_rsi_deep_itm_put_warning_threshold() -> float:
+    """Widened PUT warning threshold for Deep ITM - symmetric extension
+    of the CALL side's 70->60 widening (45->55), applied in the opposite
+    direction since PUT momentum fades as RSI rises, not falls. Not
+    stated explicitly in the original doc (only the CALL side was), so
+    this default is inferred by symmetry - tune freely. Defaults to 55."""
+    try:
+        return float(get_setting("rsi_deep_itm_put_warning_threshold", "55"))
+    except (TypeError, ValueError):
+        return 55.0
+
+
+def get_rsi_midday_start() -> str:
+    """Start of the mid-day session (IST, 'HH:MM') where enhancement #3's
+    tighter exit trigger applies. Defaults to 11:30."""
+    return get_setting("rsi_midday_start", "11:30") or "11:30"
+
+
+def get_rsi_midday_end() -> str:
+    """End of the mid-day session (IST, 'HH:MM'). Defaults to 13:30."""
+    return get_setting("rsi_midday_end", "13:30") or "13:30"
+
+
+def get_rsi_midday_confirm_candles() -> int:
+    """Consecutive-candle requirement used INSTEAD of
+    get_rsi_confirm_candles() during the mid-day session - lower means a
+    faster (tighter) exit trigger when theta decay is highest relative
+    to price movement. Defaults to 1 (exit on the first warning candle,
+    no second candle needed, still gated by the structure/EMA check)."""
+    try:
+        return max(1, int(get_setting("rsi_midday_confirm_candles", "1")))
+    except (TypeError, ValueError):
+        return 1
 
 
 # Spot-based thresholds shared by the JOAT-inspired strategies (#9, Test-B,
@@ -909,10 +1047,24 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # is required. Harmless/unused for every other strategy - just one
     # extra LTP lookup, only when a token is available.
     spot_entry_price = None
+    spot_entry_candles = None
     if access_token:
         spot_instrument_key = get_instrument_key(symbol)
         if spot_instrument_key:
             spot_entry_price = get_ltp(spot_instrument_key, access_token)
+            try:
+                spot_entry_candles = fetch_5min_candles(spot_instrument_key, access_token)
+            except Exception:
+                spot_entry_candles = None
+
+    # Logged on every trade regardless of exit strategy (not just RSI
+    # Momentum trades) so every strategy's entries/exits can be compared
+    # on the same underlying-momentum footing - see _current_underlying_rsi.
+    entry_rsi_val = _current_underlying_rsi(symbol, access_token, spot_entry_candles)
+    # Strike of the option paper trading actually bought, if any - needed
+    # later by the RSI Momentum Exit's Deep-ITM check (enhancement #2),
+    # which compares the current spot price against this strike.
+    paper_strike_val = option["strike"] if option else None
 
     with get_db() as conn:
         row = conn.execute(
@@ -920,12 +1072,14 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
             INSERT INTO paper_trades
                 (symbol, direction, entry_price, entry_time, status, quantity,
                  paper_instrument_key, paper_option_label, last_error,
-                 strategy, original_quantity, alert_name, scan_name, spot_entry_price)
-            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 strategy, original_quantity, alert_name, scan_name, spot_entry_price,
+                 paper_strike, entry_rsi)
+            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (symbol, category, entry_price, now, quantity, paper_instrument_key, paper_option_label,
-             fallback_note, entry_strategy, quantity, alert_name or None, scan_name or None, spot_entry_price),
+             fallback_note, entry_strategy, quantity, alert_name or None, scan_name or None, spot_entry_price,
+             paper_strike_val, entry_rsi_val),
         ).fetchone()
         conn.commit()
 
@@ -972,7 +1126,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                             live_quantity = lots * lot_size
                             label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
 
-                            if get_live_entry_mode() == "GTT":
+                            if get_live_entry_mode() == "GTT" and entry_strategy != "RSI_MOMENTUM":
                                 # GTT mode: entry AND trailing stop-loss are
                                 # ONE combined order - Upstox's engine
                                 # places the entry when the ENTRY leg fires
@@ -1056,11 +1210,12 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                             UPDATE paper_trades
                                             SET live_status = 'OPEN', live_quantity = ?,
                                                 live_instrument_key = ?, live_option_label = ?, live_entry_price = ?,
-                                                live_gtt_order_id = ?, live_gtt_trailing_gap = ?, live_error = ?
+                                                live_gtt_order_id = ?, live_gtt_trailing_gap = ?, live_error = ?,
+                                                live_entry_rsi = ?
                                             WHERE id = ?
                                             """,
                                             (live_quantity, option["instrument_key"], label, live_entry_price,
-                                             gtt_result["gtt_order_id"], trailing_gap, gtt_note, trade_id),
+                                             gtt_result["gtt_order_id"], trailing_gap, gtt_note, entry_rsi_val, trade_id),
                                         )
                                         conn.commit()
 
@@ -1101,10 +1256,28 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                     # visible that this position is running
                                     # without a broker-side net and needs the
                                     # app's own monitoring.
+                                    #
+                                    # EXCEPTION - RSI_MOMENTUM: skipped
+                                    # entirely, by explicit user choice, to
+                                    # match paper exactly (no fixed floor at
+                                    # all - see the doc this strategy came
+                                    # from). This position has NOTHING
+                                    # resting at the broker; the RSI/EMA
+                                    # check in run_paper_trade_check is the
+                                    # only thing that will ever close it. If
+                                    # this app/server/network goes down,
+                                    # there is no safety net until it's back
+                                    # up and this trade's next poll runs.
                                     live_sl_order_id = None
                                     live_sl_trigger_price = None
                                     sl_note = None
-                                    if live_entry_price:
+                                    if entry_strategy == "RSI_MOMENTUM":
+                                        sl_note = (
+                                            "RSI Momentum Exit: no broker-side stop placed by design (matches "
+                                            "paper exactly, per your choice) - the RSI/EMA check is the only "
+                                            "thing that closes this position. No safety net if this app goes down."
+                                        )
+                                    elif live_entry_price:
                                         live_sl_trigger_price = round(live_entry_price * 0.98, 1)
                                         live_sl_limit_price = round(live_entry_price * 0.96, 1)
                                         sl_result = place_live_order(
@@ -1124,11 +1297,13 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                             UPDATE paper_trades
                                             SET live_status = 'OPEN', live_entry_order_id = ?, live_quantity = ?,
                                                 live_instrument_key = ?, live_option_label = ?, live_entry_price = ?,
-                                                live_sl_order_id = ?, live_sl_trigger_price = ?, live_error = ?
+                                                live_sl_order_id = ?, live_sl_trigger_price = ?, live_error = ?,
+                                                live_entry_rsi = ?
                                             WHERE id = ?
                                             """,
                                             (result["order_id"], live_quantity, option["instrument_key"], label,
-                                             live_entry_price, live_sl_order_id, live_sl_trigger_price, sl_note, trade_id),
+                                             live_entry_price, live_sl_order_id, live_sl_trigger_price, sl_note,
+                                             entry_rsi_val, trade_id),
                                         )
                                         conn.commit()
                                 else:
@@ -1159,6 +1334,40 @@ def calculate_ema(values: list[float], period: int = 5) -> list[float | None]:
     for price in values[period:]:
         ema.append(price * k + ema[-1] * (1 - k))
     return ema
+
+
+def calculate_rsi(closes: list[float], period: int = 14) -> list[float | None]:
+    """Wilder's RSI (the standard definition - same smoothing style as
+    calculate_atr above, for consistency). Same length as `closes`, with
+    None for the seeding gap at the start (needs `period` price changes
+    before the first reading, i.e. `period + 1` closes minimum)."""
+    n = len(closes)
+    if n < period + 1:
+        return [None] * n
+
+    gains: list[float] = [0.0]
+    losses: list[float] = [0.0]
+    for i in range(1, n):
+        delta = closes[i] - closes[i - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+
+    rsi: list[float | None] = [None] * period
+    avg_gain = sum(gains[1:period + 1]) / period
+    avg_loss = sum(losses[1:period + 1]) / period
+
+    def _rsi_from_avgs(ag: float, al: float) -> float:
+        if al == 0:
+            return 100.0 if ag > 0 else 50.0
+        rs = ag / al
+        return 100 - (100 / (1 + rs))
+
+    rsi.append(_rsi_from_avgs(avg_gain, avg_loss))
+    for i in range(period + 1, n):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        rsi.append(_rsi_from_avgs(avg_gain, avg_loss))
+    return rsi
 
 
 def calculate_atr(candles: list[tuple[float, float, float, float]], period: int = 10) -> list[float | None]:
@@ -1226,6 +1435,80 @@ def check_exit(direction: str, candles: list[tuple[float, float, float, float]])
             if not (closes[i] > opens[i] and closes[i] > ema_line[i]):
                 return False, None
         return True, closes[-1]
+
+
+def check_rsi_momentum_exit(
+    direction: str,
+    candles: list[tuple[float, float, float, float]],
+    *,
+    rsi_period: int,
+    ema_period: int,
+    call_threshold: float,
+    put_warning_threshold: float,
+    confirm_candles: int,
+) -> tuple[bool, dict]:
+    """RSI Momentum Exit (strategy #10) - runs on the UNDERLYING's own
+    5-min candles (open, high, low, close), oldest first, per the
+    original doc's own worked examples (ITC/Bharti Airtel/Adani Ports/
+    Reliance moves), not the option premium.
+
+    Exit fires once BOTH of these hold on the latest candle:
+      - Momentum confirmation: the last `confirm_candles` candles ALL
+        show RSI < call_threshold (Buy/Call) or RSI > put_warning_threshold
+        (Sell/Put) - checked statelessly against the candle series itself
+        each call (same style as check_exit's 2-candle rule), so a missed
+        poll or app restart can never desync a persisted counter.
+      - Structure confirmation: the latest candle's Close is below
+        (Call) or above (Put) the EMA(ema_period) of Close.
+    Always returns an `info` dict with the current rsi/ema/close reading
+    (even when not triggered, or when there isn't enough data yet) so
+    callers can log/display it regardless of whether an exit fired."""
+    closes = [c[3] for c in candles]
+    rsi_line = calculate_rsi(closes, rsi_period)
+    ema_line = calculate_ema(closes, ema_period)
+    current_rsi = rsi_line[-1] if rsi_line else None
+    current_ema = ema_line[-1] if ema_line else None
+    current_close = closes[-1] if closes else None
+    info = {"rsi": current_rsi, "ema": current_ema, "close": current_close}
+
+    needed = max(confirm_candles, 1)
+    if len(candles) < needed or current_rsi is None or current_ema is None:
+        return False, info
+
+    for i in range(-1, -needed - 1, -1):
+        if rsi_line[i] is None:
+            return False, info
+        if direction == "Buy":
+            if not (rsi_line[i] < call_threshold):
+                return False, info
+        else:
+            if not (rsi_line[i] > put_warning_threshold):
+                return False, info
+
+    structure_ok = current_close < current_ema if direction == "Buy" else current_close > current_ema
+    return structure_ok, info
+
+
+def _is_deep_itm_option(direction: str, strike: float | None, spot_price: float | None, moneyness_pct: float) -> bool:
+    """True if the option is far enough in-the-money (spot beyond strike
+    by at least moneyness_pct%) to count as 'Deep ITM' for the RSI
+    Momentum Exit's enhancement #2. False (never widen) if the strike or
+    current spot price isn't available - the standard ATM/OTM threshold
+    is the safe default when moneyness can't be determined."""
+    if not strike or spot_price is None:
+        return False
+    if direction == "Buy":  # long Call - ITM as spot rises above strike
+        return spot_price >= strike * (1 + moneyness_pct / 100)
+    else:  # long Put - ITM as spot falls below strike
+        return spot_price <= strike * (1 - moneyness_pct / 100)
+
+
+def _is_midday_session(midday_start: str, midday_end: str) -> bool:
+    """True if the current IST clock time falls in [midday_start,
+    midday_end) - the mid-day lull window where the RSI Momentum Exit's
+    enhancement #3 applies a tighter (faster) exit trigger."""
+    now_hhmm = (datetime.utcnow() + IST_OFFSET).strftime("%H:%M")
+    return midday_start <= now_hhmm < midday_end
 
 
 _instrument_cache: dict[str, str] = {}
@@ -1813,6 +2096,34 @@ def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[flo
     # Upstox candle format: [timestamp, open, high, low, close, volume, oi]
     raw_candles = sorted(raw_candles, key=lambda c: c[0])
     return resample_1min_to_5min(raw_candles)
+
+
+def _current_underlying_rsi(symbol: str, access_token: str | None, existing_candles: list | None = None) -> float | None:
+    """Current RSI of the UNDERLYING's 5-min candles - the value logged
+    as entry_rsi/exit_rsi (and their live_ counterparts) on every trade
+    regardless of exit strategy, so all strategies can be compared on
+    the same underlying-momentum footing. Reuses `existing_candles` when
+    the caller already fetched the underlying's spot_candles this pass
+    (RSI Momentum / JOAT-family strategies always do) - only strategies
+    that don't otherwise need spot candles cause an extra Upstox call
+    here, and even then only at the moment a trade actually opens or
+    closes, never on every poll."""
+    if not access_token:
+        return None
+    try:
+        candles = existing_candles
+        if not candles:
+            spot_key = get_instrument_key(symbol)
+            if not spot_key:
+                return None
+            candles = fetch_5min_candles(spot_key, access_token)
+        if not candles:
+            return None
+        rsi_line = calculate_rsi([c[3] for c in candles], get_rsi_period())
+        current = rsi_line[-1] if rsi_line else None
+        return round(current, 2) if current is not None else None
+    except Exception:
+        return None
 
 
 def fetch_intraday_candles_with_volume(instrument_key: str, access_token: str) -> list[tuple[float, float, float, float, float]]:
@@ -2719,7 +3030,7 @@ def run_paper_trade_check() -> dict:
             # strategy - it's a second Upstox call on top of the option's
             # own, so no reason to pay for it otherwise.
             spot_candles = None
-            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C"):
+            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM"):
                 spot_key = get_instrument_key(symbol)
                 if spot_key:
                     spot_candles = fetch_5min_candles(spot_key, access_token)
@@ -2729,6 +3040,33 @@ def run_paper_trade_check() -> dict:
             # series itself (check_exit reads closes directly), so this
             # didn't exist as a variable until now.
             spot_last_price = spot_candles[-1][3] if spot_candles else None
+
+            # RSI Momentum Exit's trigger, computed ONCE here (rather than
+            # separately in the paper branch below and the live section
+            # further down) specifically so it stays correct even when
+            # paper has already closed but live is still open (they can
+            # diverge - see the note on live_instrument_key below) - this
+            # runs unconditionally off trade["strategy"], not paper's own
+            # OPEN/CLOSED status, so live can always find it.
+            rsi_momentum_triggered = False
+            rsi_momentum_info: dict = {}
+            if strategy == "RSI_MOMENTUM" and spot_candles:
+                rsi_confirm_candles = get_rsi_confirm_candles()
+                rsi_midday_active = _is_midday_session(get_rsi_midday_start(), get_rsi_midday_end())
+                if rsi_midday_active:
+                    rsi_confirm_candles = get_rsi_midday_confirm_candles()
+                rsi_call_threshold = get_rsi_call_threshold()
+                rsi_put_warning_threshold = get_rsi_put_warning_threshold()
+                rsi_deep_itm = _is_deep_itm_option(trade["direction"], trade["paper_strike"], spot_last_price, get_rsi_deep_itm_moneyness_pct())
+                if rsi_deep_itm:
+                    rsi_call_threshold = get_rsi_deep_itm_call_threshold()
+                    rsi_put_warning_threshold = get_rsi_deep_itm_put_warning_threshold()
+                rsi_momentum_triggered, rsi_momentum_info = check_rsi_momentum_exit(
+                    trade["direction"], spot_candles,
+                    rsi_period=get_rsi_period(), ema_period=get_rsi_ema_period(),
+                    call_threshold=rsi_call_threshold, put_warning_threshold=rsi_put_warning_threshold,
+                    confirm_candles=rsi_confirm_candles,
+                )
 
             # Paper and live each resolve their own ATM contract at entry
             # time (both from the same alert price, moments apart) - in
@@ -2760,6 +3098,20 @@ def run_paper_trade_check() -> dict:
             pct_change = None
             if last_price is not None and entry_price:
                 pct_change = (last_price - entry_price) / entry_price * 100
+
+            # Running Max Adverse Excursion (MAE) - the worst % this trade
+            # has been down since entry, tracked regardless of which
+            # strategy/branch runs below. This is what powers the R:R
+            # (risk:reward) figure shown next to P&L% - most strategies
+            # here don't use one single fixed stop-loss, so the realized
+            # MAE is used as the stand-in for "risk" (a standard practice
+            # for post-hoc R-multiples). Persisted near the end of this
+            # loop iteration, deliberately as its own small update rather
+            # than threaded into every branch below, so it can never
+            # change what any exit/trail/partial decision actually does.
+            new_mae_pct = trade["mae_pct"]
+            if pct_change is not None:
+                new_mae_pct = pct_change if new_mae_pct is None else min(new_mae_pct, pct_change)
 
             if trade["status"] != "OPEN":
                 pass  # paper side already closed - only live-side logic below applies
@@ -3050,6 +3402,25 @@ def run_paper_trade_check() -> dict:
                             exited, exit_price = True, last_price
                             exit_reason = "5-EMA (spot) reversal after ATR phase"
 
+            elif strategy == "RSI_MOMENTUM" and last_price is not None:
+                # #10 (RSI Momentum Exit - Rajaram's method): runs off the
+                # UNDERLYING's RSI and EMA-of-Close, not the option
+                # premium (same reasoning as the JOAT family above - the
+                # doc's own worked examples analyze how ITC/Bharti
+                # Airtel/Adani Ports/Reliance themselves moved). No fixed
+                # stop-loss floor - purely momentum/structure driven, per
+                # the original method ("very simple and very effective").
+                # Trigger itself is computed once, above, shared with
+                # live's own exit check further below (see
+                # rsi_momentum_triggered) so both sides agree exactly.
+                if rsi_momentum_triggered:
+                    exited, exit_price = True, last_price
+                    rsi_disp = f"{rsi_momentum_info['rsi']:.1f}" if rsi_momentum_info.get("rsi") is not None else "?"
+                    exit_reason = (
+                        f"RSI momentum exit (RSI {rsi_disp}, close "
+                        f"{'<' if trade['direction'] == 'Buy' else '>'} EMA{get_rsi_ema_period()})"
+                    )
+
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
                 # kept only so trades that opened under the old single
@@ -3198,7 +3569,26 @@ def run_paper_trade_check() -> dict:
             # here would make live's own +2%/trailing checkpoints wrong
             # relative to what was actually paid.
             live_entry_ref = trade["live_entry_price"] if trade["live_entry_price"] is not None else entry_price
-            if not live_exited and trade["live_status"] == "OPEN" and live_last_price is not None and live_entry_ref:
+            # Live's own running MAE (Max Adverse Excursion) - same idea
+            # as new_mae_pct above but sized off the real fill price, for
+            # live's own R:R figure. Computed unconditionally (not only
+            # inside the trailing-check block below) so it stays current
+            # even while live is just holding, between threshold crossings.
+            new_live_mae_pct = trade["live_mae_pct"]
+            if live_last_price is not None and live_entry_ref:
+                live_pct_now = (live_last_price - live_entry_ref) / live_entry_ref * 100
+                new_live_mae_pct = live_pct_now if new_live_mae_pct is None else min(new_live_mae_pct, live_pct_now)
+            if strategy == "RSI_MOMENTUM":
+                # Pure RSI Momentum for live, by explicit user choice - no
+                # broker floor, no percentage trail. The SAME trigger
+                # computed once above (rsi_momentum_triggered) that
+                # decides paper's exit also closes live - both sides
+                # agree exactly, since there's nothing else to check.
+                if not live_exited and trade["live_status"] == "OPEN" and rsi_momentum_triggered:
+                    live_exited = True
+                    rsi_disp = f"{rsi_momentum_info['rsi']:.1f}" if rsi_momentum_info.get("rsi") is not None else "?"
+                    live_exit_reason_val = f"RSI momentum exit (RSI {rsi_disp}) - no broker floor, by design"
+            elif not live_exited and trade["live_status"] == "OPEN" and live_last_price is not None and live_entry_ref:
                 live_pct_change = (live_last_price - live_entry_ref) / live_entry_ref * 100
                 if trade["live_trail_high_pct"] is None:
                     if live_pct_change >= 2.0:
@@ -3219,19 +3609,21 @@ def run_paper_trade_check() -> dict:
                 # place, just record it. Skip _close_live_position_if_any
                 # entirely (it would try to cancel/sell an already-closed
                 # position).
+                live_exit_rsi_val = _current_underlying_rsi(symbol, access_token, spot_candles)
                 with get_db() as conn:
                     conn.execute(
                         """
                         UPDATE paper_trades
                         SET live_status = 'CLOSED', live_exit_reason = ?,
-                            live_exit_price = ?, live_exit_time = ?
+                            live_exit_price = ?, live_exit_time = ?, live_exit_rsi = ?, live_mae_pct = ?
                         WHERE id = ?
                         """,
-                        (live_exit_reason_val, live_sl_fired_price, now, trade["id"]),
+                        (live_exit_reason_val, live_sl_fired_price, now, live_exit_rsi_val, new_live_mae_pct, trade["id"]),
                     )
                     conn.commit()
             elif live_exited:
                 live_exit_order_id, live_exit_error, live_fill_price = _close_live_position_if_any(trade, access_token)
+                live_exit_rsi_val = _current_underlying_rsi(symbol, access_token, spot_candles)
                 with get_db() as conn:
                     conn.execute(
                         """
@@ -3241,19 +3633,31 @@ def run_paper_trade_check() -> dict:
                             live_error = COALESCE(?, live_error),
                             live_exit_reason = ?,
                             live_exit_price = COALESCE(?, live_exit_price),
-                            live_exit_time = CASE WHEN ? THEN ? ELSE live_exit_time END
+                            live_exit_time = CASE WHEN ? THEN ? ELSE live_exit_time END,
+                            live_exit_rsi = ?, live_mae_pct = ?
                         WHERE id = ?
                         """,
                         (live_exit_order_id is not None, live_exit_order_id, live_exit_error,
                          live_exit_reason_val, live_fill_price,
-                         live_exit_order_id is not None, now, trade["id"]),
+                         live_exit_order_id is not None, now, live_exit_rsi_val, new_live_mae_pct, trade["id"]),
                     )
                     conn.commit()
             elif live_trail_update is not None:
                 with get_db() as conn:
                     conn.execute(
-                        "UPDATE paper_trades SET live_trail_high_pct = ? WHERE id = ?",
-                        (live_trail_update, trade["id"]),
+                        "UPDATE paper_trades SET live_trail_high_pct = ?, live_mae_pct = ? WHERE id = ?",
+                        (live_trail_update, new_live_mae_pct, trade["id"]),
+                    )
+                    conn.commit()
+            elif trade["live_status"] == "OPEN" and new_live_mae_pct != trade["live_mae_pct"]:
+                # Live is open and simply holding this pass (no trail
+                # advance, no exit) - still worth persisting the running
+                # MAE so it doesn't go stale for the whole "holding"
+                # portion of the trade's life, which is most of it.
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE paper_trades SET live_mae_pct = ? WHERE id = ?",
+                        (new_live_mae_pct, trade["id"]),
                     )
                     conn.commit()
 
@@ -3311,15 +3715,23 @@ def run_paper_trade_check() -> dict:
                     original_qty = trade["original_quantity"] or qty
                     capital_used = entry_price * original_qty
                     pnl_pct = round((total_pnl / capital_used) * 100, 2) if capital_used else 0
+                    # Logged on every closing trade regardless of exit
+                    # strategy (see _current_underlying_rsi) - reuses
+                    # spot_candles when this pass already fetched them
+                    # (RSI Momentum/JOAT strategies), else one extra
+                    # Upstox call right now, only because this trade is
+                    # actually closing this pass.
+                    exit_rsi_val = _current_underlying_rsi(symbol, access_token, spot_candles)
                     conn.execute(
                         """
                         UPDATE paper_trades
                         SET status = 'CLOSED', exit_price = ?, exit_time = ?,
                             pnl = ?, pnl_pct = ?, exit_reason = ?, last_checked_price = ?,
-                            last_checked_time = ?, last_error = NULL
+                            last_checked_time = ?, last_error = NULL, exit_rsi = ?, mae_pct = ?
                         WHERE id = ?
                         """,
-                        (exit_price, now, total_pnl, pnl_pct, exit_reason, last_price, now, trade["id"]),
+                        (exit_price, now, total_pnl, pnl_pct, exit_reason, last_price, now,
+                         exit_rsi_val, new_mae_pct, trade["id"]),
                     )
                     closed += 1
                 elif trade["status"] == "OPEN":
@@ -3844,6 +4256,72 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                     t["atr_value"] = round(current_atr, 2)
                     t["stop_info"] = f"ATR structural stop (spot): {stop_price_spot:.2f}"
 
+        elif strategy == "RSI_MOMENTUM":
+            # Runs off the underlying, same fresh-fetch pattern as the
+            # JOAT family above. Shows the live RSI/EMA reading and which
+            # tuning (Deep ITM widening / mid-day tightening) is active
+            # right now, not just the eventual exit_reason.
+            direction = t.get("direction")
+            spot_candles = None
+            spot_key = t.get("symbol")
+            if spot_key and access_token:
+                try:
+                    resolved_key = get_instrument_key(spot_key)
+                    if resolved_key:
+                        spot_candles = fetch_5min_candles(resolved_key, access_token)
+                except Exception:
+                    spot_candles = None
+            if not spot_candles:
+                t["stop_info"] = "Waiting for underlying candle data"
+                t["atr_value"] = None
+                t["rsi_value"] = None
+                continue
+
+            confirm_candles = get_rsi_confirm_candles()
+            midday_active = _is_midday_session(get_rsi_midday_start(), get_rsi_midday_end())
+            if midday_active:
+                confirm_candles = get_rsi_midday_confirm_candles()
+            call_threshold = get_rsi_call_threshold()
+            put_warning_threshold = get_rsi_put_warning_threshold()
+            deep_itm = _is_deep_itm_option(direction, t.get("paper_strike"), spot_candles[-1][3], get_rsi_deep_itm_moneyness_pct())
+            if deep_itm:
+                call_threshold = get_rsi_deep_itm_call_threshold()
+                put_warning_threshold = get_rsi_deep_itm_put_warning_threshold()
+
+            _, rsi_info = check_rsi_momentum_exit(
+                direction, spot_candles,
+                rsi_period=get_rsi_period(), ema_period=get_rsi_ema_period(),
+                call_threshold=call_threshold, put_warning_threshold=put_warning_threshold,
+                confirm_candles=confirm_candles,
+            )
+            current_rsi = rsi_info.get("rsi")
+            current_ema = rsi_info.get("ema")
+            t["rsi_value"] = round(current_rsi, 2) if current_rsi is not None else None
+            t["atr_value"] = None
+            threshold_note = f"CALL<{call_threshold:g}" if direction == "Buy" else f"PUT>{put_warning_threshold:g}"
+            tags = [tag for tag, on in (("Deep ITM", deep_itm), ("mid-day tighter", midday_active)) if on]
+            tag_note = f" [{', '.join(tags)}]" if tags else ""
+            # Momentum state label - "Strong"/"Warning" for a Call is just
+            # which side of the one CALL threshold RSI sits on; a Put has
+            # a genuine third "Neutral" band (the doc's own 35-45 gap)
+            # since its strong/warning thresholds differ, so this is the
+            # one place get_rsi_put_strong_threshold() actually gets read.
+            if current_rsi is None:
+                momentum_state = "?"
+            elif direction == "Buy":
+                momentum_state = "Strong" if current_rsi >= call_threshold else "Warning"
+            else:
+                put_strong = get_rsi_put_strong_threshold()
+                if current_rsi <= put_strong:
+                    momentum_state = "Strong"
+                elif current_rsi > put_warning_threshold:
+                    momentum_state = "Warning"
+                else:
+                    momentum_state = "Neutral"
+            ema_note = f", EMA{get_rsi_ema_period()} {current_ema:.2f}" if current_ema is not None else ""
+            rsi_disp = f"{current_rsi:.1f}" if current_rsi is not None else "?"
+            t["stop_info"] = f"RSI {rsi_disp} [{momentum_state}] (need {threshold_note} x{confirm_candles}{ema_note}){tag_note}"
+
         else:
             t["stop_info"] = None
             t["atr_value"] = None
@@ -3903,6 +4381,33 @@ def attach_running_balance(closed_trades_desc: list[dict], starting_capital: flo
         t["balance_after"] = round(running, 2)
 
 
+def compute_rr(reward_pct: float | None, mae_pct: float | None) -> float | None:
+    """Realized R-multiple: how many times the trade's worst drawdown
+    (mae_pct, the running Max Adverse Excursion - see run_paper_trade_check)
+    its actual/current %gain (reward_pct) came out to. Most strategies
+    here don't use one single fixed stop-loss, so MAE stands in for
+    'risk' - this is the standard way to get an R:R figure after the
+    fact without one. None (shown as '-') when the trade never drew down
+    meaningfully, since dividing by ~0 would report a huge, meaningless
+    multiple rather than a useful one."""
+    if reward_pct is None:
+        return None
+    risk = abs(mae_pct) if mae_pct is not None and mae_pct < 0 else 0
+    if risk < 0.05:
+        return None
+    return round(reward_pct / risk, 2)
+
+
+def attach_rr(trades: list[dict], reward_field: str, mae_field: str) -> None:
+    """Adds 'rr_multiple' to each trade in the list - see compute_rr.
+    reward_field/mae_field name the keys already on each trade dict to
+    read the reward (a %gain, realized or unrealized) and risk (stored
+    MAE %) from - e.g. ("pnl_pct", "mae_pct") for paper closed trades,
+    ("unrealized_pnl_pct", "live_mae_pct") for live open trades."""
+    for t in trades:
+        t["rr_multiple"] = compute_rr(t.get(reward_field), t.get(mae_field))
+
+
 def group_trades_by_date(trades: list[dict], date_field: str = "exit_time", pnl_field: str = "pnl") -> list[dict]:
     """Groups closed trades by exit date into [{"date", "total_pnl",
     "trades"}, ...], most recent date first - powers the collapsible
@@ -3941,6 +4446,7 @@ def paper_trading():
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
+    attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct")
     attach_stop_info(open_trades, get_setting("upstox_access_token"))
 
     total_pnl = sum(t["pnl"] for t in closed_trades if t["pnl"] is not None)
@@ -3951,6 +4457,7 @@ def paper_trading():
     token_saved = bool(get_setting("upstox_access_token"))
     capital = get_capital()
     attach_running_balance(closed_trades, capital)
+    attach_rr(closed_trades, "pnl_pct", "mae_pct")
     closed_by_date = group_trades_by_date(closed_trades)
     current_capital = get_current_capital()
     live_trading_enabled = get_live_trading_enabled()
@@ -4158,6 +4665,18 @@ def settings_page():
         gtt_trailing_gap_value=get_gtt_trailing_gap_value(),
         atr_period_c=get_atr_period_c(),
         atr_multiplier_c=get_atr_multiplier_c(),
+        rsi_period=get_rsi_period(),
+        rsi_ema_period=get_rsi_ema_period(),
+        rsi_call_threshold=get_rsi_call_threshold(),
+        rsi_put_strong_threshold=get_rsi_put_strong_threshold(),
+        rsi_put_warning_threshold=get_rsi_put_warning_threshold(),
+        rsi_confirm_candles=get_rsi_confirm_candles(),
+        rsi_deep_itm_moneyness_pct=get_rsi_deep_itm_moneyness_pct(),
+        rsi_deep_itm_call_threshold=get_rsi_deep_itm_call_threshold(),
+        rsi_deep_itm_put_warning_threshold=get_rsi_deep_itm_put_warning_threshold(),
+        rsi_midday_start=get_rsi_midday_start(),
+        rsi_midday_end=get_rsi_midday_end(),
+        rsi_midday_confirm_candles=get_rsi_midday_confirm_candles(),
     )
     body = html.encode("utf-8")
     response = make_response(body)
@@ -4183,11 +4702,15 @@ def live_trading_page():
     closed_trades = [dict(t) for t in closed_trades]
     failed_trades = [dict(t) for t in failed_trades]
     attach_live_unrealized_pnl(open_trades)
+    attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct")
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
         entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
         exit_p = t.get("live_exit_price") if t.get("live_exit_price") is not None else (t.get("exit_price") or 0)
         t["live_pnl_value"] = round((exit_p - entry) * qty, 2)
+        capital_used = entry * qty
+        t["live_pnl_pct"] = round((t["live_pnl_value"] / capital_used) * 100, 2) if capital_used else None
+    attach_rr(closed_trades, "live_pnl_pct", "live_mae_pct")
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     closed_by_date = group_trades_by_date(closed_trades, date_field="live_exit_time", pnl_field="live_pnl_value")
@@ -4238,11 +4761,15 @@ def live_trading_data():
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
     attach_live_unrealized_pnl(open_trades)
+    attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct")
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
         entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
         exit_p = t.get("live_exit_price") if t.get("live_exit_price") is not None else (t.get("exit_price") or 0)
         t["live_pnl_value"] = round((exit_p - entry) * qty, 2)
+        capital_used = entry * qty
+        t["live_pnl_pct"] = round((t["live_pnl_value"] / capital_used) * 100, 2) if capital_used else None
+    attach_rr(closed_trades, "live_pnl_pct", "live_mae_pct")
     failed_trades = [dict(t) for t in failed_trades]
 
     live_stats = compute_live_stats(open_trades, closed_trades)
@@ -4272,7 +4799,9 @@ def paper_trading_data():
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
+    attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct")
     attach_running_balance(closed_trades, get_capital())
+    attach_rr(closed_trades, "pnl_pct", "mae_pct")
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     access_token = get_setting("upstox_access_token")
@@ -4326,7 +4855,7 @@ def paper_trading_live_toggle():
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
-VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C")
+VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM")
 
 STRATEGY_DESCRIPTIONS = {
     "EMA": "1) 5-EMA only, let it run - retired from selection (let losses run too deep waiting for a pattern reversal to confirm). Kept only for trades that already opened under it.",
@@ -4340,7 +4869,9 @@ STRATEGY_DESCRIPTIONS = {
     "JOAT_HYBRID": f"9) JOAT-inspired Adaptive Hybrid Runner: everything runs off the UNDERLYING's own price move, not the option premium. A spot ATR (Chandelier-style) structural stop protects the trade, floored at {SPOT_FLOOR_PCT:g}% until enough candle history exists for the first ATR reading. At {SPOT_BOOK_PCT:g}% (spot), books half the qty and moves the rest to spot breakeven. The remaining half then trails via the underlying's own 5-EMA reversal pattern (same rule as #7/#8) instead of a further percentage trail. Uses the shared ATR period/multiplier set below.",
     "JOAT_TEST_B": f"Test-B (JOAT-inspired): spot ATR structural stop (shared ATR period/multiplier, same as #6) until {SPOT_BOOK_PCT:g}% spot, then hands off entirely to the underlying's 5-EMA reversal trail - no half-booking. For comparing against #6's option-premium-based version and Test-C's wider ATR period.",
     "JOAT_TEST_C": "Test-C (JOAT-inspired, wider ATR): identical to Test-B, but reads its OWN separate ATR period/multiplier (set below, defaults to 14x2 vs Test-B's 8x2) - kept as a distinct strategy specifically so its results never mix with Test-B's in the Stats breakdown, even if the shared ATR settings change later.",
+    "RSI_MOMENTUM": "10) RSI Momentum Exit (Rajaram's method): runs off the UNDERLYING's own RSI and EMA-of-Close (not the option premium) - Call exits once RSI has held below the CALL threshold for N consecutive 5-min candles AND that candle's Close is below the EMA (Put mirrors this: RSI above its threshold + Close above the EMA). Automatically widens its RSI threshold for a Deep ITM option (needs a bigger RSI move before exiting, since Deep ITM premium moves less per point of underlying) and tightens (fewer confirming candles needed) during the mid-day session when theta decay bites hardest. No fixed stop-loss floor - purely momentum/structure driven, per the original method. Every number (RSI/EMA periods, thresholds, candle counts, Deep-ITM %, mid-day window) is editable below so different combinations can be tested against each other. WARNING if live trading is on: by your own choice, live positions under this strategy have NO broker-side stop-loss at all (matches paper exactly) - the RSI/EMA check is the ONLY thing that closes them, so a position can sit fully unprotected if this app goes down, your connection drops, or (at the start of a trading day) there simply isn't enough candle history yet for RSI to be computable.",
 }
+
 
 
 @app.route("/api/paper-trading/strategy-toggle", methods=["POST"])
@@ -4395,6 +4926,48 @@ def paper_trading_atr_settings_c():
     set_setting("atr_period_c", str(period))
     set_setting("atr_multiplier_c", str(multiplier))
     return jsonify({"status": "ok", "atr_period": period, "atr_multiplier": multiplier})
+
+
+@app.route("/api/paper-trading/rsi-settings", methods=["POST"])
+def paper_trading_rsi_settings():
+    """Sets every tunable number the RSI Momentum Exit strategy (#10)
+    uses - RSI/EMA periods, CALL/PUT thresholds, confirm-candle count,
+    Deep-ITM widening, and the mid-day tightening window. All saved
+    together since they're meant to be tuned as a set. Takes effect
+    immediately for any open RSI_MOMENTUM trade (read fresh every pass),
+    same as the ATR settings above."""
+    data = request.get_json(silent=True) or {}
+    try:
+        rsi_period = max(2, int(data.get("rsi_period")))
+        ema_period = max(2, int(data.get("rsi_ema_period")))
+        call_threshold = float(data.get("rsi_call_threshold"))
+        put_strong = float(data.get("rsi_put_strong_threshold"))
+        put_warning = float(data.get("rsi_put_warning_threshold"))
+        confirm_candles = max(1, int(data.get("rsi_confirm_candles")))
+        deep_itm_moneyness = max(0.0, float(data.get("rsi_deep_itm_moneyness_pct")))
+        deep_itm_call = float(data.get("rsi_deep_itm_call_threshold"))
+        deep_itm_put_warning = float(data.get("rsi_deep_itm_put_warning_threshold"))
+        midday_confirm_candles = max(1, int(data.get("rsi_midday_confirm_candles")))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "all RSI Momentum fields must be numbers"}), 400
+    midday_start = (data.get("rsi_midday_start") or "").strip()
+    midday_end = (data.get("rsi_midday_end") or "").strip()
+    if not re.fullmatch(r"[0-2]\d:[0-5]\d", midday_start or "") or not re.fullmatch(r"[0-2]\d:[0-5]\d", midday_end or ""):
+        return jsonify({"status": "error", "message": "mid-day start/end must be HH:MM"}), 400
+
+    set_setting("rsi_period", str(rsi_period))
+    set_setting("rsi_ema_period", str(ema_period))
+    set_setting("rsi_call_threshold", str(call_threshold))
+    set_setting("rsi_put_strong_threshold", str(put_strong))
+    set_setting("rsi_put_warning_threshold", str(put_warning))
+    set_setting("rsi_confirm_candles", str(confirm_candles))
+    set_setting("rsi_deep_itm_moneyness_pct", str(deep_itm_moneyness))
+    set_setting("rsi_deep_itm_call_threshold", str(deep_itm_call))
+    set_setting("rsi_deep_itm_put_warning_threshold", str(deep_itm_put_warning))
+    set_setting("rsi_midday_start", midday_start)
+    set_setting("rsi_midday_end", midday_end)
+    set_setting("rsi_midday_confirm_candles", str(midday_confirm_candles))
+    return jsonify({"status": "ok"})
 
 
 @app.route("/api/paper-trading/entry-time-filter", methods=["POST"])
