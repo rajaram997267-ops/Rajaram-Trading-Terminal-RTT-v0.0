@@ -197,6 +197,7 @@
       <option value="JOAT_HYBRID" {% if exit_strategy == "JOAT_HYBRID" %}selected{% endif %}>9) JOAT Hybrid: spot ATR -&gt; book 50% -&gt; spot 5-EMA trail</option>
       <option value="JOAT_TEST_B" {% if exit_strategy == "JOAT_TEST_B" %}selected{% endif %}>Test-B: spot ATR (shared) -&gt; spot 5-EMA trail</option>
       <option value="JOAT_TEST_C" {% if exit_strategy == "JOAT_TEST_C" %}selected{% endif %}>Test-C: spot ATR (own period) -&gt; spot 5-EMA trail</option>
+      <option value="RSI_MOMENTUM" {% if exit_strategy == "RSI_MOMENTUM" %}selected{% endif %}>10) RSI Momentum Exit (spot RSI + EMA9)</option>
     </select>
     <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
   </div>
@@ -219,6 +220,45 @@
     <input type="text" id="atrMultiplierCInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_multiplier_c }}">
     <button class="secondary" onclick="saveAtrSettingsC()">Save</button>
     <span class="token-status" id="atrSettingsCStatus">Kept separate from the shared ATR settings above specifically so Test-C's results stay distinct from Test-B's in the Stats breakdown.</span>
+  </div>
+
+  <div class="settings-box" style="flex-wrap: wrap; row-gap: 10px;">
+    <span style="flex-basis: 100%; font-weight: 600;">RSI Momentum Exit (10) settings - every value below is editable so different combinations can be tested against each other:</span>
+
+    <span>RSI period:</span>
+    <input type="text" id="rsiPeriodInput" style="max-width: 50px; flex: none; text-align: center;" value="{{ rsi_period }}">
+    <span>EMA (structure) period:</span>
+    <input type="text" id="rsiEmaPeriodInput" style="max-width: 50px; flex: none; text-align: center;" value="{{ rsi_ema_period }}">
+    <span>Confirm candles:</span>
+    <input type="text" id="rsiConfirmCandlesInput" style="max-width: 50px; flex: none; text-align: center;" value="{{ rsi_confirm_candles }}">
+
+    <div style="flex-basis: 100%; height: 0;"></div>
+    <span>CALL warning (RSI &lt;):</span>
+    <input type="text" id="rsiCallThresholdInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_call_threshold }}">
+    <span>PUT strong (RSI &le;):</span>
+    <input type="text" id="rsiPutStrongInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_put_strong_threshold }}">
+    <span>PUT warning (RSI &gt;):</span>
+    <input type="text" id="rsiPutWarningInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_put_warning_threshold }}">
+
+    <div style="flex-basis: 100%; height: 0;"></div>
+    <span>Deep ITM moneyness (%):</span>
+    <input type="text" id="rsiDeepItmMoneynessInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_deep_itm_moneyness_pct }}">
+    <span>Deep ITM CALL threshold:</span>
+    <input type="text" id="rsiDeepItmCallInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_deep_itm_call_threshold }}">
+    <span>Deep ITM PUT threshold:</span>
+    <input type="text" id="rsiDeepItmPutInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_deep_itm_put_warning_threshold }}">
+
+    <div style="flex-basis: 100%; height: 0;"></div>
+    <span>Mid-day window (IST):</span>
+    <input type="text" id="rsiMiddayStartInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_midday_start }}">
+    <span>to</span>
+    <input type="text" id="rsiMiddayEndInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_midday_end }}">
+    <span>Mid-day confirm candles:</span>
+    <input type="text" id="rsiMiddayConfirmCandlesInput" style="max-width: 50px; flex: none; text-align: center;" value="{{ rsi_midday_confirm_candles }}">
+
+    <div style="flex-basis: 100%; height: 0;"></div>
+    <button class="secondary" onclick="saveRsiSettings()">Save RSI Momentum settings</button>
+    <span class="token-status" id="rsiSettingsStatus">Used by "10) RSI Momentum Exit" above, off the UNDERLYING's candles. Changes apply immediately to any open trade already using it, not just new ones.</span>
   </div>
 
   <div class="settings-box">
@@ -365,6 +405,47 @@
         } else {
           statusEl.textContent = result.message || "Failed to save";
         }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveRsiSettings() {
+      const statusEl = document.getElementById("rsiSettingsStatus");
+      const payload = {
+        rsi_period: parseInt(document.getElementById("rsiPeriodInput").value, 10),
+        rsi_ema_period: parseInt(document.getElementById("rsiEmaPeriodInput").value, 10),
+        rsi_confirm_candles: parseInt(document.getElementById("rsiConfirmCandlesInput").value, 10),
+        rsi_call_threshold: parseFloat(document.getElementById("rsiCallThresholdInput").value),
+        rsi_put_strong_threshold: parseFloat(document.getElementById("rsiPutStrongInput").value),
+        rsi_put_warning_threshold: parseFloat(document.getElementById("rsiPutWarningInput").value),
+        rsi_deep_itm_moneyness_pct: parseFloat(document.getElementById("rsiDeepItmMoneynessInput").value),
+        rsi_deep_itm_call_threshold: parseFloat(document.getElementById("rsiDeepItmCallInput").value),
+        rsi_deep_itm_put_warning_threshold: parseFloat(document.getElementById("rsiDeepItmPutInput").value),
+        rsi_midday_start: document.getElementById("rsiMiddayStartInput").value.trim(),
+        rsi_midday_end: document.getElementById("rsiMiddayEndInput").value.trim(),
+        rsi_midday_confirm_candles: parseInt(document.getElementById("rsiMiddayConfirmCandlesInput").value, 10),
+      };
+      for (const [key, val] of Object.entries(payload)) {
+        if (key === "rsi_midday_start" || key === "rsi_midday_end") continue;
+        if (val === null || val === undefined || Number.isNaN(val)) {
+          statusEl.textContent = `Enter a valid number for ${key}`;
+          return;
+        }
+      }
+      if (!/^\d{2}:\d{2}$/.test(payload.rsi_midday_start) || !/^\d{2}:\d{2}$/.test(payload.rsi_midday_end)) {
+        statusEl.textContent = "Mid-day start/end must be HH:MM (e.g. 11:30)";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/rsi-settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const result = await res.json();
+        statusEl.textContent = res.ok ? "Saved - RSI Momentum settings updated" : (result.message || "Failed to save");
       } catch (err) {
         statusEl.textContent = "Failed to update - see console";
         console.error(err);

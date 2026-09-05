@@ -220,8 +220,8 @@
     {% if open_trades %}
     <table>
       <tr>
-        <th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry price</th>
-        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>Status</th><th>Entry order id</th><th>Error</th><th></th>
+        <th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry price</th><th>Entry RSI</th>
+        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Status</th><th>Entry order id</th><th>Error</th><th></th>
       </tr>
       {% for t in open_trades %}
       <tr>
@@ -229,8 +229,11 @@
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
         <td>{{ t.live_quantity }}{% if t.live_trail_high_pct is not none %}<div class="sub" style="font-size:11px; color: var(--green);">Trail stop: {{ "%.1f"|format(t.live_trail_high_pct - 0.5) }}%</div>{% endif %}</td>
         <td>{{ t.live_entry_price if t.live_entry_price is not none else t.entry_price }}</td>
+        <td>{{ t.live_entry_rsi if t.live_entry_rsi is not none else (t.entry_rsi if t.entry_rsi is not none else "-") }}</td>
         <td>{{ t.last_checked_price or "-" }}</td>
         <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl if t.unrealized_pnl is not none else "-" }}</td>
+        <td class="{% if t.unrealized_pnl_pct and t.unrealized_pnl_pct > 0 %}pnl-pos{% elif t.unrealized_pnl_pct and t.unrealized_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl_pct if t.unrealized_pnl_pct is not none else "-" }}{% if t.unrealized_pnl_pct is not none %}%{% endif %}</td>
+        <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
         <td><span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span></td>
         <td>{{ t.live_entry_order_id or "-" }}</td>
         <td class="error-note">{{ t.live_error or "" }}</td>
@@ -299,8 +302,8 @@
         <div class="date-trades">
           <table>
             <tr>
-              <th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry</th><th>Exit</th>
-              <th>P&amp;L (Rs)</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th>
+              <th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry</th><th>Entry RSI</th><th>Exit</th><th>Exit RSI</th>
+              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th>
             </tr>
             {% for t in group.trades %}
             <tr>
@@ -308,8 +311,12 @@
               <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
               <td>{{ t.live_quantity }}</td>
               <td>{{ t.live_entry_price if t.live_entry_price is not none else t.entry_price }}</td>
+              <td>{{ t.live_entry_rsi if t.live_entry_rsi is not none else (t.entry_rsi if t.entry_rsi is not none else "-") }}</td>
               <td>{{ t.live_exit_price if t.live_exit_price is not none else t.exit_price }}</td>
+              <td>{{ t.live_exit_rsi if t.live_exit_rsi is not none else (t.exit_rsi if t.exit_rsi is not none else "-") }}</td>
               <td class="{% if t.live_pnl_value and t.live_pnl_value > 0 %}pnl-pos{% elif t.live_pnl_value and t.live_pnl_value < 0 %}pnl-neg{% endif %}">{{ t.live_pnl_value }}</td>
+              <td class="{% if t.live_pnl_pct and t.live_pnl_pct > 0 %}pnl-pos{% elif t.live_pnl_pct and t.live_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.live_pnl_pct if t.live_pnl_pct is not none else "-" }}{% if t.live_pnl_pct is not none %}%{% endif %}</td>
+              <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
               <td>{{ t.live_exit_reason or t.exit_reason }}</td>
               <td><span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span></td>
               <td>{{ t.live_entry_order_id or "-" }}</td>
@@ -378,6 +385,13 @@
       container.innerHTML = html;
     }
 
+    function rrClass(t) {
+      return (t.rr_multiple || 0) > 0 ? "pnl-pos" : ((t.rr_multiple || 0) < 0 ? "pnl-neg" : "");
+    }
+    function rrText(t) {
+      return (t.rr_multiple === null || t.rr_multiple === undefined) ? "-" : (t.rr_multiple >= 0 ? "+" : "") + t.rr_multiple.toFixed(2) + "R";
+    }
+
     function renderOpenTrades(trades) {
       const container = document.getElementById("openTradesContainer");
       if (trades.length === 0) {
@@ -387,6 +401,8 @@
       const rows = trades.map(t => {
         const pnlClass = t.unrealized_pnl > 0 ? "pnl-pos" : (t.unrealized_pnl < 0 ? "pnl-neg" : "");
         const pnlText = (t.unrealized_pnl === null || t.unrealized_pnl === undefined) ? "-" : t.unrealized_pnl;
+        const pctText = (t.unrealized_pnl_pct === null || t.unrealized_pnl_pct === undefined) ? "-" : t.unrealized_pnl_pct + "%";
+        const entryRsi = (t.live_entry_rsi !== null && t.live_entry_rsi !== undefined) ? t.live_entry_rsi : ((t.entry_rsi !== null && t.entry_rsi !== undefined) ? t.entry_rsi : "-");
         const trailNote = (t.live_trail_high_pct !== null && t.live_trail_high_pct !== undefined)
           ? `<div class="sub" style="font-size:11px; color: var(--green);">Trail stop: ${(t.live_trail_high_pct - 0.5).toFixed(1)}%</div>` : "";
         return `
@@ -395,8 +411,11 @@
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
           <td>${t.live_quantity}${trailNote}</td>
           <td>${(t.live_entry_price !== null && t.live_entry_price !== undefined) ? t.live_entry_price : t.entry_price}</td>
+          <td>${entryRsi}</td>
           <td>${t.last_checked_price || "-"}</td>
           <td class="${pnlClass}">${pnlText}</td>
+          <td class="${pnlClass}">${pctText}</td>
+          <td class="${rrClass(t)}">${rrText(t)}</td>
           <td><span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span></td>
           <td>${t.live_entry_order_id || "-"}</td>
           <td class="error-note">${escapeHtml(t.live_error || "")}</td>
@@ -406,8 +425,8 @@
       }).join("");
       container.innerHTML = `
         <table>
-          <tr><th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry price</th>
-              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>Status</th><th>Entry order id</th><th>Error</th><th></th></tr>
+          <tr><th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry price</th><th>Entry RSI</th>
+              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Status</th><th>Entry order id</th><th>Error</th><th></th></tr>
           ${rows}
         </table>
       `;
@@ -452,14 +471,22 @@
           const pnlClassRow = t.live_pnl_value > 0 ? "pnl-pos" : (t.live_pnl_value < 0 ? "pnl-neg" : "");
           const exitPrice = (t.live_exit_price !== null && t.live_exit_price !== undefined) ? t.live_exit_price : t.exit_price;
           const exitReason = t.live_exit_reason || t.exit_reason || "";
+          const entryRsi = (t.live_entry_rsi !== null && t.live_entry_rsi !== undefined) ? t.live_entry_rsi : ((t.entry_rsi !== null && t.entry_rsi !== undefined) ? t.entry_rsi : "-");
+          const exitRsi = (t.live_exit_rsi !== null && t.live_exit_rsi !== undefined) ? t.live_exit_rsi : ((t.exit_rsi !== null && t.exit_rsi !== undefined) ? t.exit_rsi : "-");
+          const pctText = (t.live_pnl_pct === null || t.live_pnl_pct === undefined) ? "-" : t.live_pnl_pct + "%";
+          const pctClass = (t.live_pnl_pct || 0) > 0 ? "pnl-pos" : ((t.live_pnl_pct || 0) < 0 ? "pnl-neg" : "");
           return `
             <tr>
               <td>${escapeHtml(t.symbol)}${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)}</div>` : ""}</td>
               <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
               <td>${t.live_quantity}</td>
               <td>${(t.live_entry_price !== null && t.live_entry_price !== undefined) ? t.live_entry_price : t.entry_price}</td>
+              <td>${entryRsi}</td>
               <td>${exitPrice}</td>
+              <td>${exitRsi}</td>
               <td class="${pnlClassRow}">${t.live_pnl_value}</td>
+              <td class="${pctClass}">${pctText}</td>
+              <td class="${rrClass(t)}">${rrText(t)}</td>
               <td>${escapeHtml(exitReason)}</td>
               <td><span class="live-badge live-${t.live_status || 'NONE'}">${t.live_status || 'NONE'}</span></td>
               <td>${t.live_entry_order_id || "-"}</td>
@@ -481,8 +508,8 @@
             </div>
             <div class="date-trades">
               <table>
-                <tr><th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry</th><th>Exit</th>
-                    <th>P&amp;L (Rs)</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th></tr>
+                <tr><th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry</th><th>Entry RSI</th><th>Exit</th><th>Exit RSI</th>
+                    <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th></tr>
                 ${rows}
               </table>
             </div>
