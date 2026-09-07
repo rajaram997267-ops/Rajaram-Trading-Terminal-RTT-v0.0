@@ -2562,41 +2562,71 @@ def _ws_run(access_token: str) -> None:
             time.sleep(5)
             continue
 
-        # Monitor loop: only treat the feed as dead (and reconnect) once
-        # it's genuinely gone quiet for a while with subscriptions active -
-        # not the instant connect() happens to return.
-        quiet_checks = 0
+        # NOTE: the staleness watchdog used to live here, as a loop right
+        # after streamer.connect() - but that only ever runs if connect()
+        # actually returns. In production this SDK's connect() blocks for
+        # the life of the connection (run_forever-style), so that in-loop
+        # watchdog was dead code the whole time a connection was open: a
+        # feed that went silent (13 ticks then nothing for 45+ minutes)
+        # sat there forever showing "streaming" with connect_attempts/
+        # reconnect_count frozen, because the code that would have caught
+        # it never got a turn to run. See _ws_watchdog_loop below, which
+        # runs on its own always-alive thread instead, independent of
+        # whether this thread is currently stuck inside connect().
         while True:
-            time.sleep(10)
-            if _ws_debug["status"] == "error":
-                break  # the "error" event fired above - go reconnect
+            time.sleep(30)
+
+
+def _ws_watchdog_loop() -> None:
+    """Independent of _ws_run's own thread on purpose - see the note left
+    in place of the old in-loop monitor above. Runs for the life of the
+    process, checking _ws_debug regardless of whether _ws_run's thread is
+    currently blocked inside streamer.connect(). If the feed has gone
+    quiet for too long, forces a fresh reconnect rather than trusting the
+    old thread to ever notice on its own."""
+    STALE_AFTER_SECONDS = 90
+    while True:
+        time.sleep(20)
+        try:
+            status = _ws_debug.get("status")
+            if status in ("stale_reconnecting", "connecting", "not_started", "sdk_not_installed"):
+                continue  # already mid-reconnect, or nothing to watch yet
             last_msg = _ws_debug.get("last_message_at")
+            connected_since = _ws_debug.get("connected_since")
+            now = datetime.utcnow()
+            age = None
             if last_msg:
-                age = (datetime.utcnow() - datetime.fromisoformat(last_msg)).total_seconds()
-                if age < 60:
-                    quiet_checks = 0
-                    continue
-            # No early-exit for "nothing subscribed yet" - the streamer
-            # always connects with at least the Nifty 50 fallback key (see
-            # initial_keys above), so ticks should be flowing within
-            # seconds of a genuinely successful connection regardless of
-            # whether any real trade is open. Silence here almost always
-            # means the connection itself never actually succeeded (a
-            # rejected handshake that fired a 'close' event instead of an
-            # 'error' event, for instance) - gating this on
-            # _ws_subscribed_keys being non-empty meant a dead connection
-            # with no open trade could sit stuck forever, never retrying,
-            # never picking up a freshly-saved token. That's exactly what
-            # was happening: connect_attempts staying frozen at 1 no
-            # matter how long the actual connection had been dead.
-            quiet_checks += 1
-            if quiet_checks >= 3:  # ~30s of silence
+                age = (now - datetime.fromisoformat(last_msg)).total_seconds()
+            elif connected_since:
+                # "streaming" but not a single tick received yet
+                age = (now - datetime.fromisoformat(connected_since)).total_seconds()
+            # An "error" or "disconnected" event fired but the blocked
+            # connect() call never returned to let _ws_run's own loop react
+            # - force a reconnect right away, don't wait out the staleness
+            # window in that case.
+            is_stale = (age is not None and age > STALE_AFTER_SECONDS)
+            needs_kick = status in ("error", "disconnected") or is_stale
+            if needs_kick:
                 _ws_debug["status"] = "stale_reconnecting"
                 _ws_debug["stale_reconnect_count"] = _ws_debug.get("stale_reconnect_count", 0) + 1
-                break
-        _ws_streamer = None
-        _ws_debug["connected_since"] = None
-        time.sleep(5)  # brief pause before reconnecting, avoid a hot retry loop
+                _ws_debug["error"] = (
+                    f"watchdog: no tick for {int(age)}s, forcing reconnect" if age is not None
+                    else f"watchdog: status={status}, forcing reconnect"
+                )
+                try:
+                    if _ws_streamer is not None:
+                        _ws_streamer.disconnect()
+                except Exception:
+                    pass
+                # Start a fresh connection regardless of whether disconnect()
+                # above actually unblocked the old thread's connect() call -
+                # if that old thread really is wedged, it just sits idle
+                # harmlessly rather than ever streaming again.
+                token = get_setting("upstox_access_token")
+                if token:
+                    threading.Thread(target=_ws_run, args=(token,), daemon=True).start()
+        except Exception:
+            pass
 
 
 def ensure_websocket_started(access_token: str) -> None:
@@ -2608,6 +2638,7 @@ def ensure_websocket_started(access_token: str) -> None:
         return
     _ws_thread_started = True
     threading.Thread(target=_ws_run, args=(access_token,), daemon=True).start()
+    threading.Thread(target=_ws_watchdog_loop, daemon=True).start()
 
 
 def update_ws_subscriptions(instrument_keys: set[str]) -> None:
