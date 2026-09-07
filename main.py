@@ -2098,7 +2098,7 @@ def fetch_5min_candles_with_time(instrument_key: str, access_token: str) -> list
     time label - used only by the dashboard's on-demand per-alert chart
     (see /api/chart/<symbol>), fetched lazily on click, never for the
     whole alert list at once."""
-    url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/1minute"
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/1minute"
     req = urllib.request.Request(
         url,
         headers={
@@ -2119,7 +2119,7 @@ def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[flo
     supports 1minute or 30minute - not 5minute directly) and combines them
     into 5-minute candles ourselves. Returns (open, high, low, close),
     oldest first."""
-    url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/1minute"
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/1minute"
     req = urllib.request.Request(
         url,
         headers={
@@ -2169,7 +2169,7 @@ def fetch_intraday_candles_with_volume(instrument_key: str, access_token: str) -
     raw 1-minute candles (not resampled) - needed for the Volume Profile
     POC calculation, which fetch_5min_candles' OHLC-only tuples don't
     carry. Returns (open, high, low, close, volume), oldest first."""
-    url = f"https://api.upstox.com/v2/historical-candle/intraday/{instrument_key}/1minute"
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/1minute"
     req = urllib.request.Request(
         url,
         headers={
