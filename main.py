@@ -2021,8 +2021,20 @@ def get_sector_performance_cached(access_token: str | None) -> dict | None:
 def resample_1min_to_5min(candles_1min: list) -> list[tuple[float, float, float, float]]:
     """candles_1min: list of (timestamp_str, open, high, low, close, volume, oi),
     oldest first. Groups consecutive 1-min candles into 5-min buckets aligned
-    to the clock (e.g. 09:15-09:19), the way real 5-min candles work."""
+    to the clock (e.g. 09:15-09:19), the way real 5-min candles work.
+
+    The most recent bucket is dropped unless it has collected a full 5
+    one-minute candles. Upstox's intraday endpoint returns the
+    currently-forming minute as its last row, so without this the final
+    "5-min candle" here would really just be a partial bar whose close is
+    the live price at the moment of the API call - not a settled close.
+    Every exit rule that reads closes[-1] as "the latest candle's close"
+    (RSI Momentum's EMA9 structure check, the 5-EMA reversal check, ATR
+    trail peak tracking) was treating that live in-progress tick as a
+    confirmed candle close, which could fire an exit on a brief intra-bar
+    dip that reverses before the candle actually finishes forming."""
     buckets: dict = {}
+    counts: dict = {}
     order = []
     for c in candles_1min:
         ts_str, o, h, l, cl = c[0], c[1], c[2], c[3], c[4]
@@ -2031,12 +2043,16 @@ def resample_1min_to_5min(candles_1min: list) -> list[tuple[float, float, float,
         bucket_key = dt.replace(minute=bucket_minute, second=0, microsecond=0)
         if bucket_key not in buckets:
             buckets[bucket_key] = [o, h, l, cl]
+            counts[bucket_key] = 1
             order.append(bucket_key)
         else:
             b = buckets[bucket_key]
             b[1] = max(b[1], h)
             b[2] = min(b[2], l)
             b[3] = cl
+            counts[bucket_key] += 1
+    if order and counts[order[-1]] < 5:
+        order = order[:-1]
     return [tuple(buckets[k]) for k in order]
 
 
