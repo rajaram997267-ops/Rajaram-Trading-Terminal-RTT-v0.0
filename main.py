@@ -28,6 +28,19 @@ IST_OFFSET = timedelta(hours=5, minutes=30)
 
 app = Flask(__name__)
 
+# Alert names for indices (BANKNIFTY, NIFTY...) vs. how Upstox's
+# instrument master actually names those same indices under NSE_INDEX.
+# Best-guess values below - after deploy, hit /api/paper-trading/debug-instruments
+# and check "index_sample_rows"/"index_matched" to confirm or correct these.
+INDEX_SYMBOL_ALIASES = {
+    "BANKNIFTY": "NIFTY BANK",
+    "NIFTY": "NIFTY 50",
+    "FINNIFTY": "NIFTY FIN SERVICE",
+    "MIDCPNIFTY": "NIFTY MIDCAP SELECT",
+    "SENSEX": "SENSEX",
+    "BANKEX": "BANKEX",
+}
+
 SECTOR_MAP = {
     "360ONE": "Financials",
     "ABB": "Industrials",
@@ -1575,10 +1588,12 @@ def _load_instrument_master() -> None:
         fieldnames = reader.fieldnames or []
         sample_rows = []
         fo_sample_rows = []
+        index_sample_rows = []
         mapping = {}
         name_to_ticker: dict[str, str] = {}
         pending_options = []
         row_count = 0
+        index_rows_seen = 0
         for i, row in enumerate(reader):
             row_count = i + 1
             if i < 3:
@@ -1593,6 +1608,26 @@ def _load_instrument_master() -> None:
                 name = (row.get("name") or "").upper()
                 if name:
                     name_to_ticker[name] = tsym
+            elif exch in ("NSE_INDEX", "BSE_INDEX") and ikey:
+                # Indices (BANKNIFTY, NIFTY, etc.) have no NSE_EQ row, so
+                # they'd never get an instrument_key from the block above -
+                # that gap is what left BANKNIFTY paper/live trades stuck
+                # waiting on candle data indefinitely. Upstox keys these
+                # under a display name (e.g. "Nifty Bank"), not the
+                # tradingsymbol alerts use (e.g. "BANKNIFTY"), so match
+                # against both the raw name/tradingsymbol and the known
+                # alias for each - whichever the live file actually uses.
+                index_rows_seen += 1
+                if len(index_sample_rows) < 8:
+                    index_sample_rows.append(dict(row))
+                raw_name = (row.get("name") or "").upper()
+                for alias, upstox_name in INDEX_SYMBOL_ALIASES.items():
+                    if upstox_name in (raw_name, tsym):
+                        mapping[alias] = ikey
+                # Also register under whatever the file literally calls it,
+                # in case an alert name happens to match Upstox's own naming.
+                if tsym:
+                    mapping.setdefault(tsym, ikey)
             elif exch == "NSE_FO" and opt_type in ("CE", "PE") and ikey:
                 if len(fo_sample_rows) < 3:
                     fo_sample_rows.append(dict(row))
@@ -1650,6 +1685,9 @@ def _load_instrument_master() -> None:
             "sample_rows": sample_rows,
             "total_rows_scanned": row_count,
             "matched_count": len(mapping),
+            "index_rows_seen": index_rows_seen,
+            "index_sample_rows": index_sample_rows,
+            "index_aliases_matched": {k: (k in mapping) for k in INDEX_SYMBOL_ALIASES},
             "error": None,
         }
         _option_debug = {
