@@ -3623,7 +3623,7 @@ def _run_paper_trade_check_impl() -> dict:
                     exited, exit_price = True, last_price
                     rsi_disp = f"{rsi_momentum_info['rsi']:.1f}" if rsi_momentum_info.get("rsi") is not None else "?"
                     exit_reason = (
-                        f"RSI momentum exit (RSI {rsi_disp}, close "
+                        f"RSI momentum exit (RSI {rsi_disp} on last closed 5m candle, close "
                         f"{'<' if trade['direction'] == 'Buy' else '>'} EMA{get_rsi_ema_period()})"
                     )
 
@@ -3793,7 +3793,7 @@ def _run_paper_trade_check_impl() -> dict:
                 if not live_exited and trade["live_status"] == "OPEN" and rsi_momentum_triggered:
                     live_exited = True
                     rsi_disp = f"{rsi_momentum_info['rsi']:.1f}" if rsi_momentum_info.get("rsi") is not None else "?"
-                    live_exit_reason_val = f"RSI momentum exit (RSI {rsi_disp}) - no broker floor, by design"
+                    live_exit_reason_val = f"RSI momentum exit (RSI {rsi_disp} on last closed 5m candle) - no broker floor, by design"
             elif not live_exited and trade["live_status"] == "OPEN" and live_last_price is not None and live_entry_ref:
                 live_pct_change = (live_last_price - live_entry_ref) / live_entry_ref * 100
                 if trade["live_trail_high_pct"] is None:
@@ -4526,7 +4526,14 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                     momentum_state = "Neutral"
             ema_note = f", EMA{get_rsi_ema_period()} {current_ema:.2f}" if current_ema is not None else ""
             rsi_disp = f"{current_rsi:.1f}" if current_rsi is not None else "?"
-            t["stop_info"] = f"RSI {rsi_disp} [{momentum_state}] (need {threshold_note} x{confirm_candles}{ema_note}){tag_note}"
+            # Spelled out explicitly (not left implicit) because it's the
+            # single most common source of "is this broken?" confusion:
+            # this reading is always the LAST CLOSED 5-min candle, which
+            # can look stale next to a live chart's still-forming candle
+            # (different RSI/EMA/price entirely) for up to 5 minutes at a
+            # stretch. Correct behavior, not a bug - see resample_1min_
+            # to_5min - but invisible unless said outright here.
+            t["stop_info"] = f"RSI {rsi_disp} [{momentum_state}] (need {threshold_note} x{confirm_candles}{ema_note}){tag_note} · last CLOSED 5m candle, not the live one"
 
         else:
             t["stop_info"] = None
