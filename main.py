@@ -993,7 +993,7 @@ def create_paper_trades_for_batch(data: dict) -> None:
     open_trade_for_symbol(symbol, category, price_val, alert_name=data.get("alert_name", ""), scan_name=data.get("scan_name", ""))
 
 
-def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_name: str = "", scan_name: str = "") -> None:
+def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_name: str = "", scan_name: str = "") -> tuple[bool, str | None]:
     """Opens exactly one paper trade (and, if live trading is on, a
     matching live order) for a single already-resolved symbol/category/
     price. This is the shared core used by both the normal webhook
@@ -1001,7 +1001,17 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     alert' Buy button on the dashboard (api_manual_enter_alert).
     Callers are responsible for their own already-open-trade / entry-
     time / buy-sell-enabled checks first - this function only applies
-    the per-trade qualification checks (sector filter, POC filter)."""
+    the per-trade qualification checks (sector filter, POC filter).
+
+    Returns (created, skip_reason): created is False when the sector or
+    POC filter rejected this alert - no trade was opened, paper or live.
+    The automatic webhook flow ignores this (a skip there just means the
+    next alert gets a chance, exactly as intended), but the manual Enter
+    button needs it: without it, that endpoint always reported
+    "Trade opened" even when a filter silently skipped the trade,
+    which is exactly what was happening - the button never lied about
+    the Buy-vs-Sell classification, it lied about whether anything
+    actually got created underneath it."""
     # Paper trading now simulates the actual ATM OPTION this alert would
     # buy live (Call for Buy, Put for Sell) - not the equity - so it's a
     # true preview of the live strategy: premium as entry price, quantity
@@ -1017,7 +1027,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # a bottom-N one). Off by default; when on, a non-qualifying alert is
     # skipped entirely - no paper trade opens, next alert gets a chance.
     if get_sector_filter_enabled() and not sector_qualifies(symbol, category, access_token):
-        return
+        return False, f"Sector filter is on and {symbol}'s sector doesn't currently qualify for a {category} entry"
 
     option = get_atm_option(symbol, opt_type, price_val) if access_token else None
     premium = get_ltp(option["instrument_key"], access_token) if option else None
@@ -1038,7 +1048,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
         if get_poc_filter_enabled():
             poc_ok, poc_reason = poc_qualifies(option["instrument_key"], category, premium, access_token)
             if not poc_ok:
-                return  # doesn't qualify - skip this alert entirely, no paper or live trade
+                return False, f"POC filter rejected this entry: {poc_reason}"  # doesn't qualify - skip this alert entirely, no paper or live trade
             entry_reason = poc_reason
     else:
         capital = get_current_capital()
@@ -1331,6 +1341,8 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                             (result["error"], live_quantity, label, trade_id),
                                         )
                                         conn.commit()
+
+    return True, None
 
 
 def calculate_ema(values: list[float], period: int = 5) -> list[float | None]:
@@ -4198,11 +4210,19 @@ def api_manual_enter_alert(alert_id):
     if not symbol or price_val <= 0:
         return jsonify({"status": "error", "message": "This alert doesn't have a usable symbol/price"}), 400
 
-    open_trade_for_symbol(
+    created, skip_reason = open_trade_for_symbol(
         symbol, category, price_val,
         alert_name=alert_dict.get("alert_name", ""),
         scan_name=alert_dict.get("scan_name", ""),
     )
+    if not created:
+        # This is the actual fix: previously this endpoint always
+        # returned "ok" here regardless of what open_trade_for_symbol
+        # did internally, so a sector/POC filter silently rejecting the
+        # entry looked identical to a successful one from the button's
+        # point of view - "Trade opened" would show even though nothing
+        # was created, paper or live.
+        return jsonify({"status": "error", "message": skip_reason or "Entry was skipped"}), 422
     return jsonify({"status": "ok", "symbol": symbol, "category": category})
 
 
