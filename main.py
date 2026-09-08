@@ -2202,35 +2202,36 @@ def fetch_prev_session_5min_candles(instrument_key: str, access_token: str) -> l
     return result
 
 
-_today_candle_cache: dict[str, tuple[str, list]] = {}  # instrument_key -> (bucket_key, candles)
-
-
-def _current_5min_bucket_key() -> str:
-    """Identifies which 5-min bucket 'now' falls in (IST), as a cache key.
-    A fresh 5-min candle can only possibly appear once the wall clock
-    crosses into a new bucket, so this is the natural cache-invalidation
-    signal - no TTL/timer needed."""
-    now_ist = datetime.utcnow() + IST_OFFSET
-    bucket_minute = (now_ist.minute // 5) * 5
-    return now_ist.replace(minute=bucket_minute, second=0, microsecond=0).isoformat()
+_today_candle_cache: dict[str, tuple[float, list]] = {}  # instrument_key -> (fetched_at_monotonic, candles)
+_CANDLE_CACHE_TTL_SECONDS = 30
 
 
 def fetch_5min_candles_cached(instrument_key: str, access_token: str) -> list[tuple[float, float, float, float]]:
-    """fetch_5min_candles, but only actually re-hits Upstox once per 5-min
-    bucket instead of on every exit-check poll (every 5s, see
-    EXIT_CHECK_INTERVAL_SECONDS). The underlying data can only change once
-    a new 5-min candle actually completes - polling Upstox every 5
-    seconds for the same answer in between was pure waste, and the main
-    reason 'Check Exits Now' / last_checked_price felt slow for an open
-    trade. Cache is keyed by instrument, so each traded symbol still gets
-    its own fresh fetch right when its next candle completes."""
-    bucket_key = _current_5min_bucket_key()
+    """fetch_5min_candles, but only actually re-hits Upstox at most once
+    every _CANDLE_CACHE_TTL_SECONDS instead of on every exit-check poll
+    (every 5s, see EXIT_CHECK_INTERVAL_SECONDS) - polling Upstox every 5
+    seconds for data that mostly hadn't changed was pure waste, and the
+    main reason 'Check Exits Now' / last_checked_price felt slow.
+
+    This used to cache by wall-clock 5-min bucket instead of a TTL, on
+    the assumption a fresh 5-min candle can only appear once the clock
+    crosses a bucket boundary - true in principle, but Upstox's intraday
+    endpoint has its own ~1-2 minute publish lag (confirmed on their
+    developer forum), so the FIRST fetch inside a new bucket could catch
+    it before the just-completed candle was actually available yet. That
+    stale snapshot then got locked in for the full 5 minutes, letting RSI
+    trail the live chart by up to a whole extra candle. A short TTL
+    bounds the staleness window tightly (worst case ~30s + Upstox's own
+    lag) regardless of where that lag falls relative to a bucket edge,
+    while still cutting call volume by roughly 6x."""
     cached = _today_candle_cache.get(instrument_key)
-    if cached and cached[0] == bucket_key:
+    now = time.monotonic()
+    if cached and (now - cached[0]) < _CANDLE_CACHE_TTL_SECONDS:
         return cached[1]
     result = fetch_5min_candles(instrument_key, access_token)
-    _today_candle_cache[instrument_key] = (bucket_key, result)
+    _today_candle_cache[instrument_key] = (now, result)
     return result
+
 
 
 def get_5min_candles_with_warmup(
