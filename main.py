@@ -2202,6 +2202,37 @@ def fetch_prev_session_5min_candles(instrument_key: str, access_token: str) -> l
     return result
 
 
+_today_candle_cache: dict[str, tuple[str, list]] = {}  # instrument_key -> (bucket_key, candles)
+
+
+def _current_5min_bucket_key() -> str:
+    """Identifies which 5-min bucket 'now' falls in (IST), as a cache key.
+    A fresh 5-min candle can only possibly appear once the wall clock
+    crosses into a new bucket, so this is the natural cache-invalidation
+    signal - no TTL/timer needed."""
+    now_ist = datetime.utcnow() + IST_OFFSET
+    bucket_minute = (now_ist.minute // 5) * 5
+    return now_ist.replace(minute=bucket_minute, second=0, microsecond=0).isoformat()
+
+
+def fetch_5min_candles_cached(instrument_key: str, access_token: str) -> list[tuple[float, float, float, float]]:
+    """fetch_5min_candles, but only actually re-hits Upstox once per 5-min
+    bucket instead of on every exit-check poll (every 5s, see
+    EXIT_CHECK_INTERVAL_SECONDS). The underlying data can only change once
+    a new 5-min candle actually completes - polling Upstox every 5
+    seconds for the same answer in between was pure waste, and the main
+    reason 'Check Exits Now' / last_checked_price felt slow for an open
+    trade. Cache is keyed by instrument, so each traded symbol still gets
+    its own fresh fetch right when its next candle completes."""
+    bucket_key = _current_5min_bucket_key()
+    cached = _today_candle_cache.get(instrument_key)
+    if cached and cached[0] == bucket_key:
+        return cached[1]
+    result = fetch_5min_candles(instrument_key, access_token)
+    _today_candle_cache[instrument_key] = (bucket_key, result)
+    return result
+
+
 def get_5min_candles_with_warmup(
     instrument_key: str, access_token: str, min_candles: int = 30
 ) -> list[tuple[float, float, float, float]]:
@@ -2210,8 +2241,9 @@ def get_5min_candles_with_warmup(
     fix for RSI/EMA/ATR reading as unavailable for the first hour-plus of
     every trading day (a 14-period RSI needs 14 candles = 70 minutes of
     TODAY-only data before it can compute anything at all). Falls back to
-    today-only data if the warmup fetch fails for any reason."""
-    today_candles = fetch_5min_candles(instrument_key, access_token)
+    today-only data if the warmup fetch fails for any reason. Today's leg
+    is served from fetch_5min_candles_cached, not a fresh fetch each call."""
+    today_candles = fetch_5min_candles_cached(instrument_key, access_token)
     if len(today_candles) >= min_candles:
         return today_candles
     try:
@@ -3087,6 +3119,7 @@ def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[
 
 EXIT_CHECK_INTERVAL_SECONDS = 5
 _exit_check_thread_started = False
+_exit_check_lock = threading.Lock()
 
 
 def _exit_check_loop() -> None:
@@ -3121,6 +3154,22 @@ def ensure_exit_check_loop_started() -> None:
 
 
 def run_paper_trade_check() -> dict:
+    """Thin wrapper around _run_paper_trade_check_impl() that prevents two
+    checks from ever running at once. Without this, the background loop
+    (every 5s, see _exit_check_loop) and a manual "Check Exits Now" click
+    (same function, different thread) could overlap - each doing its own
+    round of Upstox REST calls at the same time, competing for the same
+    DB rows. Non-blocking: if a check is already in flight, this returns
+    immediately instead of queuing up a second one behind it."""
+    if not _exit_check_lock.acquire(blocking=False):
+        return {"checked": 0, "closed": 0, "note": "A check was already running - skipped this one."}
+    try:
+        return _run_paper_trade_check_impl()
+    finally:
+        _exit_check_lock.release()
+
+
+def _run_paper_trade_check_impl() -> dict:
     """Checks every open paper trade against its exit strategy, closing
     any that qualify. Returns a summary dict for the UI. Runs both from
     the frontend's periodic poll AND continuously from the background
