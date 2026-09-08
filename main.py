@@ -4028,6 +4028,33 @@ def debug_sector_perf():
     })
 
 
+@app.route("/healthz")
+def healthz():
+    """Minimal, side-effect-free liveness check for external uptime
+    monitors (UptimeRobot etc.) - point a keep-alive ping here, not at
+    '/' or any real page. '/' runs a real query over up to 2000 alert
+    rows on every hit; this does the smallest possible DB round-trip
+    instead, purely so a monitor firing every few minutes doesn't add
+    needless load forever. Confirms the DB connection itself is alive
+    too (a bare 200 from Flask alone wouldn't catch a broken DB) - so an
+    alert from this endpoint means a real problem, not just idle silence
+    since the last request.
+
+    This is what makes an external keep-alive ping actually work on
+    Render's free tier: Render spins the whole process down after 15
+    minutes with no inbound HTTP traffic, and _exit_check_loop's
+    background thread dies right along with it (it isn't a separate
+    process). A ping here every few minutes keeps sending traffic, so
+    the process - and that thread - never gets the chance to be idle
+    long enough to be spun down in the first place."""
+    try:
+        with get_db() as conn:
+            conn.execute("SELECT 1")
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route("/")
 def index():
     try:
