@@ -1066,7 +1066,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
         if spot_instrument_key:
             spot_entry_price = get_ltp(spot_instrument_key, access_token)
             try:
-                spot_entry_candles = fetch_5min_candles(spot_instrument_key, access_token)
+                spot_entry_candles = get_5min_candles_with_warmup(spot_instrument_key, access_token)
             except Exception:
                 spot_entry_candles = None
 
@@ -2152,6 +2152,78 @@ def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[flo
     return resample_1min_to_5min(raw_candles)
 
 
+_prev_session_candle_cache: dict[str, list] = {}
+
+
+def fetch_prev_session_5min_candles(instrument_key: str, access_token: str) -> list[tuple[float, float, float, float]]:
+    """Backfills the tail end of the LAST COMPLETED trading session's
+    5-min candles, so RSI/EMA/ATR aren't blind for the first 70+ minutes
+    of every single trading day waiting on today's candles alone.
+    Upstox's historical-candle endpoint (the non-'intraday' one) supports
+    up to a month of 1-minute data per their own docs, so this asks for
+    the last 7 calendar days ending yesterday (covers weekends/holidays)
+    and keeps only the single most recent day actually present in the
+    response. Cached per instrument+day - one extra Upstox call per
+    symbol per day, not one per exit-check poll. Never raises; an empty
+    list just means the caller falls back to today-only data."""
+    cache_key = f"{instrument_key}:{_ist_today_str()}"
+    if cache_key in _prev_session_candle_cache:
+        return _prev_session_candle_cache[cache_key]
+    from_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=7)).strftime("%Y-%m-%d")
+    to_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=1)).strftime("%Y-%m-%d")
+    url = (
+        f"https://api.upstox.com/v2/historical-candle/"
+        f"{urllib.parse.quote(instrument_key, safe='|')}/1minute/{to_date}/{from_date}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    result: list = []
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode())
+        raw_candles = payload.get("data", {}).get("candles", [])
+        raw_candles = sorted(raw_candles, key=lambda c: c[0])
+        if raw_candles:
+            # Keep only the most recent calendar day present, so a warmup
+            # fetch spanning a long weekend/holiday doesn't bridge two
+            # sessions together with a misleading overnight gap.
+            last_day = raw_candles[-1][0][:10]
+            raw_candles = [c for c in raw_candles if c[0][:10] == last_day]
+        result = resample_1min_to_5min(raw_candles)[-60:]
+    except Exception:
+        result = []
+    _prev_session_candle_cache[cache_key] = result
+    return result
+
+
+def get_5min_candles_with_warmup(
+    instrument_key: str, access_token: str, min_candles: int = 30
+) -> list[tuple[float, float, float, float]]:
+    """Same as fetch_5min_candles, but prepends the tail of the previous
+    session when today alone doesn't have min_candles yet - this is the
+    fix for RSI/EMA/ATR reading as unavailable for the first hour-plus of
+    every trading day (a 14-period RSI needs 14 candles = 70 minutes of
+    TODAY-only data before it can compute anything at all). Falls back to
+    today-only data if the warmup fetch fails for any reason."""
+    today_candles = fetch_5min_candles(instrument_key, access_token)
+    if len(today_candles) >= min_candles:
+        return today_candles
+    try:
+        prev = fetch_prev_session_5min_candles(instrument_key, access_token)
+    except Exception:
+        prev = []
+    if not prev:
+        return today_candles
+    needed = min_candles - len(today_candles)
+    return prev[-needed:] + today_candles
+
+
 def _current_underlying_rsi(symbol: str, access_token: str | None, existing_candles: list | None = None) -> float | None:
     """Current RSI of the UNDERLYING's 5-min candles - the value logged
     as entry_rsi/exit_rsi (and their live_ counterparts) on every trade
@@ -2170,7 +2242,7 @@ def _current_underlying_rsi(symbol: str, access_token: str | None, existing_cand
             spot_key = get_instrument_key(symbol)
             if not spot_key:
                 return None
-            candles = fetch_5min_candles(spot_key, access_token)
+            candles = get_5min_candles_with_warmup(spot_key, access_token)
         if not candles:
             return None
         rsi_line = calculate_rsi([c[3] for c in candles], get_rsi_period())
@@ -3102,7 +3174,7 @@ def run_paper_trade_check() -> dict:
             # once a minute, without hammering Upstox's candle endpoint.
             needs_candles = strategy in ("EMA", "TARGETS", "ATR_TRAIL")
             ws_price = get_ws_price(instrument_key)
-            candles = fetch_5min_candles(instrument_key, access_token) if (needs_candles or ws_price is None) else None
+            candles = get_5min_candles_with_warmup(instrument_key, access_token) if (needs_candles or ws_price is None) else None
             last_price = ws_price if ws_price is not None else (candles[-1][3] if candles else None)
             entry_price = trade["entry_price"]
 
@@ -3118,7 +3190,7 @@ def run_paper_trade_check() -> dict:
             if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM"):
                 spot_key = get_instrument_key(symbol)
                 if spot_key:
-                    spot_candles = fetch_5min_candles(spot_key, access_token)
+                    spot_candles = get_5min_candles_with_warmup(spot_key, access_token)
             # Current spot price - only the JOAT-inspired strategies need
             # this as a standalone value (for their spot-%-change and ATR
             # peak-tracking math); #7/#8 only ever needed the candle
@@ -4235,7 +4307,7 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                 instrument_key = t.get("paper_instrument_key")
                 if instrument_key and access_token:
                     try:
-                        candles = fetch_5min_candles(instrument_key, access_token)
+                        candles = get_5min_candles_with_warmup(instrument_key, access_token)
                         atr_series = calculate_atr(candles, get_atr_period())
                         current_atr = atr_series[-1] if atr_series else None
                     except Exception:
@@ -4267,7 +4339,7 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                 try:
                     resolved_key = get_instrument_key(spot_key)
                     if resolved_key:
-                        spot_candles = fetch_5min_candles(resolved_key, access_token)
+                        spot_candles = get_5min_candles_with_warmup(resolved_key, access_token)
                         if spot_candles:
                             series = [c[2] for c in spot_candles] if t.get("direction") == "Buy" else [c[1] for c in spot_candles]
                             ema_series = calculate_ema(series, 5)
@@ -4297,7 +4369,7 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                 try:
                     resolved_key = get_instrument_key(spot_key)
                     if resolved_key:
-                        spot_candles = fetch_5min_candles(resolved_key, access_token)
+                        spot_candles = get_5min_candles_with_warmup(resolved_key, access_token)
                 except Exception:
                     spot_candles = None
             spot_last = spot_candles[-1][3] if spot_candles else None
@@ -4353,7 +4425,7 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                 try:
                     resolved_key = get_instrument_key(spot_key)
                     if resolved_key:
-                        spot_candles = fetch_5min_candles(resolved_key, access_token)
+                        spot_candles = get_5min_candles_with_warmup(resolved_key, access_token)
                 except Exception:
                     spot_candles = None
             if not spot_candles:
