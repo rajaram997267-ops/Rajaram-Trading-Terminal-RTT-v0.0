@@ -2181,6 +2181,15 @@ def fetch_prev_session_5min_candles(instrument_key: str, access_token: str) -> l
     cache_key = f"{instrument_key}:{_ist_today_str()}"
     if cache_key in _prev_session_candle_cache:
         return _prev_session_candle_cache[cache_key]
+    # Prune entries from any earlier day before adding today's - this
+    # cache previously grew by one entry per traded instrument PER DAY
+    # forever, with nothing ever removing old ones. Small individually
+    # (~60 candle tuples each) but unbounded over weeks/months of runtime
+    # is still a genuine slow leak worth closing.
+    today_str = _ist_today_str()
+    stale_keys = [k for k in _prev_session_candle_cache if not k.endswith(f":{today_str}")]
+    for k in stale_keys:
+        del _prev_session_candle_cache[k]
     from_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=7)).strftime("%Y-%m-%d")
     to_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=1)).strftime("%Y-%m-%d")
     url = (
@@ -2467,7 +2476,22 @@ def compute_live_stats(open_trades: list[dict], closed_trades: list[dict]) -> di
     }
 
 
-UPSTOX_ORDER_URL = "https://api.upstox.com/v3/order/place"
+# Place/Modify/Cancel Order deliberately go through Upstox's dedicated
+# low-latency endpoint (api-hft.upstox.com, <45ms per Upstox's own docs)
+# instead of the regular api.upstox.com used for everything else -
+# same bearer token works on both, only the host differs. GTT orders
+# stay on the standard endpoint on purpose (Upstox's own GTT
+# announcement explicitly keeps GTT off the HFT host), so only the
+# entry/exit MARKET and SL-Limit order calls benefit from this, which is
+# exactly where execution speed matters most for slippage.
+# CAVEAT (seen on Upstox's own developer community forum): some
+# accounts/apps have hit 401 UDAPI100050 "Invalid token used to access
+# API" specifically on api-hft while the same token works fine on
+# api.upstox.com. Verify with a real small live order after deploying
+# this before trusting it in a real exit-critical moment - if it 401s,
+# revert this one constant back to api.upstox.com/v3/order/place (and
+# the cancel-order URL below back to api.upstox.com) as a safe fallback.
+UPSTOX_ORDER_URL = "https://api-hft.upstox.com/v3/order/place"
 
 
 def get_ltp(instrument_key: str, access_token: str) -> float | None:
@@ -2515,6 +2539,7 @@ _ws_lock = threading.Lock()
 _ws_streamer = None
 _ws_subscribed_keys: set[str] = set()
 _ws_thread_started = False
+_ws_generation = 0  # bumped each time a new _ws_run thread is started (main or watchdog-triggered)
 _ws_debug: dict = {
     "status": "not_started", "error": None, "last_message_at": None,
     "sdk_available": None, "connect_attempts": 0,
@@ -2609,8 +2634,17 @@ def _ws_run(access_token: str) -> None:
     """Runs for the lifetime of the process on a background thread -
     connects to Upstox's V3 feed and automatically reconnects (after a
     pause) if the connection drops for any reason: network blip, Render
-    spinning the app down and back up, Upstox-side restart, etc."""
-    global _ws_streamer, _ws_debug
+    spinning the app down and back up, Upstox-side restart, etc.
+
+    Captures the generation counter at the moment it starts. If a call
+    into this function's own try/except ever returns control after a
+    NEWER generation has already been started elsewhere (by the
+    watchdog), it exits quietly instead of reconnecting itself too -
+    without this, an old "wedged" thread that unexpectedly comes back to
+    life could start competing with the current connection, fighting
+    over the shared _ws_streamer global and doubling up subscriptions."""
+    global _ws_streamer, _ws_debug, _ws_generation
+    my_generation = _ws_generation
     try:
         import upstox_client
         _ws_debug["sdk_available"] = True
@@ -2621,6 +2655,8 @@ def _ws_run(access_token: str) -> None:
         return
 
     while True:
+        if _ws_generation != my_generation:
+            return  # superseded by a newer connection attempt - stop here, don't reconnect
         try:
             # Always use the freshest saved token, not the one this
             # thread happened to be started with. If the DB already had
@@ -2658,6 +2694,25 @@ def _ws_run(access_token: str) -> None:
                 streamer.on("close", lambda *a: _ws_debug.update({"status": "disconnected"}))
             except Exception:
                 pass
+            # Use the SDK's own reconnect handling for ordinary drops
+            # (network blips, Upstox-side restarts) - this keeps the SAME
+            # connection object/thread alive and reconnecting internally,
+            # instead of every drop requiring _ws_watchdog_loop to spawn a
+            # brand new thread + streamer object. That matters because if
+            # connect() truly blocks for the life of the connection (see
+            # the note below), a thread-replacing reconnect can never be
+            # fully cleaned up if the old one stays wedged - each one
+            # leaks its stack and everything the old streamer object
+            # holds, since Python can't garbage-collect memory still
+            # referenced by a live thread. Native auto-reconnect handles
+            # the common case without ever needing a replacement thread;
+            # the watchdog is now only a backstop for the rarer case of a
+            # connection that LOOKS alive but has gone silent, which
+            # auto-reconnect alone won't detect.
+            try:
+                streamer.auto_reconnect(True, 10, 50)
+            except Exception:
+                pass  # older/different SDK version without this method - fine, watchdog covers it
             _ws_streamer = streamer
             _ws_debug["status"] = "connecting"
             _ws_debug["connect_attempts"] += 1
@@ -2692,6 +2747,8 @@ def _ws_run(access_token: str) -> None:
         # whether this thread is currently stuck inside connect().
         while True:
             time.sleep(30)
+            if _ws_generation != my_generation:
+                return  # a newer connection took over - let this thread end here
 
 
 def _ws_watchdog_loop() -> None:
@@ -2701,6 +2758,7 @@ def _ws_watchdog_loop() -> None:
     currently blocked inside streamer.connect(). If the feed has gone
     quiet for too long, forces a fresh reconnect rather than trusting the
     old thread to ever notice on its own."""
+    global _ws_generation
     STALE_AFTER_SECONDS = 90
     while True:
         time.sleep(20)
@@ -2735,10 +2793,13 @@ def _ws_watchdog_loop() -> None:
                         _ws_streamer.disconnect()
                 except Exception:
                     pass
-                # Start a fresh connection regardless of whether disconnect()
-                # above actually unblocked the old thread's connect() call -
-                # if that old thread really is wedged, it just sits idle
-                # harmlessly rather than ever streaming again.
+                # Bump the generation BEFORE starting the replacement thread,
+                # so the new thread's _ws_run immediately sees itself as the
+                # current generation and any old wedged thread that later
+                # regains control (if disconnect() above didn't fully work)
+                # recognizes it's stale and exits instead of reconnecting
+                # itself too and fighting over _ws_streamer.
+                _ws_generation += 1
                 token = get_setting("upstox_access_token")
                 if token:
                     threading.Thread(target=_ws_run, args=(token,), daemon=True).start()
@@ -2750,10 +2811,11 @@ def ensure_websocket_started(access_token: str) -> None:
     """Starts the background WebSocket thread once per process. Safe to
     call from any request handler - a no-op if it's already running or if
     there's no token yet."""
-    global _ws_thread_started
+    global _ws_thread_started, _ws_generation
     if _ws_thread_started or not access_token:
         return
     _ws_thread_started = True
+    _ws_generation += 1
     threading.Thread(target=_ws_run, args=(access_token,), daemon=True).start()
     threading.Thread(target=_ws_watchdog_loop, daemon=True).start()
 
@@ -2947,7 +3009,7 @@ def cancel_order(order_id: str, access_token: str) -> bool:
     successful cancel request; never raises. Treats 'already
     filled/cancelled' errors as a non-fatal no-op, since that's exactly
     what happens when the SL itself already fired first."""
-    url = "https://api.upstox.com/v2/order/cancel?order_id=" + urllib.parse.quote(order_id)
+    url = "https://api-hft.upstox.com/v2/order/cancel?order_id=" + urllib.parse.quote(order_id)
     req = urllib.request.Request(
         url,
         method="DELETE",
