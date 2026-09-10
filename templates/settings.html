@@ -198,6 +198,7 @@
       <option value="JOAT_TEST_B" {% if exit_strategy == "JOAT_TEST_B" %}selected{% endif %}>Test-B: spot ATR (shared) -&gt; spot 5-EMA trail</option>
       <option value="JOAT_TEST_C" {% if exit_strategy == "JOAT_TEST_C" %}selected{% endif %}>Test-C: spot ATR (own period) -&gt; spot 5-EMA trail</option>
       <option value="RSI_MOMENTUM" {% if exit_strategy == "RSI_MOMENTUM" %}selected{% endif %}>10) RSI Momentum Exit (spot RSI + EMA9)</option>
+      <option value="CAMARILLA_LADDER" {% if exit_strategy == "CAMARILLA_LADDER" %}selected{% endif %}>11) Camarilla Ladder Exit (RSI pre-T1, ratchet stop post-T1)</option>
     </select>
     <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
   </div>
