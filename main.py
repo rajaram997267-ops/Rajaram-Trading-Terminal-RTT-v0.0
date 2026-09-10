@@ -522,6 +522,16 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_rsi DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS mae_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_mae_pct DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t1 DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t2 DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t3 DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t4 DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_ratchet_stage INTEGER DEFAULT 0",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_stop_premium DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_captured_json TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_camarilla_ratchet_stage INTEGER DEFAULT 0",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_camarilla_stop_premium DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_camarilla_captured_json TEXT",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -1089,6 +1099,22 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # which compares the current spot price against this strike.
     paper_strike_val = option["strike"] if option else None
 
+    # Camarilla Ladder's target tiers (T1-T4), computed once at entry from
+    # the previous day's H/L/C - fixed for the life of this trade, exactly
+    # like the reference indicator's own levels. If previous-day data
+    # can't be fetched, these stay None and the trade runs as pure RSI
+    # Momentum Exit for its whole life (see the exit-check loop) - a
+    # missing ladder never blocks the trade, it just never gets to the
+    # ratchet phase.
+    camarilla_t1 = camarilla_t2 = camarilla_t3 = camarilla_t4 = None
+    if entry_strategy == "CAMARILLA_LADDER" and access_token:
+        cam_spot_key = get_instrument_key(symbol)
+        if cam_spot_key:
+            pdh, pdl, pdc = fetch_previous_day_high_low(cam_spot_key, access_token)
+            tiers = compute_camarilla_target_ladder(category, pdh, pdl, pdc)
+            if tiers:
+                camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4 = tiers
+
     with get_db() as conn:
         row = conn.execute(
             """
@@ -1096,13 +1122,13 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                 (symbol, direction, entry_price, entry_time, status, quantity,
                  paper_instrument_key, paper_option_label, last_error,
                  strategy, original_quantity, alert_name, scan_name, spot_entry_price,
-                 paper_strike, entry_rsi)
-            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 paper_strike, entry_rsi, camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4)
+            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (symbol, category, entry_price, now, quantity, paper_instrument_key, paper_option_label,
              fallback_note, entry_strategy, quantity, alert_name or None, scan_name or None, spot_entry_price,
-             paper_strike_val, entry_rsi_val),
+             paper_strike_val, entry_rsi_val, camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4),
         ).fetchone()
         conn.commit()
 
@@ -1149,7 +1175,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                             live_quantity = lots * lot_size
                             label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
 
-                            if get_live_entry_mode() == "GTT" and entry_strategy != "RSI_MOMENTUM":
+                            if get_live_entry_mode() == "GTT" and entry_strategy not in ("RSI_MOMENTUM", "CAMARILLA_LADDER"):
                                 # GTT mode: entry AND trailing stop-loss are
                                 # ONE combined order - Upstox's engine
                                 # places the entry when the ENTRY leg fires
@@ -1299,6 +1325,13 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                             "RSI Momentum Exit: no broker-side stop placed by design (matches "
                                             "paper exactly, per your choice) - the RSI/EMA check is the only "
                                             "thing that closes this position. No safety net if this app goes down."
+                                        )
+                                    elif entry_strategy == "CAMARILLA_LADDER":
+                                        sl_note = (
+                                            "Camarilla Ladder: no broker-side stop yet - pre-T1 phase runs on "
+                                            "the same RSI/EMA check as RSI Momentum. A real SL order gets placed "
+                                            "automatically the moment spot first reaches T1, then moves up as "
+                                            "further tiers are reached. No safety net until that first happens."
                                         )
                                     elif live_entry_price:
                                         live_sl_trigger_price = round(live_entry_price * 0.98, 1)
@@ -2090,11 +2123,12 @@ def resample_1min_to_5min_with_time(candles_1min: list) -> list[tuple[str, float
     return [(k.strftime("%H:%M"), *buckets[k]) for k in order]
 
 
-def fetch_previous_day_high_low(instrument_key: str, access_token: str) -> tuple[float | None, float | None]:
-    """The most recent COMPLETED trading day's high and low, for the
-    dashboard's per-alert chart PDH/PDL reference lines. Same day-candle
-    endpoint the sector prev-close loader already uses - just reading
-    high/low instead of close."""
+def fetch_previous_day_high_low(instrument_key: str, access_token: str) -> tuple[float | None, float | None, float | None]:
+    """The most recent COMPLETED trading day's high, low, and close - used
+    for the dashboard's per-alert PDH/PDL reference lines, and (close
+    included, added for this) as the basis for Camarilla Ladder's pivot
+    levels. Same day-candle endpoint the sector prev-close loader already
+    uses."""
     today = _ist_today_str()
     from_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=10)).strftime("%Y-%m-%d")
     url = (
@@ -2115,10 +2149,58 @@ def fetch_previous_day_high_low(instrument_key: str, access_token: str) -> tuple
         candles = (payload.get("data") or {}).get("candles") or []
         # Newest-first; the first entry is the most recent COMPLETED day.
         if candles:
-            return candles[0][2], candles[0][3]
+            return candles[0][2], candles[0][3], candles[0][4]
     except Exception:
         pass
-    return None, None
+    return None, None, None
+
+
+def compute_camarilla_target_ladder(direction: str, pdh: float, pdl: float, pdc: float) -> list[float] | None:
+    """Standard Camarilla pivot formula (Nick Scott, publicly documented -
+    not a guess at anyone's proprietary indicator). Range = previous day's
+    High - Low; each tier is previous day's Close plus/minus a fraction of
+    that range:
+        R1 = PDC + Range*1.1/12   R2 = PDC + Range*1.1/6
+        R3 = PDC + Range*1.1/4    R4 = PDC + Range*1.1/2
+        S1..S4 mirror these below PDC.
+    Returns [T1, T2, T3, T4] in the direction relevant to this trade - the
+    resistance ladder (R1-R4) for a Buy, the support ladder (S1-S4,
+    ascending order so T1 is nearest first) for a Sell. None if any input
+    is missing (previous-day data unavailable)."""
+    if pdh is None or pdl is None or pdc is None:
+        return None
+    day_range = pdh - pdl
+    if direction == "Buy":
+        return [
+            pdc + day_range * 1.1 / 12,
+            pdc + day_range * 1.1 / 6,
+            pdc + day_range * 1.1 / 4,
+            pdc + day_range * 1.1 / 2,
+        ]
+    else:
+        return [
+            pdc - day_range * 1.1 / 12,
+            pdc - day_range * 1.1 / 6,
+            pdc - day_range * 1.1 / 4,
+            pdc - day_range * 1.1 / 2,
+        ]
+
+
+def camarilla_ratchet_stage_reached(direction: str, spot_price: float, tiers: list[float], current_stage: int) -> int:
+    """How many Camarilla tiers spot_price has reached, starting from
+    current_stage (ratchet is one-directional - never reports a LOWER
+    stage than what's already been locked in, even if price pulls back
+    below a tier it already touched)."""
+    stage = current_stage
+    for i, tier in enumerate(tiers, start=1):
+        if i <= stage:
+            continue
+        reached = (spot_price >= tier) if direction == "Buy" else (spot_price <= tier)
+        if reached:
+            stage = i
+        else:
+            break
+    return stage
 
 
 def fetch_5min_candles_with_time(instrument_key: str, access_token: str) -> list[tuple[str, float, float, float, float]]:
@@ -2938,6 +3020,67 @@ def place_live_order(
         return {"ok": False, "error": str(e)}
 
 
+def modify_order(
+    order_id: str,
+    quantity: int,
+    order_type: str,
+    trigger_price: float,
+    price: float,
+    access_token: str,
+) -> dict:
+    """Modifies an existing order in place (PUT, not a new order) - used by
+    Camarilla Ladder to move its SL order's trigger/limit price up as each
+    tier is reached, instead of cancel+replace. Confirmed against Upstox's
+    own Modify Order V3 docs: same host as place_order
+    (api-hft.upstox.com), PUT method, body needs quantity/validity/price/
+    order_id/order_type/disclosed_quantity/trigger_price together - Upstox
+    treats this as replacing those fields, not patching just the one that
+    changed, so all of them are sent every time even though only
+    trigger_price/price actually move here.
+
+    CAVEAT (same one noted on UPSTOX_ORDER_URL above): api-hft.upstox.com
+    has been reported to occasionally 401 with UDAPI100050 on some
+    accounts even with a token that works fine on api.upstox.com. Same
+    advice applies - verify this actually succeeds on a real order before
+    trusting the ratchet in a live-money moment.
+
+    Never raises. Returns {"ok": True} on success, {"ok": False, "error": "..."} on failure."""
+    body = {
+        "quantity": quantity,
+        "validity": "DAY",
+        "price": price,
+        "order_id": order_id,
+        "order_type": order_type,
+        "disclosed_quantity": 0,
+        "trigger_price": trigger_price,
+    }
+    req = urllib.request.Request(
+        "https://api-hft.upstox.com/v3/order/modify",
+        data=json.dumps(body).encode(),
+        method="PUT",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        opener = _get_order_proxy_opener()
+        opener_fn = opener.open if opener else urllib.request.urlopen
+        with opener_fn(req, timeout=10) as resp:
+            json.loads(resp.read().decode())
+        return {"ok": True}
+    except urllib.error.HTTPError as e:
+        try:
+            body_text = e.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            body_text = ""
+        return {"ok": False, "error": f"HTTP {e.code}: {body_text}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def get_order_average_price(order_id: str, access_token: str) -> float | None:
     """Fetches the REAL average fill price for a placed order via Upstox's
     Order Details API. This is what live P&L must be computed from -
@@ -3311,7 +3454,7 @@ def _run_paper_trade_check_impl() -> dict:
             # strategy - it's a second Upstox call on top of the option's
             # own, so no reason to pay for it otherwise.
             spot_candles = None
-            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM"):
+            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER"):
                 spot_key = get_instrument_key(symbol)
                 if spot_key:
                     spot_candles = get_5min_candles_with_warmup(spot_key, access_token)
@@ -3328,10 +3471,14 @@ def _run_paper_trade_check_impl() -> dict:
             # paper has already closed but live is still open (they can
             # diverge - see the note on live_instrument_key below) - this
             # runs unconditionally off trade["strategy"], not paper's own
-            # OPEN/CLOSED status, so live can always find it.
+            # OPEN/CLOSED status, so live can always find it. Camarilla
+            # Ladder shares this exact computation for its own pre-T1
+            # phase (see camarilla_ratchet_stage below) - it's the same
+            # RSI/EMA check, strategy #10's own settings, until the first
+            # tier is reached.
             rsi_momentum_triggered = False
             rsi_momentum_info: dict = {}
-            if strategy == "RSI_MOMENTUM" and spot_candles:
+            if strategy in ("RSI_MOMENTUM", "CAMARILLA_LADDER") and spot_candles:
                 rsi_confirm_candles = get_rsi_confirm_candles()
                 rsi_midday_active = _is_midday_session(get_rsi_midday_start(), get_rsi_midday_end())
                 if rsi_midday_active:
@@ -3348,6 +3495,24 @@ def _run_paper_trade_check_impl() -> dict:
                     call_threshold=rsi_call_threshold, put_warning_threshold=rsi_put_warning_threshold,
                     confirm_candles=rsi_confirm_candles,
                 )
+
+            # Camarilla Ladder's own tier-ratchet, computed ONCE here for
+            # the same reason as the RSI trigger above - shared between
+            # paper and live so they never disagree on which tier has
+            # been reached. Only actually does anything once the trade
+            # has valid ladder levels (entry-time fetch of previous-day
+            # data can fail - see open_trade_for_symbol) and a current
+            # spot price to compare against them.
+            camarilla_new_stage = None
+            camarilla_tiers = None
+            if strategy == "CAMARILLA_LADDER" and trade["camarilla_t1"] is not None and spot_last_price is not None:
+                camarilla_tiers = [trade["camarilla_t1"], trade["camarilla_t2"], trade["camarilla_t3"], trade["camarilla_t4"]]
+                camarilla_current_stage = trade["camarilla_ratchet_stage"] or 0
+                camarilla_new_stage = camarilla_ratchet_stage_reached(
+                    trade["direction"], spot_last_price, camarilla_tiers, camarilla_current_stage
+                )
+
+
 
             # Paper and live each resolve their own ATM contract at entry
             # time (both from the same alert price, moments apart) - in
@@ -3702,6 +3867,55 @@ def _run_paper_trade_check_impl() -> dict:
                         f"{'<' if trade['direction'] == 'Buy' else '>'} EMA{get_rsi_ema_period()})"
                     )
 
+            elif strategy == "CAMARILLA_LADDER" and last_price is not None:
+                # Hybrid (see strategy description in EXIT_STRATEGY_INFO):
+                # before spot ever reaches T1, this is identical to RSI
+                # Momentum Exit above - same shared trigger, strategy #10's
+                # own settings. The moment spot first reaches T1, the RSI
+                # check stops being consulted and a ratcheting stop in
+                # OPTION PREMIUM terms takes over. Camarilla's own T1-T4
+                # levels are in SPOT price terms and don't translate
+                # cleanly into option premium (depends on delta/theta/IV,
+                # not a fixed ratio) - so rather than projecting a spot
+                # price into premium space, this locks in whatever the
+                # OPTION was actually trading at the moment each tier was
+                # crossed, and uses THAT captured value as the next stop.
+                camarilla_current_stage = trade["camarilla_ratchet_stage"] or 0
+                if camarilla_current_stage == 0:
+                    if camarilla_new_stage and camarilla_new_stage >= 1:
+                        trail_update = {"camarilla": {
+                            "stage": camarilla_new_stage, "stop_premium": entry_price,
+                            "captured": [last_price] * camarilla_new_stage,
+                        }}
+                    elif rsi_momentum_triggered:
+                        exited, exit_price = True, last_price
+                        rsi_disp = f"{rsi_momentum_info['rsi']:.1f}" if rsi_momentum_info.get("rsi") is not None else "?"
+                        exit_reason = (
+                            f"Camarilla Ladder: RSI momentum exit before T1 (RSI {rsi_disp}, close "
+                            f"{'<' if trade['direction'] == 'Buy' else '>'} EMA{get_rsi_ema_period()})"
+                        )
+                else:
+                    # Ratchet already active - RSI is no longer consulted,
+                    # the ladder stop is the only exit condition from here.
+                    try:
+                        captured = json.loads(trade["camarilla_captured_json"] or "[]")
+                    except Exception:
+                        captured = []
+                    if camarilla_new_stage and camarilla_new_stage > camarilla_current_stage:
+                        new_stop = captured[camarilla_current_stage - 1] if captured else entry_price
+                        while len(captured) < camarilla_new_stage:
+                            captured.append(last_price)
+                        trail_update = {"camarilla": {
+                            "stage": camarilla_new_stage, "stop_premium": new_stop, "captured": captured,
+                        }}
+                    else:
+                        stop_premium = trade["camarilla_stop_premium"]
+                        if stop_premium is not None:
+                            hit = (last_price <= stop_premium) if trade["direction"] == "Buy" else (last_price >= stop_premium)
+                            if hit:
+                                exited, exit_price = True, last_price
+                                exit_reason = f"Camarilla Ladder stop hit (T{camarilla_current_stage} ratchet, stop {stop_premium:.2f})"
+
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
                 # kept only so trades that opened under the old single
@@ -3810,6 +4024,7 @@ def _run_paper_trade_check_impl() -> dict:
             live_exit_reason_val = None
             live_trail_update = None
             live_sl_fired_price = None
+            live_camarilla_update = None
 
             # Check whether the resting SL stop already fired on its own
             # since the last pass - if so, the broker closed the position
@@ -3869,6 +4084,74 @@ def _run_paper_trade_check_impl() -> dict:
                     live_exited = True
                     rsi_disp = f"{rsi_momentum_info['rsi']:.1f}" if rsi_momentum_info.get("rsi") is not None else "?"
                     live_exit_reason_val = f"RSI momentum exit (RSI {rsi_disp} on last closed 5m candle) - no broker floor, by design"
+            elif strategy == "CAMARILLA_LADDER":
+                # Hybrid, live side. Pre-T1 (stage 0): identical to RSI
+                # Momentum above - no broker-side stop exists yet, only
+                # the shared RSI trigger can close this. The moment spot
+                # first reaches T1, a REAL SL order gets placed for the
+                # first time (there was none before) at breakeven; every
+                # further tier crossing MODIFIES that same order in place
+                # (see modify_order) rather than replacing it. The
+                # existing generic SL-fired check earlier in this
+                # function (trade["live_sl_order_id"] polling) picks up
+                # this order automatically once it exists - nothing
+                # strategy-specific needed there.
+                live_camarilla_current_stage = trade["live_camarilla_ratchet_stage"] or 0
+                if live_camarilla_current_stage == 0:
+                    if not live_exited and trade["live_status"] == "OPEN" and rsi_momentum_triggered:
+                        live_exited = True
+                        rsi_disp = f"{rsi_momentum_info['rsi']:.1f}" if rsi_momentum_info.get("rsi") is not None else "?"
+                        live_exit_reason_val = (
+                            f"Camarilla Ladder: RSI momentum exit before T1 (RSI {rsi_disp}) "
+                            "- no broker floor yet, by design"
+                        )
+                    elif (trade["live_status"] == "OPEN" and camarilla_new_stage and camarilla_new_stage >= 1
+                          and live_entry_ref and trade["live_instrument_key"] and trade["live_quantity"]):
+                        live_stop_trigger = _round_to_tick(live_entry_ref)
+                        live_stop_limit = _round_to_tick(live_entry_ref * 0.98)
+                        cam_sl_result = place_live_order(
+                            trade["live_instrument_key"], "SELL", trade["live_quantity"], access_token,
+                            order_type="SL", trigger_price=live_stop_trigger, price=live_stop_limit,
+                        )
+                        if cam_sl_result["ok"]:
+                            cam_capture_val = live_last_price if live_last_price is not None else live_entry_ref
+                            live_camarilla_update = {
+                                "stage": camarilla_new_stage, "stop_premium": live_entry_ref,
+                                "captured": [cam_capture_val] * camarilla_new_stage,
+                                "sl_order_id": cam_sl_result["order_id"], "sl_trigger": live_stop_trigger,
+                            }
+                        # else: stop failed to place - stage stays 0,
+                        # retries next pass rather than losing protection
+                        # silently. This trade has no broker floor until
+                        # a retry succeeds - same exposure window as RSI
+                        # Momentum's own by-design gap.
+                else:
+                    try:
+                        live_captured = json.loads(trade["live_camarilla_captured_json"] or "[]")
+                    except Exception:
+                        live_captured = []
+                    if (trade["live_status"] == "OPEN" and camarilla_new_stage
+                            and camarilla_new_stage > live_camarilla_current_stage and trade["live_sl_order_id"]):
+                        new_live_stop = live_captured[live_camarilla_current_stage - 1] if live_captured else live_entry_ref
+                        new_live_trigger = _round_to_tick(new_live_stop)
+                        new_live_limit = _round_to_tick(new_live_stop * 0.98)
+                        cam_mod_result = modify_order(
+                            trade["live_sl_order_id"], trade["live_quantity"], "SL",
+                            new_live_trigger, new_live_limit, access_token,
+                        )
+                        if cam_mod_result["ok"]:
+                            cam_capture_val = live_last_price if live_last_price is not None else new_live_stop
+                            while len(live_captured) < camarilla_new_stage:
+                                live_captured.append(cam_capture_val)
+                            live_camarilla_update = {
+                                "stage": camarilla_new_stage, "stop_premium": new_live_stop,
+                                "captured": live_captured,
+                                "sl_order_id": trade["live_sl_order_id"], "sl_trigger": new_live_trigger,
+                            }
+                        # else: modify failed - stage stays as-is, retry
+                        # next pass. The OLD stop is still resting at the
+                        # broker in the meantime (real protection, just
+                        # not yet moved up to the new tier).
             elif not live_exited and trade["live_status"] == "OPEN" and live_last_price is not None and live_entry_ref:
                 live_pct_change = (live_last_price - live_entry_ref) / live_entry_ref * 100
                 if trade["live_trail_high_pct"] is None:
@@ -3930,6 +4213,21 @@ def _run_paper_trade_check_impl() -> dict:
                         (live_trail_update, new_live_mae_pct, trade["id"]),
                     )
                     conn.commit()
+            elif live_camarilla_update is not None:
+                with get_db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET live_camarilla_ratchet_stage = ?, live_camarilla_stop_premium = ?,
+                            live_camarilla_captured_json = ?, live_sl_order_id = ?,
+                            live_sl_trigger_price = ?, live_mae_pct = ?
+                        WHERE id = ?
+                        """,
+                        (live_camarilla_update["stage"], live_camarilla_update["stop_premium"],
+                         json.dumps(live_camarilla_update["captured"]), live_camarilla_update["sl_order_id"],
+                         live_camarilla_update["sl_trigger"], new_live_mae_pct, trade["id"]),
+                    )
+                    conn.commit()
             elif trade["live_status"] == "OPEN" and new_live_mae_pct != trade["live_mae_pct"]:
                 # Live is open and simply holding this pass (no trail
                 # advance, no exit) - still worth persisting the running
@@ -3984,6 +4282,19 @@ def _run_paper_trade_check_impl() -> dict:
                         WHERE id = ?
                         """,
                         (trail_update["spot_atr_trail_peak_price"], last_price, now, trade["id"]),
+                    )
+                elif trail_update and "camarilla" in trail_update:
+                    cam = trail_update["camarilla"]
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET camarilla_ratchet_stage = ?, camarilla_stop_premium = ?,
+                            camarilla_captured_json = ?, last_checked_price = ?,
+                            last_checked_time = ?, last_error = NULL
+                        WHERE id = ?
+                        """,
+                        (cam["stage"], cam["stop_premium"], json.dumps(cam["captured"]),
+                         last_price, now, trade["id"]),
                     )
                 elif exited:
                     qty = trade["quantity"] or 1
@@ -4366,7 +4677,7 @@ def api_chart(symbol):
         _, _, h, l, _ = candles[i]
         is_inside_bar.append(h <= prev_h and l >= prev_l)
 
-    prev_day_high, prev_day_low = fetch_previous_day_high_low(instrument_key, access_token)
+    prev_day_high, prev_day_low, _prev_day_close = fetch_previous_day_high_low(instrument_key, access_token)
 
     return jsonify({
         "status": "ok",
@@ -4617,6 +4928,60 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
             # stretch. Correct behavior, not a bug - see resample_1min_
             # to_5min - but invisible unless said outright here.
             t["stop_info"] = f"RSI {rsi_disp} [{momentum_state}] (need {threshold_note} x{confirm_candles}{ema_note}){tag_note} · last CLOSED 5m candle, not the live one"
+
+        elif strategy == "CAMARILLA_LADDER":
+            stage = t.get("camarilla_ratchet_stage") or 0
+            if stage >= 1:
+                # Ratchet already active - show the ladder status, not
+                # RSI (RSI isn't consulted anymore once a tier's been
+                # reached - see the exit-check logic).
+                stop_val = t.get("camarilla_stop_premium")
+                stop_disp = f"{stop_val:.2f}" if stop_val is not None else "?"
+                t["stop_info"] = f"Camarilla Ladder: T{stage} reached, stop now {stop_disp} (option premium terms)"
+                t["atr_value"] = None
+                t["rsi_value"] = None
+            else:
+                # Pre-T1 - identical display to RSI Momentum above, since
+                # that's exactly what's protecting this trade right now.
+                direction = t.get("direction")
+                spot_candles = None
+                spot_key = t.get("symbol")
+                if spot_key and access_token:
+                    try:
+                        resolved_key = get_instrument_key(spot_key)
+                        if resolved_key:
+                            spot_candles = get_5min_candles_with_warmup(resolved_key, access_token)
+                    except Exception:
+                        spot_candles = None
+                if not spot_candles:
+                    t["stop_info"] = "Camarilla Ladder (pre-T1): waiting for underlying candle data"
+                    t["atr_value"] = None
+                    t["rsi_value"] = None
+                    continue
+                confirm_candles = get_rsi_confirm_candles()
+                midday_active = _is_midday_session(get_rsi_midday_start(), get_rsi_midday_end())
+                if midday_active:
+                    confirm_candles = get_rsi_midday_confirm_candles()
+                call_threshold = get_rsi_call_threshold()
+                put_warning_threshold = get_rsi_put_warning_threshold()
+                deep_itm = _is_deep_itm_option(direction, t.get("paper_strike"), spot_candles[-1][3], get_rsi_deep_itm_moneyness_pct())
+                if deep_itm:
+                    call_threshold = get_rsi_deep_itm_call_threshold()
+                    put_warning_threshold = get_rsi_deep_itm_put_warning_threshold()
+                _, rsi_info = check_rsi_momentum_exit(
+                    direction, spot_candles,
+                    rsi_period=get_rsi_period(), ema_period=get_rsi_ema_period(),
+                    call_threshold=call_threshold, put_warning_threshold=put_warning_threshold,
+                    confirm_candles=confirm_candles,
+                )
+                current_rsi = rsi_info.get("rsi")
+                t["rsi_value"] = round(current_rsi, 2) if current_rsi is not None else None
+                t["atr_value"] = None
+                rsi_disp = f"{current_rsi:.1f}" if current_rsi is not None else "?"
+                threshold_note = f"CALL<{call_threshold:g}" if direction == "Buy" else f"PUT>{put_warning_threshold:g}"
+                t1_val = t.get("camarilla_t1")
+                t1_disp = f", T1 {t1_val:.2f}" if t1_val is not None else ""
+                t["stop_info"] = f"Camarilla Ladder (pre-T1): RSI {rsi_disp} (need {threshold_note} x{confirm_candles}){t1_disp} · last CLOSED 5m candle"
 
         else:
             t["stop_info"] = None
@@ -5151,7 +5516,7 @@ def paper_trading_live_toggle():
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
-VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM")
+VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER")
 
 STRATEGY_DESCRIPTIONS = {
     "EMA": "1) 5-EMA only, let it run - retired from selection (let losses run too deep waiting for a pattern reversal to confirm). Kept only for trades that already opened under it.",
@@ -5166,6 +5531,7 @@ STRATEGY_DESCRIPTIONS = {
     "JOAT_TEST_B": f"Test-B (JOAT-inspired): spot ATR structural stop (shared ATR period/multiplier, same as #6) until {SPOT_BOOK_PCT:g}% spot, then hands off entirely to the underlying's 5-EMA reversal trail - no half-booking. For comparing against #6's option-premium-based version and Test-C's wider ATR period.",
     "JOAT_TEST_C": "Test-C (JOAT-inspired, wider ATR): identical to Test-B, but reads its OWN separate ATR period/multiplier (set below, defaults to 14x2 vs Test-B's 8x2) - kept as a distinct strategy specifically so its results never mix with Test-B's in the Stats breakdown, even if the shared ATR settings change later.",
     "RSI_MOMENTUM": "10) RSI Momentum Exit (Rajaram's method): runs off the UNDERLYING's own RSI and EMA-of-Close (not the option premium) - Call exits once RSI has held below the CALL threshold for N consecutive 5-min candles AND that candle's Close is below the EMA (Put mirrors this: RSI above its threshold + Close above the EMA). Automatically widens its RSI threshold for a Deep ITM option (needs a bigger RSI move before exiting, since Deep ITM premium moves less per point of underlying) and tightens (fewer confirming candles needed) during the mid-day session when theta decay bites hardest. No fixed stop-loss floor - purely momentum/structure driven, per the original method. Every number (RSI/EMA periods, thresholds, candle counts, Deep-ITM %, mid-day window) is editable below so different combinations can be tested against each other. WARNING if live trading is on: by your own choice, live positions under this strategy have NO broker-side stop-loss at all (matches paper exactly) - the RSI/EMA check is the ONLY thing that closes them, so a position can sit fully unprotected if this app goes down, your connection drops, or (at the start of a trading day) there simply isn't enough candle history yet for RSI to be computable.",
+    "CAMARILLA_LADDER": "11) Camarilla Ladder Exit (hybrid): before the underlying's price ever reaches its first Camarilla target (T1, standard public formula off the PREVIOUS day's High/Low/Close - not a guess at any proprietary indicator), this behaves EXACTLY like RSI Momentum Exit (#10) above and shares its settings - same RSI<70/EMA9 check, same no-broker-stop-until-triggered design. The moment spot price first reaches T1, that RSI check stops being used entirely and a real broker-side stop-loss order takes over instead: placed at breakeven (your entry price) the instant T1 hits, then MOVED UP (never down) each time a further tier is reached - to T1's own option premium once T2 hits, to T2's premium once T3 hits, and so on through T4. Exit happens when that stop is hit, whichever tier it's currently sitting at - there's no fixed target/booking, this only ever tightens the floor as price proves itself, using Upstox's regular Modify Order (not GTT - a plain SL order updated in place). WARNING if live trading is on: exactly like RSI Momentum, there is NO broker-side protection at all until spot first touches T1 - if this app goes down before that point, this position has nothing resting at the broker.",
 }
 
 
