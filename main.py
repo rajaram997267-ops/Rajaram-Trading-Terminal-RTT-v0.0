@@ -1329,9 +1329,9 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                     elif entry_strategy == "CAMARILLA_LADDER":
                                         sl_note = (
                                             "Camarilla Ladder: no broker-side stop yet - pre-T1 phase runs on "
-                                            "the same RSI/EMA check as RSI Momentum. A real SL order gets placed "
-                                            "automatically the moment spot first reaches T1, then moves up as "
-                                            "further tiers are reached. No safety net until that first happens."
+                                            "RSI Simple Exit's bare rule (RSI-only, no EMA). A real SL order gets "
+                                            "placed automatically the moment spot first reaches T1, then moves up "
+                                            "as further tiers are reached. No safety net until that first happens."
                                         )
                                     elif live_entry_price:
                                         live_sl_trigger_price = round(live_entry_price * 0.98, 1)
@@ -3510,14 +3510,10 @@ def _run_paper_trade_check_impl() -> dict:
             # paper has already closed but live is still open (they can
             # diverge - see the note on live_instrument_key below) - this
             # runs unconditionally off trade["strategy"], not paper's own
-            # OPEN/CLOSED status, so live can always find it. Camarilla
-            # Ladder shares this exact computation for its own pre-T1
-            # phase (see camarilla_ratchet_stage below) - it's the same
-            # RSI/EMA check, strategy #10's own settings, until the first
-            # tier is reached.
+            # OPEN/CLOSED status, so live can always find it.
             rsi_momentum_triggered = False
             rsi_momentum_info: dict = {}
-            if strategy in ("RSI_MOMENTUM", "CAMARILLA_LADDER") and spot_candles:
+            if strategy == "RSI_MOMENTUM" and spot_candles:
                 rsi_confirm_candles = get_rsi_confirm_candles()
                 rsi_midday_active = _is_midday_session(get_rsi_midday_start(), get_rsi_midday_end())
                 if rsi_midday_active:
@@ -3533,6 +3529,33 @@ def _run_paper_trade_check_impl() -> dict:
                     rsi_period=get_rsi_period(), ema_period=get_rsi_ema_period(),
                     call_threshold=rsi_call_threshold, put_warning_threshold=rsi_put_warning_threshold,
                     confirm_candles=rsi_confirm_candles,
+                )
+
+            # Camarilla Ladder's pre-T1 trigger, computed ONCE here for the
+            # same shared-between-paper-and-live reason as above. Originally
+            # reused RSI Momentum's own EMA-gated check, but a live example
+            # (FEDERALBNK, entry 9:25, RSI already <70 by the 9:35 candle,
+            # EMA9 didn't turn down until 9:55 - 6 candles later) showed
+            # requiring EMA confirmation here made this exit fire too late.
+            # Switched to RSI Simple Exit's bare rule instead - no EMA leg,
+            # no Deep-ITM widening (matching check_rsi_simple_exit's own
+            # design choice, made for the same reason: fewer conditions
+            # layered on performed better in live use). Still shares #10's
+            # core period/threshold/confirm-candles settings, just not its
+            # EMA period or Deep-ITM settings.
+            camarilla_rsi_triggered = False
+            camarilla_rsi_info: dict = {}
+            if strategy == "CAMARILLA_LADDER" and spot_candles:
+                cam_confirm_candles = get_rsi_confirm_candles()
+                cam_midday_active = _is_midday_session(get_rsi_midday_start(), get_rsi_midday_end())
+                if cam_midday_active:
+                    cam_confirm_candles = get_rsi_midday_confirm_candles()
+                camarilla_rsi_triggered, camarilla_rsi_info = check_rsi_simple_exit(
+                    trade["direction"], spot_candles,
+                    rsi_period=get_rsi_period(),
+                    call_threshold=get_rsi_call_threshold(),
+                    put_warning_threshold=get_rsi_put_warning_threshold(),
+                    confirm_candles=cam_confirm_candles,
                 )
 
             # Camarilla Ladder's own tier-ratchet, computed ONCE here for
@@ -3927,9 +3950,11 @@ def _run_paper_trade_check_impl() -> dict:
 
             elif strategy == "CAMARILLA_LADDER" and last_price is not None:
                 # Hybrid (see strategy description in EXIT_STRATEGY_INFO):
-                # before spot ever reaches T1, this is identical to RSI
-                # Momentum Exit above - same shared trigger, strategy #10's
-                # own settings. The moment spot first reaches T1, the RSI
+                # before spot ever reaches T1, pre-T1 protection is RSI
+                # Simple Exit's bare rule (see camarilla_rsi_triggered
+                # above - no EMA leg, switched from RSI Momentum's EMA-
+                # gated check after live use showed EMA confirmation firing
+                # too late). The moment spot first reaches T1, that RSI
                 # check stops being consulted and a ratcheting stop in
                 # OPTION PREMIUM terms takes over. Camarilla's own T1-T4
                 # levels are in SPOT price terms and don't translate
@@ -3945,13 +3970,10 @@ def _run_paper_trade_check_impl() -> dict:
                             "stage": camarilla_new_stage, "stop_premium": entry_price,
                             "captured": [last_price] * camarilla_new_stage,
                         }}
-                    elif rsi_momentum_triggered:
+                    elif camarilla_rsi_triggered:
                         exited, exit_price = True, last_price
-                        rsi_disp = f"{rsi_momentum_info['rsi']:.1f}" if rsi_momentum_info.get("rsi") is not None else "?"
-                        exit_reason = (
-                            f"Camarilla Ladder: RSI momentum exit before T1 (RSI {rsi_disp}, close "
-                            f"{'<' if trade['direction'] == 'Buy' else '>'} EMA{get_rsi_ema_period()})"
-                        )
+                        rsi_disp = f"{camarilla_rsi_info['rsi']:.1f}" if camarilla_rsi_info.get("rsi") is not None else "?"
+                        exit_reason = f"Camarilla Ladder: RSI simple exit before T1 (RSI {rsi_disp} on last closed 5m candle)"
                 else:
                     # Ratchet already active - RSI is no longer consulted,
                     # the ladder stop is the only exit condition from here.
@@ -4157,24 +4179,26 @@ def _run_paper_trade_check_impl() -> dict:
                     rsi_disp = f"{rsi_momentum_info['rsi']:.1f}" if rsi_momentum_info.get("rsi") is not None else "?"
                     live_exit_reason_val = f"RSI momentum exit (RSI {rsi_disp} on last closed 5m candle) - no broker floor, by design"
             elif strategy == "CAMARILLA_LADDER":
-                # Hybrid, live side. Pre-T1 (stage 0): identical to RSI
-                # Momentum above - no broker-side stop exists yet, only
-                # the shared RSI trigger can close this. The moment spot
-                # first reaches T1, a REAL SL order gets placed for the
-                # first time (there was none before) at breakeven; every
-                # further tier crossing MODIFIES that same order in place
-                # (see modify_order) rather than replacing it. The
-                # existing generic SL-fired check earlier in this
-                # function (trade["live_sl_order_id"] polling) picks up
-                # this order automatically once it exists - nothing
-                # strategy-specific needed there.
+                # Hybrid, live side. Pre-T1 (stage 0): RSI Simple Exit's
+                # bare rule (camarilla_rsi_triggered above - no EMA leg,
+                # switched from RSI Momentum's EMA-gated check after live
+                # use showed EMA confirmation firing too late), no broker-
+                # side stop exists yet. The moment spot first reaches T1,
+                # a REAL SL order gets placed for the first time (there
+                # was none before) at breakeven; every further tier
+                # crossing MODIFIES that same order in place (see
+                # modify_order) rather than replacing it. The existing
+                # generic SL-fired check earlier in this function
+                # (trade["live_sl_order_id"] polling) picks up this order
+                # automatically once it exists - nothing strategy-specific
+                # needed there.
                 live_camarilla_current_stage = trade["live_camarilla_ratchet_stage"] or 0
                 if live_camarilla_current_stage == 0:
-                    if not live_exited and trade["live_status"] == "OPEN" and rsi_momentum_triggered:
+                    if not live_exited and trade["live_status"] == "OPEN" and camarilla_rsi_triggered:
                         live_exited = True
-                        rsi_disp = f"{rsi_momentum_info['rsi']:.1f}" if rsi_momentum_info.get("rsi") is not None else "?"
+                        rsi_disp = f"{camarilla_rsi_info['rsi']:.1f}" if camarilla_rsi_info.get("rsi") is not None else "?"
                         live_exit_reason_val = (
-                            f"Camarilla Ladder: RSI momentum exit before T1 (RSI {rsi_disp}) "
+                            f"Camarilla Ladder: RSI simple exit before T1 (RSI {rsi_disp}) "
                             "- no broker floor yet, by design"
                         )
                     elif (trade["live_status"] == "OPEN" and camarilla_new_stage and camarilla_new_stage >= 1
@@ -5013,8 +5037,10 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                 t["atr_value"] = None
                 t["rsi_value"] = None
             else:
-                # Pre-T1 - identical display to RSI Momentum above, since
-                # that's exactly what's protecting this trade right now.
+                # Pre-T1 - RSI Simple Exit's bare rule protects this trade
+                # right now (no EMA leg, no Deep-ITM widening - switched
+                # from RSI Momentum's EMA-gated check after live use
+                # showed EMA confirmation firing too late).
                 direction = t.get("direction")
                 spot_candles = None
                 spot_key = t.get("symbol")
@@ -5036,13 +5062,9 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                     confirm_candles = get_rsi_midday_confirm_candles()
                 call_threshold = get_rsi_call_threshold()
                 put_warning_threshold = get_rsi_put_warning_threshold()
-                deep_itm = _is_deep_itm_option(direction, t.get("paper_strike"), spot_candles[-1][3], get_rsi_deep_itm_moneyness_pct())
-                if deep_itm:
-                    call_threshold = get_rsi_deep_itm_call_threshold()
-                    put_warning_threshold = get_rsi_deep_itm_put_warning_threshold()
-                _, rsi_info = check_rsi_momentum_exit(
+                _, rsi_info = check_rsi_simple_exit(
                     direction, spot_candles,
-                    rsi_period=get_rsi_period(), ema_period=get_rsi_ema_period(),
+                    rsi_period=get_rsi_period(),
                     call_threshold=call_threshold, put_warning_threshold=put_warning_threshold,
                     confirm_candles=confirm_candles,
                 )
@@ -5652,7 +5674,7 @@ STRATEGY_DESCRIPTIONS = {
     "JOAT_TEST_B": f"Test-B (JOAT-inspired): spot ATR structural stop (shared ATR period/multiplier, same as #6) until {SPOT_BOOK_PCT:g}% spot, then hands off entirely to the underlying's 5-EMA reversal trail - no half-booking. For comparing against #6's option-premium-based version and Test-C's wider ATR period.",
     "JOAT_TEST_C": "Test-C (JOAT-inspired, wider ATR): identical to Test-B, but reads its OWN separate ATR period/multiplier (set below, defaults to 14x2 vs Test-B's 8x2) - kept as a distinct strategy specifically so its results never mix with Test-B's in the Stats breakdown, even if the shared ATR settings change later.",
     "RSI_MOMENTUM": "10) RSI Momentum Exit (Rajaram's method): runs off the UNDERLYING's own RSI and EMA-of-Close (not the option premium) - Call exits once RSI has held below the CALL threshold for N consecutive 5-min candles AND that candle's Close is below the EMA (Put mirrors this: RSI above its threshold + Close above the EMA). Automatically widens its RSI threshold for a Deep ITM option (needs a bigger RSI move before exiting, since Deep ITM premium moves less per point of underlying) and tightens (fewer confirming candles needed) during the mid-day session when theta decay bites hardest. No fixed stop-loss floor - purely momentum/structure driven, per the original method. Every number (RSI/EMA periods, thresholds, candle counts, Deep-ITM %, mid-day window) is editable below so different combinations can be tested against each other. WARNING if live trading is on: by your own choice, live positions under this strategy have NO broker-side stop-loss at all (matches paper exactly) - the RSI/EMA check is the ONLY thing that closes them, so a position can sit fully unprotected if this app goes down, your connection drops, or (at the start of a trading day) there simply isn't enough candle history yet for RSI to be computable.",
-    "CAMARILLA_LADDER": "11) Camarilla Ladder Exit (hybrid): before the underlying's price ever reaches its first Camarilla target (T1, standard public formula off the PREVIOUS day's High/Low/Close - not a guess at any proprietary indicator), this behaves EXACTLY like RSI Momentum Exit (#10) above and shares its settings - same RSI<70/EMA9 check, same no-broker-stop-until-triggered design. The moment spot price first reaches T1, that RSI check stops being used entirely and a real broker-side stop-loss order takes over instead: placed at breakeven (your entry price) the instant T1 hits, then MOVED UP (never down) each time a further tier is reached - to T1's own option premium once T2 hits, to T2's premium once T3 hits, and so on through T4. Exit happens when that stop is hit, whichever tier it's currently sitting at - there's no fixed target/booking, this only ever tightens the floor as price proves itself, using Upstox's regular Modify Order (not GTT - a plain SL order updated in place). WARNING if live trading is on: exactly like RSI Momentum, there is NO broker-side protection at all until spot first touches T1 - if this app goes down before that point, this position has nothing resting at the broker.",
+    "CAMARILLA_LADDER": "11) Camarilla Ladder Exit (hybrid): before the underlying's price ever reaches its first Camarilla target (T1, standard public formula off the PREVIOUS day's High/Low/Close - not a guess at any proprietary indicator), this runs RSI Simple Exit's bare rule (#12) - RSI<70/>45 for 2 closed candles, no EMA leg - same no-broker-stop-until-triggered design (switched from RSI Momentum's EMA-gated check after a live example showed EMA confirmation firing too late). The moment spot price first reaches T1, that RSI check stops being used entirely and a real broker-side stop-loss order takes over instead: placed at breakeven (your entry price) the instant T1 hits, then MOVED UP (never down) each time a further tier is reached - to T1's own option premium once T2 hits, to T2's premium once T3 hits, and so on through T4. Exit happens when that stop is hit, whichever tier it's currently sitting at - there's no fixed target/booking, this only ever tightens the floor as price proves itself, using Upstox's regular Modify Order (not GTT - a plain SL order updated in place). WARNING if live trading is on: exactly like RSI Simple/Momentum, there is NO broker-side protection at all until spot first touches T1 - if this app goes down before that point, this position has nothing resting at the broker.",
     "RSI_SIMPLE": "12) RSI Simple Exit: the bare rule with nothing else added - exit Buy once 2 consecutive CLOSED 5-min candles (of the underlying) show RSI<70, exit Sell once 2 consecutive closed candles show RSI>45. No EMA/structure check, no Deep-ITM widening, no mid-day tightening - added after live testing of #10 and #11 found the plain version working better than either one with more conditions layered on top. Shares #10's core RSI period/threshold/confirm-candles settings above (not its EMA period, Deep-ITM, or mid-day settings - none of those apply here). Live trading note: unlike #10/#11, this one is NOT wired into live's own exit trigger - a live position under this strategy still gets the normal broker-side -2% stop and 0.5% trail, same as strategies #2-#9. Say the word if you'd rather it match #10/#11's no-floor, RSI-only live behavior instead.",
 }
 
