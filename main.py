@@ -1175,7 +1175,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                             live_quantity = lots * lot_size
                             label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
 
-                            if get_live_entry_mode() == "GTT" and entry_strategy not in ("RSI_MOMENTUM", "CAMARILLA_LADDER"):
+                            if get_live_entry_mode() == "GTT" and entry_strategy not in ("RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE"):
                                 # GTT mode: entry AND trailing stop-loss are
                                 # ONE combined order - Upstox's engine
                                 # places the entry when the ENTRY leg fires
@@ -1332,6 +1332,12 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                             "RSI Simple Exit's bare rule (RSI-only, no EMA). A real SL order gets "
                                             "placed automatically the moment spot first reaches T1, then moves up "
                                             "as further tiers are reached. No safety net until that first happens."
+                                        )
+                                    elif entry_strategy == "RSI_SIMPLE":
+                                        sl_note = (
+                                            "RSI Simple Exit: no broker-side stop placed by design (matches paper "
+                                            "exactly, per your choice) - the bare RSI check (no EMA) is the only "
+                                            "thing that closes this position. No safety net if this app goes down."
                                         )
                                     elif live_entry_price:
                                         live_sl_trigger_price = round(live_entry_price * 0.98, 1)
@@ -4248,6 +4254,17 @@ def _run_paper_trade_check_impl() -> dict:
                         # next pass. The OLD stop is still resting at the
                         # broker in the meantime (real protection, just
                         # not yet moved up to the new tier).
+            elif strategy == "RSI_SIMPLE":
+                # Pure RSI Simple for live, per user's explicit follow-up
+                # choice to extend #10's no-floor treatment to #12 too -
+                # no broker floor, no percentage trail. The SAME trigger
+                # computed once above (rsi_simple_triggered) that decides
+                # paper's exit also closes live - both sides agree exactly,
+                # since there's nothing else to check (no EMA leg here).
+                if not live_exited and trade["live_status"] == "OPEN" and rsi_simple_triggered:
+                    live_exited = True
+                    rsi_disp = f"{rsi_simple_info['rsi']:.1f}" if rsi_simple_info.get("rsi") is not None else "?"
+                    live_exit_reason_val = f"RSI simple exit (RSI {rsi_disp} on last closed 5m candle) - no broker floor, by design"
             elif not live_exited and trade["live_status"] == "OPEN" and live_last_price is not None and live_entry_ref:
                 live_pct_change = (live_last_price - live_entry_ref) / live_entry_ref * 100
                 if trade["live_trail_high_pct"] is None:
@@ -5675,7 +5692,7 @@ STRATEGY_DESCRIPTIONS = {
     "JOAT_TEST_C": "Test-C (JOAT-inspired, wider ATR): identical to Test-B, but reads its OWN separate ATR period/multiplier (set below, defaults to 14x2 vs Test-B's 8x2) - kept as a distinct strategy specifically so its results never mix with Test-B's in the Stats breakdown, even if the shared ATR settings change later.",
     "RSI_MOMENTUM": "10) RSI Momentum Exit (Rajaram's method): runs off the UNDERLYING's own RSI and EMA-of-Close (not the option premium) - Call exits once RSI has held below the CALL threshold for N consecutive 5-min candles AND that candle's Close is below the EMA (Put mirrors this: RSI above its threshold + Close above the EMA). Automatically widens its RSI threshold for a Deep ITM option (needs a bigger RSI move before exiting, since Deep ITM premium moves less per point of underlying) and tightens (fewer confirming candles needed) during the mid-day session when theta decay bites hardest. No fixed stop-loss floor - purely momentum/structure driven, per the original method. Every number (RSI/EMA periods, thresholds, candle counts, Deep-ITM %, mid-day window) is editable below so different combinations can be tested against each other. WARNING if live trading is on: by your own choice, live positions under this strategy have NO broker-side stop-loss at all (matches paper exactly) - the RSI/EMA check is the ONLY thing that closes them, so a position can sit fully unprotected if this app goes down, your connection drops, or (at the start of a trading day) there simply isn't enough candle history yet for RSI to be computable.",
     "CAMARILLA_LADDER": "11) Camarilla Ladder Exit (hybrid): before the underlying's price ever reaches its first Camarilla target (T1, standard public formula off the PREVIOUS day's High/Low/Close - not a guess at any proprietary indicator), this runs RSI Simple Exit's bare rule (#12) - RSI<70/>45 for 2 closed candles, no EMA leg - same no-broker-stop-until-triggered design (switched from RSI Momentum's EMA-gated check after a live example showed EMA confirmation firing too late). The moment spot price first reaches T1, that RSI check stops being used entirely and a real broker-side stop-loss order takes over instead: placed at breakeven (your entry price) the instant T1 hits, then MOVED UP (never down) each time a further tier is reached - to T1's own option premium once T2 hits, to T2's premium once T3 hits, and so on through T4. Exit happens when that stop is hit, whichever tier it's currently sitting at - there's no fixed target/booking, this only ever tightens the floor as price proves itself, using Upstox's regular Modify Order (not GTT - a plain SL order updated in place). WARNING if live trading is on: exactly like RSI Simple/Momentum, there is NO broker-side protection at all until spot first touches T1 - if this app goes down before that point, this position has nothing resting at the broker.",
-    "RSI_SIMPLE": "12) RSI Simple Exit: the bare rule with nothing else added - exit Buy once 2 consecutive CLOSED 5-min candles (of the underlying) show RSI<70, exit Sell once 2 consecutive closed candles show RSI>45. No EMA/structure check, no Deep-ITM widening, no mid-day tightening - added after live testing of #10 and #11 found the plain version working better than either one with more conditions layered on top. Shares #10's core RSI period/threshold/confirm-candles settings above (not its EMA period, Deep-ITM, or mid-day settings - none of those apply here). Live trading note: unlike #10/#11, this one is NOT wired into live's own exit trigger - a live position under this strategy still gets the normal broker-side -2% stop and 0.5% trail, same as strategies #2-#9. Say the word if you'd rather it match #10/#11's no-floor, RSI-only live behavior instead.",
+    "RSI_SIMPLE": "12) RSI Simple Exit: the bare rule with nothing else added - exit Buy once 2 consecutive CLOSED 5-min candles (of the underlying) show RSI<70, exit Sell once 2 consecutive closed candles show RSI>45. No EMA/structure check, no Deep-ITM widening, no mid-day tightening - added after live testing of #10 and #11 found the plain version working better than either one with more conditions layered on top. Shares #10's core RSI period/threshold/confirm-candles settings above (not its EMA period, Deep-ITM, or mid-day settings - none of those apply here). WARNING if live trading is on: same no-floor design as #10/#11 - there is NO broker-side protection at all, the bare RSI check is the only thing that closes this position. If this app goes down, this position has nothing resting at the broker until it's back up.",
 }
 
 
