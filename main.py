@@ -532,6 +532,10 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_camarilla_ratchet_stage INTEGER DEFAULT 0",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_camarilla_stop_premium DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_camarilla_captured_json TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_t1 DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_t2 DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_stage INTEGER DEFAULT 0",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_fib_stage INTEGER DEFAULT 0",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -1115,6 +1119,21 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
             if tiers:
                 camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4 = tiers
 
+    # First 5-Min Fib Exit's T1/T2, computed once at entry from TODAY's
+    # own first 5-min candle (09:15-09:20 IST) - a bigger opening candle
+    # produces bigger targets and vice versa, by design. If that first
+    # candle hasn't closed yet (an unusually early entry, before ~09:20),
+    # these stay None for now and the exit-check loop retries fetching
+    # them on a later poll - same graceful-degradation pattern as
+    # Camarilla Ladder's own missing-previous-day-data case.
+    fib_t1 = fib_t2 = None
+    if entry_strategy == "FIRST5MIN_FIB" and access_token:
+        fib_spot_key = get_instrument_key(symbol)
+        if fib_spot_key:
+            first_candle = fetch_first_5min_candle(fib_spot_key, access_token)
+            if first_candle:
+                fib_t1, fib_t2 = compute_first_5min_fib_targets(category, first_candle[0], first_candle[1])
+
     with get_db() as conn:
         row = conn.execute(
             """
@@ -1122,13 +1141,15 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                 (symbol, direction, entry_price, entry_time, status, quantity,
                  paper_instrument_key, paper_option_label, last_error,
                  strategy, original_quantity, alert_name, scan_name, spot_entry_price,
-                 paper_strike, entry_rsi, camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4)
-            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 paper_strike, entry_rsi, camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4,
+                 fib_t1, fib_t2)
+            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (symbol, category, entry_price, now, quantity, paper_instrument_key, paper_option_label,
              fallback_note, entry_strategy, quantity, alert_name or None, scan_name or None, spot_entry_price,
-             paper_strike_val, entry_rsi_val, camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4),
+             paper_strike_val, entry_rsi_val, camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4,
+             fib_t1, fib_t2),
         ).fetchone()
         conn.commit()
 
@@ -1175,7 +1196,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                             live_quantity = lots * lot_size
                             label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
 
-                            if get_live_entry_mode() == "GTT" and entry_strategy not in ("RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE"):
+                            if get_live_entry_mode() == "GTT" and entry_strategy not in ("RSI_MOMENTUM", "CAMARILLA_LADDER", "FIRST5MIN_FIB"):
                                 # GTT mode: entry AND trailing stop-loss are
                                 # ONE combined order - Upstox's engine
                                 # places the entry when the ENTRY leg fires
@@ -1333,11 +1354,12 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                             "placed automatically the moment spot first reaches T1, then moves up "
                                             "as further tiers are reached. No safety net until that first happens."
                                         )
-                                    elif entry_strategy == "RSI_SIMPLE":
+                                    elif entry_strategy == "FIRST5MIN_FIB":
                                         sl_note = (
-                                            "RSI Simple Exit: no broker-side stop placed by design (matches paper "
-                                            "exactly, per your choice) - the bare RSI check (no EMA) is the only "
-                                            "thing that closes this position. No safety net if this app goes down."
+                                            "1st 5 Min FIB levels strategy: no broker-side stop at all, for this "
+                                            "trade's ENTIRE life - pre-T1 runs on RSI Simple Exit's bare rule; "
+                                            "once T1 is reached, exit fires purely in software the instant T2 "
+                                            "hits or price reverses back through T1. No safety net ever, by design."
                                         )
                                     elif live_entry_price:
                                         live_sl_trigger_price = round(live_entry_price * 0.98, 1)
@@ -2246,6 +2268,40 @@ def camarilla_ratchet_stage_reached(direction: str, spot_price: float, tiers: li
         else:
             break
     return stage
+
+
+def fetch_first_5min_candle(instrument_key: str, access_token: str) -> tuple[float, float] | None:
+    """Today's first 5-min candle (09:15-09:20 IST) High/Low, for First
+    5-Min Fib Exit (strategy #13). Uses the same cached today-only fetch
+    everything else uses (fetch_5min_candles_cached) - candles[0] is the
+    oldest, i.e. the first one of the day, once it exists. Returns None
+    before that first candle has actually closed (~09:20) - by far the
+    common case in practice since the earliest-entry-time setting
+    defaults to 09:30, already past that point, but a trade opened
+    unusually early (or with that setting changed) may need a few extra
+    polls before this becomes available. Callers should treat None the
+    same as "not computed yet, retry" rather than a hard failure."""
+    candles = fetch_5min_candles_cached(instrument_key, access_token)
+    if not candles:
+        return None
+    o, h, l, c = candles[0]
+    return h, l
+
+
+def compute_first_5min_fib_targets(direction: str, first_high: float, first_low: float) -> tuple[float, float]:
+    """Fibonacci-extension-style targets off today's first 5-min candle,
+    per Rajaram's own worked levels: candle High = the 1.00 level, Low =
+    the 0.00 level, Range = High - Low.
+        Buy:  T1 = High + Range*0.50 (the 1.50 level), T2 = High + Range*1.00 (the 2.00 level)
+        Sell: T1 = Low  - Range*0.50 (the -0.50 level), T2 = Low  - Range*1.00 (the -1.00 level)
+    A bigger first candle produces a bigger target distance and vice
+    versa, by design - this is the whole point of basing it on that
+    candle's own range rather than a fixed point distance."""
+    rng = first_high - first_low
+    if direction == "Buy":
+        return first_high + rng * 0.5, first_high + rng * 1.0
+    else:
+        return first_low - rng * 0.5, first_low - rng * 1.0
 
 
 def fetch_5min_candles_with_time(instrument_key: str, access_token: str) -> list[tuple[str, float, float, float, float]]:
@@ -3499,7 +3555,7 @@ def _run_paper_trade_check_impl() -> dict:
             # strategy - it's a second Upstox call on top of the option's
             # own, so no reason to pay for it otherwise.
             spot_candles = None
-            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE"):
+            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE", "FIRST5MIN_FIB"):
                 spot_key = get_instrument_key(symbol)
                 if spot_key:
                     spot_candles = get_5min_candles_with_warmup(spot_key, access_token)
@@ -3598,6 +3654,70 @@ def _run_paper_trade_check_impl() -> dict:
                     put_warning_threshold=get_rsi_put_warning_threshold(),
                     confirm_candles=get_rsi_confirm_candles(),
                 )
+
+            # 1st 5 Min FIB levels strategy's trigger (#13) - separate from
+            # both #11 and #12, though its pre-T1 phase reuses the exact
+            # same RSI-only rule as #12 (see check_rsi_simple_exit). Once
+            # T1 has been reached this pass or on a previous one, RSI is
+            # no longer consulted - fib_reversed_or_t2 below is the only
+            # thing that matters from that point on.
+            fib_rsi_triggered = False
+            fib_rsi_info: dict = {}
+            fib_stage_now = None
+            fib_reversed_or_t2 = None
+            if strategy == "FIRST5MIN_FIB" and trade["fib_t1"] is not None and spot_last_price is not None:
+                fib_current_stage = trade["fib_stage"] or 0
+                t1, t2 = trade["fib_t1"], trade["fib_t2"]
+                if fib_current_stage == 0:
+                    reached_t1 = (spot_last_price >= t1) if trade["direction"] == "Buy" else (spot_last_price <= t1)
+                    fib_stage_now = 1 if reached_t1 else 0
+                    if not reached_t1 and spot_candles:
+                        fib_rsi_triggered, fib_rsi_info = check_rsi_simple_exit(
+                            trade["direction"], spot_candles,
+                            rsi_period=get_rsi_period(),
+                            call_threshold=get_rsi_call_threshold(),
+                            put_warning_threshold=get_rsi_put_warning_threshold(),
+                            confirm_candles=get_rsi_confirm_candles(),
+                        )
+                else:
+                    fib_stage_now = 1
+                    reached_t2 = (spot_last_price >= t2) if trade["direction"] == "Buy" else (spot_last_price <= t2)
+                    # Tightest possible trigger, by explicit choice: fires
+                    # the moment spot is AT or back below T1 (Buy) / AT or
+                    # back above T1 (Sell), not only once it's confirmed
+                    # clearly past T1. A 5-second poll still can't catch
+                    # the exact instant spot equals T1 - this just avoids
+                    # adding any extra confirmation margin on top of that
+                    # unavoidable polling gap.
+                    reversed_below_t1 = (spot_last_price <= t1) if trade["direction"] == "Buy" else (spot_last_price >= t1)
+                    if reached_t2:
+                        fib_reversed_or_t2 = "t2"
+                    elif reversed_below_t1:
+                        fib_reversed_or_t2 = "reversed"
+            elif strategy == "FIRST5MIN_FIB" and trade["fib_t1"] is None and access_token:
+                # First candle wasn't available yet at entry (rare - only
+                # happens if a trade opened before ~09:20 IST) - retry
+                # fetching it here so this doesn't stay stuck pre-T1
+                # forever with no targets to check against.
+                fib_retry_key = get_instrument_key(trade["symbol"])
+                if fib_retry_key:
+                    fib_retry_candle = fetch_first_5min_candle(fib_retry_key, access_token)
+                    if fib_retry_candle:
+                        new_t1, new_t2 = compute_first_5min_fib_targets(trade["direction"], fib_retry_candle[0], fib_retry_candle[1])
+                        with get_db() as conn:
+                            conn.execute(
+                                "UPDATE paper_trades SET fib_t1 = ?, fib_t2 = ? WHERE id = ?",
+                                (new_t1, new_t2, trade["id"]),
+                            )
+                            conn.commit()
+                if spot_candles:
+                    fib_rsi_triggered, fib_rsi_info = check_rsi_simple_exit(
+                        trade["direction"], spot_candles,
+                        rsi_period=get_rsi_period(),
+                        call_threshold=get_rsi_call_threshold(),
+                        put_warning_threshold=get_rsi_put_warning_threshold(),
+                        confirm_candles=get_rsi_confirm_candles(),
+                    )
 
 
 
@@ -4016,6 +4136,26 @@ def _run_paper_trade_check_impl() -> dict:
                         f"{get_rsi_confirm_candles()}x candle)"
                     )
 
+            elif strategy == "FIRST5MIN_FIB" and last_price is not None:
+                # #13 (1st 5 Min FIB levels strategy). Pre-T1: same RSI-only
+                # rule as #12. Once T1 is reached: 100% exit the instant
+                # EITHER T2 is reached OR spot reverses back through T1 -
+                # no partial booking, no ratchet, just a single trigger.
+                if fib_stage_now == 1 and (trade["fib_stage"] or 0) == 0:
+                    # T1 just reached THIS pass for the first time - record
+                    # the stage flip, nothing exits yet on this same poll.
+                    trail_update = {"fib_stage": 1}
+                elif fib_reversed_or_t2 == "t2":
+                    exited, exit_price = True, last_price
+                    exit_reason = f"1st 5 Min FIB: Target 2 hit ({trade['fib_t2']:.2f} on the underlying)"
+                elif fib_reversed_or_t2 == "reversed":
+                    exited, exit_price = True, last_price
+                    exit_reason = f"1st 5 Min FIB: reversed back through T1 ({trade['fib_t1']:.2f}) - booked near T1"
+                elif fib_rsi_triggered:
+                    exited, exit_price = True, last_price
+                    rsi_disp = f"{fib_rsi_info['rsi']:.1f}" if fib_rsi_info.get("rsi") is not None else "?"
+                    exit_reason = f"1st 5 Min FIB: RSI stoploss before T1 (RSI {rsi_disp} on last closed 5m candle)"
+
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
                 # kept only so trades that opened under the old single
@@ -4125,6 +4265,7 @@ def _run_paper_trade_check_impl() -> dict:
             live_trail_update = None
             live_sl_fired_price = None
             live_camarilla_update = None
+            live_fib_stage_update = None
 
             # Check whether the resting SL stop already fired on its own
             # since the last pass - if so, the broker closed the position
@@ -4254,17 +4395,30 @@ def _run_paper_trade_check_impl() -> dict:
                         # next pass. The OLD stop is still resting at the
                         # broker in the meantime (real protection, just
                         # not yet moved up to the new tier).
-            elif strategy == "RSI_SIMPLE":
-                # Pure RSI Simple for live, per user's explicit follow-up
-                # choice to extend #10's no-floor treatment to #12 too -
-                # no broker floor, no percentage trail. The SAME trigger
-                # computed once above (rsi_simple_triggered) that decides
-                # paper's exit also closes live - both sides agree exactly,
-                # since there's nothing else to check (no EMA leg here).
-                if not live_exited and trade["live_status"] == "OPEN" and rsi_simple_triggered:
-                    live_exited = True
-                    rsi_disp = f"{rsi_simple_info['rsi']:.1f}" if rsi_simple_info.get("rsi") is not None else "?"
-                    live_exit_reason_val = f"RSI simple exit (RSI {rsi_disp} on last closed 5m candle) - no broker floor, by design"
+            elif strategy == "FIRST5MIN_FIB":
+                # #13, live side - mirrors the paper logic exactly, no
+                # order placement/modification at all (unlike #11): pre-T1
+                # is RSI-only with no broker floor; once T1 is reached,
+                # exit fires the moment EITHER T2 is reached or spot
+                # reverses back through T1 - a single plain market exit
+                # via the generic live_exited mechanism, live and paper
+                # sharing the same underlying-price decision (fib_stage_now/
+                # fib_reversed_or_t2, computed once above).
+                live_fib_current_stage = trade["live_fib_stage"] or 0
+                if live_fib_current_stage == 0:
+                    if fib_stage_now == 1:
+                        live_fib_stage_update = 1
+                    elif not live_exited and trade["live_status"] == "OPEN" and fib_rsi_triggered:
+                        live_exited = True
+                        rsi_disp = f"{fib_rsi_info['rsi']:.1f}" if fib_rsi_info.get("rsi") is not None else "?"
+                        live_exit_reason_val = f"1st 5 Min FIB: RSI stoploss before T1 (RSI {rsi_disp}) - no broker floor, by design"
+                elif not live_exited and trade["live_status"] == "OPEN":
+                    if fib_reversed_or_t2 == "t2":
+                        live_exited = True
+                        live_exit_reason_val = f"1st 5 Min FIB: Target 2 hit ({trade['fib_t2']:.2f} on the underlying)"
+                    elif fib_reversed_or_t2 == "reversed":
+                        live_exited = True
+                        live_exit_reason_val = f"1st 5 Min FIB: reversed back through T1 ({trade['fib_t1']:.2f}) - booked near T1"
             elif not live_exited and trade["live_status"] == "OPEN" and live_last_price is not None and live_entry_ref:
                 live_pct_change = (live_last_price - live_entry_ref) / live_entry_ref * 100
                 if trade["live_trail_high_pct"] is None:
@@ -4341,6 +4495,13 @@ def _run_paper_trade_check_impl() -> dict:
                          live_camarilla_update["sl_trigger"], new_live_mae_pct, trade["id"]),
                     )
                     conn.commit()
+            elif live_fib_stage_update is not None:
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE paper_trades SET live_fib_stage = ?, live_mae_pct = ? WHERE id = ?",
+                        (live_fib_stage_update, new_live_mae_pct, trade["id"]),
+                    )
+                    conn.commit()
             elif trade["live_status"] == "OPEN" and new_live_mae_pct != trade["live_mae_pct"]:
                 # Live is open and simply holding this pass (no trail
                 # advance, no exit) - still worth persisting the running
@@ -4408,6 +4569,15 @@ def _run_paper_trade_check_impl() -> dict:
                         """,
                         (cam["stage"], cam["stop_premium"], json.dumps(cam["captured"]),
                          last_price, now, trade["id"]),
+                    )
+                elif trail_update and "fib_stage" in trail_update:
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET fib_stage = ?, last_checked_price = ?, last_checked_time = ?, last_error = NULL
+                        WHERE id = ?
+                        """,
+                        (trail_update["fib_stage"], last_price, now, trade["id"]),
                     )
                 elif exited:
                     qty = trade["quantity"] or 1
@@ -5094,6 +5264,59 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                 t1_disp = f", T1 {t1_val:.2f}" if t1_val is not None else ""
                 t["stop_info"] = f"Camarilla Ladder (pre-T1): RSI {rsi_disp} (need {threshold_note} x{confirm_candles}){t1_disp} · last CLOSED 5m candle"
 
+        elif strategy == "FIRST5MIN_FIB":
+            stage = t.get("fib_stage") or 0
+            t1_val, t2_val = t.get("fib_t1"), t.get("fib_t2")
+            if stage >= 1:
+                # T1 already reached - watching for T2 or a reversal back
+                # through T1, no RSI involved anymore.
+                t1_disp = f"{t1_val:.2f}" if t1_val is not None else "?"
+                t2_disp = f"{t2_val:.2f}" if t2_val is not None else "?"
+                t["stop_info"] = f"1st 5 Min FIB: T1 ({t1_disp}) reached - exits at T2 ({t2_disp}) or on reversal back through T1"
+                t["atr_value"] = None
+                t["rsi_value"] = None
+            elif t1_val is None:
+                t["stop_info"] = "1st 5 Min FIB: waiting for today's first 5-min candle to close (~09:20 IST)"
+                t["atr_value"] = None
+                t["rsi_value"] = None
+            else:
+                # Pre-T1 - same RSI Simple Exit display as strategies
+                # #11/#12's own pre-T1 phase.
+                direction = t.get("direction")
+                spot_candles = None
+                spot_key = t.get("symbol")
+                if spot_key and access_token:
+                    try:
+                        resolved_key = get_instrument_key(spot_key)
+                        if resolved_key:
+                            spot_candles = get_5min_candles_with_warmup(resolved_key, access_token)
+                    except Exception:
+                        spot_candles = None
+                if not spot_candles:
+                    t["stop_info"] = "1st 5 Min FIB (pre-T1): waiting for underlying candle data"
+                    t["atr_value"] = None
+                    t["rsi_value"] = None
+                    continue
+                confirm_candles = get_rsi_confirm_candles()
+                midday_active = _is_midday_session(get_rsi_midday_start(), get_rsi_midday_end())
+                if midday_active:
+                    confirm_candles = get_rsi_midday_confirm_candles()
+                call_threshold = get_rsi_call_threshold()
+                put_warning_threshold = get_rsi_put_warning_threshold()
+                _, rsi_info = check_rsi_simple_exit(
+                    direction, spot_candles,
+                    rsi_period=get_rsi_period(),
+                    call_threshold=call_threshold, put_warning_threshold=put_warning_threshold,
+                    confirm_candles=confirm_candles,
+                )
+                current_rsi = rsi_info.get("rsi")
+                t["rsi_value"] = round(current_rsi, 2) if current_rsi is not None else None
+                t["atr_value"] = None
+                rsi_disp = f"{current_rsi:.1f}" if current_rsi is not None else "?"
+                threshold_note = f"CALL<{call_threshold:g}" if direction == "Buy" else f"PUT>{put_warning_threshold:g}"
+                t1_disp = f", T1 {t1_val:.2f}" if t1_val is not None else ""
+                t["stop_info"] = f"1st 5 Min FIB (pre-T1): RSI {rsi_disp} (need {threshold_note} x{confirm_candles}){t1_disp} · last CLOSED 5m candle"
+
         elif strategy == "RSI_SIMPLE":
             # #12 - same fresh-fetch pattern as RSI Momentum above, but
             # the bare rule: no EMA/structure check, no Deep-ITM
@@ -5676,7 +5899,7 @@ def paper_trading_live_toggle():
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
-VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE")
+VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE", "FIRST5MIN_FIB")
 
 STRATEGY_DESCRIPTIONS = {
     "EMA": "1) 5-EMA only, let it run - retired from selection (let losses run too deep waiting for a pattern reversal to confirm). Kept only for trades that already opened under it.",
@@ -5692,7 +5915,8 @@ STRATEGY_DESCRIPTIONS = {
     "JOAT_TEST_C": "Test-C (JOAT-inspired, wider ATR): identical to Test-B, but reads its OWN separate ATR period/multiplier (set below, defaults to 14x2 vs Test-B's 8x2) - kept as a distinct strategy specifically so its results never mix with Test-B's in the Stats breakdown, even if the shared ATR settings change later.",
     "RSI_MOMENTUM": "10) RSI Momentum Exit (Rajaram's method): runs off the UNDERLYING's own RSI and EMA-of-Close (not the option premium) - Call exits once RSI has held below the CALL threshold for N consecutive 5-min candles AND that candle's Close is below the EMA (Put mirrors this: RSI above its threshold + Close above the EMA). Automatically widens its RSI threshold for a Deep ITM option (needs a bigger RSI move before exiting, since Deep ITM premium moves less per point of underlying) and tightens (fewer confirming candles needed) during the mid-day session when theta decay bites hardest. No fixed stop-loss floor - purely momentum/structure driven, per the original method. Every number (RSI/EMA periods, thresholds, candle counts, Deep-ITM %, mid-day window) is editable below so different combinations can be tested against each other. WARNING if live trading is on: by your own choice, live positions under this strategy have NO broker-side stop-loss at all (matches paper exactly) - the RSI/EMA check is the ONLY thing that closes them, so a position can sit fully unprotected if this app goes down, your connection drops, or (at the start of a trading day) there simply isn't enough candle history yet for RSI to be computable.",
     "CAMARILLA_LADDER": "11) Camarilla Ladder Exit (hybrid): before the underlying's price ever reaches its first Camarilla target (T1, standard public formula off the PREVIOUS day's High/Low/Close - not a guess at any proprietary indicator), this runs RSI Simple Exit's bare rule (#12) - RSI<70/>45 for 2 closed candles, no EMA leg - same no-broker-stop-until-triggered design (switched from RSI Momentum's EMA-gated check after a live example showed EMA confirmation firing too late). The moment spot price first reaches T1, that RSI check stops being used entirely and a real broker-side stop-loss order takes over instead: placed at breakeven (your entry price) the instant T1 hits, then MOVED UP (never down) each time a further tier is reached - to T1's own option premium once T2 hits, to T2's premium once T3 hits, and so on through T4. Exit happens when that stop is hit, whichever tier it's currently sitting at - there's no fixed target/booking, this only ever tightens the floor as price proves itself, using Upstox's regular Modify Order (not GTT - a plain SL order updated in place). WARNING if live trading is on: exactly like RSI Simple/Momentum, there is NO broker-side protection at all until spot first touches T1 - if this app goes down before that point, this position has nothing resting at the broker.",
-    "RSI_SIMPLE": "12) RSI Simple Exit: the bare rule with nothing else added - exit Buy once 2 consecutive CLOSED 5-min candles (of the underlying) show RSI<70, exit Sell once 2 consecutive closed candles show RSI>45. No EMA/structure check, no Deep-ITM widening, no mid-day tightening - added after live testing of #10 and #11 found the plain version working better than either one with more conditions layered on top. Shares #10's core RSI period/threshold/confirm-candles settings above (not its EMA period, Deep-ITM, or mid-day settings - none of those apply here). WARNING if live trading is on: same no-floor design as #10/#11 - there is NO broker-side protection at all, the bare RSI check is the only thing that closes this position. If this app goes down, this position has nothing resting at the broker until it's back up.",
+    "RSI_SIMPLE": "12) RSI Simple Exit: the bare rule with nothing else added - exit Buy once 2 consecutive CLOSED 5-min candles (of the underlying) show RSI<70, exit Sell once 2 consecutive closed candles show RSI>45. No EMA/structure check, no Deep-ITM widening, no mid-day tightening - added after live testing of #10 and #11 found the plain version working better than either one with more conditions layered on top. Shares #10's core RSI period/threshold/confirm-candles settings above (not its EMA period, Deep-ITM, or mid-day settings - none of those apply here). Live trading note: unlike #10/#11, this one is NOT wired into live's own exit trigger - a live position under this strategy still gets the normal broker-side -2% stop and 0.5% trail, same as strategies #2-#9. Say the word if you'd rather it match #10/#11's no-floor, RSI-only live behavior instead.",
+    "FIRST5MIN_FIB": "13) 1st 5 Min FIB levels strategy: a separate strategy from #11/#12, though it shares the same pre-T1 RSI-only stoploss idea. T1/T2 are computed once at entry from TODAY's own FIRST 5-min candle (09:15-09:20 IST): that candle's High is the 1.00 level, Low is the 0.00 level, Range = High-Low - Buy's T1 = High + Range*0.5 (the 1.50 level), T2 = High + Range*1.0 (the 2.00 level); Sell mirrors this below the Low. A bigger opening candle produces bigger targets and vice versa, by design. Before spot ever reaches T1: pure RSI stoploss, no broker floor - RSI<70/>45 for 2 closed candles, identical rule to #12. Once spot reaches T1: 100% of the position exits the moment EITHER spot reaches T2 (target hit) OR spot reverses back through T1 (booked near T1 instead) - whichever comes first, no partial booking, no further ratcheting past that. Simpler than strategy #11 on purpose: no order-modification, no captured-premium tracking - just a plain market exit the instant either condition fires, live and paper alike. WARNING if live trading is on: no broker-side protection at all, for the ENTIRE life of this trade, not just pre-T1 - if this app goes down at any point, this position has nothing resting at the broker.",
 }
 
 
