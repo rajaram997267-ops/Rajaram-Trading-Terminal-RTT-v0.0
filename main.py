@@ -534,6 +534,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_camarilla_captured_json TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_t1 DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_t2 DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_t3 DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_t4 DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_stage INTEGER DEFAULT 0",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_fib_stage INTEGER DEFAULT 0",
         ):
@@ -742,10 +744,11 @@ def get_rsi_put_strong_threshold() -> float:
 def get_rsi_put_warning_threshold() -> float:
     """PUT side: momentum warning triggers once RSI rises above this.
     Deliberately a different number from the strong threshold (35) per
-    the original method - there's an intentional 35-45 neutral band that
-    counts as neither. Defaults to 45."""
+    the original method - there's an intentional 35-40 neutral band that
+    counts as neither. Defaults to 40 (lowered from 45 after live use
+    showed 45 confirming too late on the SELL side)."""
     try:
-        return float(get_setting("rsi_put_warning_threshold", "45"))
+        return float(get_setting("rsi_put_warning_threshold", "40"))
     except (TypeError, ValueError):
         return 45.0
 
@@ -1126,13 +1129,13 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # these stay None for now and the exit-check loop retries fetching
     # them on a later poll - same graceful-degradation pattern as
     # Camarilla Ladder's own missing-previous-day-data case.
-    fib_t1 = fib_t2 = None
+    fib_t1 = fib_t2 = fib_t3 = fib_t4 = None
     if entry_strategy == "FIRST5MIN_FIB" and access_token:
         fib_spot_key = get_instrument_key(symbol)
         if fib_spot_key:
             first_candle = fetch_first_5min_candle(fib_spot_key, access_token)
             if first_candle:
-                fib_t1, fib_t2 = compute_first_5min_fib_targets(category, first_candle[0], first_candle[1])
+                fib_t1, fib_t2, fib_t3, fib_t4 = compute_first_5min_fib_targets(category, first_candle[0], first_candle[1])
 
     with get_db() as conn:
         row = conn.execute(
@@ -1142,14 +1145,14 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                  paper_instrument_key, paper_option_label, last_error,
                  strategy, original_quantity, alert_name, scan_name, spot_entry_price,
                  paper_strike, entry_rsi, camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4,
-                 fib_t1, fib_t2)
-            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 fib_t1, fib_t2, fib_t3, fib_t4)
+            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (symbol, category, entry_price, now, quantity, paper_instrument_key, paper_option_label,
              fallback_note, entry_strategy, quantity, alert_name or None, scan_name or None, spot_entry_price,
              paper_strike_val, entry_rsi_val, camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4,
-             fib_t1, fib_t2),
+             fib_t1, fib_t2, fib_t3, fib_t4),
         ).fetchone()
         conn.commit()
 
@@ -2288,65 +2291,88 @@ def fetch_first_5min_candle(instrument_key: str, access_token: str) -> tuple[flo
     return h, l
 
 
-def compute_first_5min_fib_targets(direction: str, first_high: float, first_low: float) -> tuple[float, float]:
+def compute_first_5min_fib_targets(direction: str, first_high: float, first_low: float) -> tuple[float, float, float, float]:
     """Fibonacci-extension-style targets off today's first 5-min candle,
     per Rajaram's own worked levels: candle High = the 1.00 level, Low =
-    the 0.00 level, Range = High - Low.
-        Buy:  T1 = High + Range*0.50 (the 1.50 level), T2 = High + Range*1.00 (the 2.00 level)
-        Sell: T1 = Low  - Range*0.50 (the -0.50 level), T2 = Low  - Range*1.00 (the -1.00 level)
-    A bigger first candle produces a bigger target distance and vice
-    versa, by design - this is the whole point of basing it on that
-    candle's own range rather than a fixed point distance."""
+    the 0.00 level, Range = High - Low. Extended from 2 tiers to 4,
+    continuing the same 0.5-range-per-step pattern (confirmed against a
+    live Coal India example that ran all the way to the -2.0 level):
+        Buy:  T1=High+Range*0.5 (1.50), T2=High+Range*1.0 (2.00),
+              T3=High+Range*1.5 (2.50), T4=High+Range*2.0 (3.00)
+        Sell: T1=Low-Range*0.5 (-0.50), T2=Low-Range*1.0 (-1.00),
+              T3=Low-Range*1.5 (-1.50), T4=Low-Range*2.0 (-2.00)
+    A bigger first candle produces bigger target distances and vice
+    versa, by design - the whole point of basing it on that candle's own
+    range rather than a fixed point distance."""
     rng = first_high - first_low
     if direction == "Buy":
-        return first_high + rng * 0.5, first_high + rng * 1.0
+        return (first_high + rng * 0.5, first_high + rng * 1.0, first_high + rng * 1.5, first_high + rng * 2.0)
     else:
-        return first_low - rng * 0.5, first_low - rng * 1.0
+        return (first_low - rng * 0.5, first_low - rng * 1.0, first_low - rng * 1.5, first_low - rng * 2.0)
 
 
-def fib_stage_transition(direction: str, current_stage: int, t1: float, t2: float, spot_price: float) -> tuple[int, str | None]:
-    """The whole T1/T2 state machine for 1st 5-Min FIB levels strategy
-    (#13), as one pure function - called ONCE for paper's own stage and
-    ONCE for live's own stage, each poll, so paper and live are always
-    judged independently and can never end up silently riding each
-    other's progress (that WAS a real bug: the original version computed
-    this only against paper's stage, so a trade where paper had already
-    closed but live was still open would stop evaluating T2/reversal for
-    live entirely, since the shared computation's branch selection was
-    gated on paper's own state).
+def fib_stage_transition(direction: str, current_stage: int, tiers: list[float], spot_price: float) -> tuple[int, str | None]:
+    """The whole T1-T4 ratchet state machine for 1st 5-Min FIB levels
+    strategy (#13), as one pure function - called ONCE for paper's own
+    stage and ONCE for live's own stage, each poll, so paper and live are
+    always judged independently and can never end up silently riding
+    each other's progress (a real bug found and fixed earlier: computing
+    this only against paper's stage meant a trade where paper had
+    already closed but live was still open would stop evaluating further
+    tiers/reversal for live entirely).
 
-    Also fixes a second real bug found by direct trace: previously, the
-    poll where stage first flips 0->1 (T1 just reached) never ALSO
-    checked T2 in that same pass - deferred to the next poll instead. A
-    fast move that clears both T1 and T2 within one ~5s poll cycle would
-    then only be caught as a T2 hit if price was STILL above T2 on the
-    next poll; if it had already pulled back below T1 by then, it would
-    wrongly exit as "reversed" at a worse price, silently losing the T2
-    hit that actually happened. This checks T2 in the SAME pass a stage
-    0->1 transition occurs, so a single-poll gap through both levels
-    still resolves to the better "t2" outcome.
+    Rule, per tier N (1-4): once tier N is reached, the "floor" becomes
+    tier N. If price advances to tier N+1, the floor ratchets forward to
+    N+1 and watching continues. If price instead falls back through the
+    CURRENT floor before reaching the next tier, exit now, booked near
+    that floor. Reaching T4 (the last tier) is an immediate full exit -
+    there's nothing further to ratchet to.
+
+    Handles a fast move clearing more than one tier within a single poll
+    correctly in both directions: advancing through several tiers at
+    once still lands on the correct (highest reached) stage, and if that
+    multi-tier jump reaches T4 directly, it resolves to "target" (exit)
+    rather than silently arming and waiting - the same class of bug
+    fixed for the original 2-tier version, now handled generally for any
+    number of tiers.
 
     Returns (new_stage, outcome) where outcome is None (nothing to do
-    yet), "t2" (target 2 reached - exit), or "reversed" (reversed back
-    through T1 without reaching T2 - exit)."""
+    yet), "target" (a tier was reached that triggers an exit - always
+    true for T4, since it's the final tier), or "reversed" (fell back
+    through the current floor without reaching the next tier)."""
+    n = len(tiers)
+    if current_stage >= n:
+        return current_stage, None  # already fully resolved (T4 exit already fired when it happened)
+
+    # Check how far forward price has advanced from wherever it
+    # currently stands, handling a multi-tier jump in one poll.
+    new_stage = current_stage
+    for i in range(current_stage + 1, n + 1):
+        tier = tiers[i - 1]
+        reached = (spot_price >= tier) if direction == "Buy" else (spot_price <= tier)
+        if reached:
+            new_stage = i
+        else:
+            break
+
+    if new_stage > current_stage:
+        if new_stage == n:
+            return new_stage, "target"  # reached T4 (directly or via a multi-tier jump) - exit
+        return new_stage, None  # advanced to an intermediate tier - ratchet the floor, keep watching
+
     if current_stage == 0:
-        reached_t1 = (spot_price >= t1) if direction == "Buy" else (spot_price <= t1)
-        if not reached_t1:
-            return 0, None
-        reached_t2 = (spot_price >= t2) if direction == "Buy" else (spot_price <= t2)
-        return 1, ("t2" if reached_t2 else None)
-    else:
-        reached_t2 = (spot_price >= t2) if direction == "Buy" else (spot_price <= t2)
-        if reached_t2:
-            return 1, "t2"
-        # Tightest possible trigger, by explicit choice: fires the moment
-        # spot is AT or back below T1 (Buy) / AT or back above T1 (Sell),
-        # not only once it's confirmed clearly past T1. A 5-second poll
-        # still can't catch the exact instant spot equals T1 - this just
-        # avoids adding any extra confirmation margin on top of that
-        # unavoidable polling gap.
-        reversed_ = (spot_price <= t1) if direction == "Buy" else (spot_price >= t1)
-        return 1, ("reversed" if reversed_ else None)
+        return 0, None  # still pre-T1, nothing to reverse against yet
+
+    # No further tier reached this pass - check reversal against the
+    # CURRENT floor (the last tier already reached). Tightest possible
+    # trigger, by explicit choice: fires the moment spot is AT or back
+    # through the floor, not only once confirmed clearly past it - a
+    # 5-second poll still can't catch the exact instant price equals the
+    # floor, so this avoids adding any extra confirmation margin on top
+    # of that unavoidable polling gap.
+    floor = tiers[current_stage - 1]
+    reversed_ = (spot_price <= floor) if direction == "Buy" else (spot_price >= floor)
+    return current_stage, ("reversed" if reversed_ else None)
 
 
 def fetch_5min_candles_with_time(instrument_key: str, access_token: str) -> list[tuple[str, float, float, float, float]]:
@@ -3746,10 +3772,10 @@ def _run_paper_trade_check_impl() -> dict:
                     confirm_candles=get_rsi_confirm_candles(),
                 )
             if strategy == "FIRST5MIN_FIB" and trade["fib_t1"] is not None and spot_last_price is not None:
-                t1, t2 = trade["fib_t1"], trade["fib_t2"]
+                fib_tiers = [trade["fib_t1"], trade["fib_t2"], trade["fib_t3"], trade["fib_t4"]]
                 fib_current_stage = trade["fib_stage"] or 0
                 fib_stage_now, fib_reversed_or_t2 = fib_stage_transition(
-                    trade["direction"], fib_current_stage, t1, t2, spot_last_price
+                    trade["direction"], fib_current_stage, fib_tiers, spot_last_price
                 )
                 # Live's own independent pass - same spot price/targets,
                 # but gated on live's OWN stage, never paper's. Computed
@@ -3757,7 +3783,7 @@ def _run_paper_trade_check_impl() -> dict:
                 # be OPEN on a trade whose paper side is CLOSED).
                 live_fib_current_stage = trade["live_fib_stage"] or 0
                 live_fib_stage_now, live_fib_reversed_or_t2 = fib_stage_transition(
-                    trade["direction"], live_fib_current_stage, t1, t2, spot_last_price
+                    trade["direction"], live_fib_current_stage, fib_tiers, spot_last_price
                 )
             elif strategy == "FIRST5MIN_FIB" and trade["fib_t1"] is None and access_token:
                 # First candle wasn't available yet at entry (rare - only
@@ -3771,11 +3797,11 @@ def _run_paper_trade_check_impl() -> dict:
                 if fib_retry_key:
                     fib_retry_candle = fetch_first_5min_candle(fib_retry_key, access_token)
                     if fib_retry_candle:
-                        new_t1, new_t2 = compute_first_5min_fib_targets(trade["direction"], fib_retry_candle[0], fib_retry_candle[1])
+                        new_t1, new_t2, new_t3, new_t4 = compute_first_5min_fib_targets(trade["direction"], fib_retry_candle[0], fib_retry_candle[1])
                         with get_db() as conn:
                             conn.execute(
-                                "UPDATE paper_trades SET fib_t1 = ?, fib_t2 = ? WHERE id = ?",
-                                (new_t1, new_t2, trade["id"]),
+                                "UPDATE paper_trades SET fib_t1 = ?, fib_t2 = ?, fib_t3 = ?, fib_t4 = ? WHERE id = ?",
+                                (new_t1, new_t2, new_t3, new_t4, trade["id"]),
                             )
                             conn.commit()
 
@@ -4197,27 +4223,32 @@ def _run_paper_trade_check_impl() -> dict:
                     )
 
             elif strategy == "FIRST5MIN_FIB" and last_price is not None:
-                # #13 (1st 5 Min FIB levels strategy). Pre-T1: same RSI-only
-                # rule as #12. Once T1 is reached: 100% exit the instant
-                # EITHER T2 is reached OR spot reverses back through T1 -
-                # no partial booking, no ratchet, just a single trigger.
-                # Outcome checked BEFORE the plain stage-record branch
-                # (not after) - fib_stage_transition can return a "t2"
-                # outcome on the very same pass T1 is first reached (a
-                # fast move clearing both in one poll), and that must
-                # still win over "just record stage=1 and wait" or the T2
-                # hit would be silently lost to a worse exit later.
-                if fib_reversed_or_t2 == "t2":
+                # #13 (1st 5 Min FIB levels strategy), 4-tier ratchet:
+                # T1 reached -> floor=T1, watching for T2 or reversal below T1
+                # T2 reached -> floor=T2 (ratchets forward), watching T3 or reversal below T2
+                # T3 reached -> floor=T3, watching T4 or reversal below T3
+                # T4 reached -> immediate 100% exit, no further tiers
+                # Outcome checked BEFORE the plain stage-record branch (not
+                # after) - fib_stage_transition can return a "target"/
+                # "reversed" outcome on the very same pass a stage first
+                # advances (a fast move clearing multiple tiers in one
+                # poll), and that must still win over "just record the new
+                # stage and wait" or the real outcome would be silently
+                # lost to a worse exit later.
+                fib_old_stage = trade["fib_stage"] or 0
+                if fib_reversed_or_t2 == "target":
                     exited, exit_price = True, last_price
-                    exit_reason = f"1st 5 Min FIB: Target 2 hit ({trade['fib_t2']:.2f} on the underlying)"
+                    exit_reason = f"1st 5 Min FIB: Target 4 hit ({trade['fib_t4']:.2f} on the underlying)"
                 elif fib_reversed_or_t2 == "reversed":
                     exited, exit_price = True, last_price
-                    exit_reason = f"1st 5 Min FIB: reversed back through T1 ({trade['fib_t1']:.2f}) - booked near T1"
-                elif fib_stage_now == 1 and (trade["fib_stage"] or 0) == 0:
-                    # T1 just reached THIS pass, no T2/reversal outcome yet
-                    # - record the stage flip, nothing exits this poll.
-                    trail_update = {"fib_stage": 1}
-                elif fib_rsi_triggered:
+                    floor_n = fib_stage_now
+                    floor_val = trade[f"fib_t{floor_n}"]
+                    exit_reason = f"1st 5 Min FIB: reversed back through T{floor_n} ({floor_val:.2f}) - booked near T{floor_n}"
+                elif fib_stage_now is not None and fib_stage_now > fib_old_stage:
+                    # Advanced to an intermediate tier (T1-T3), no exit
+                    # outcome yet - record the ratcheted stage, keep going.
+                    trail_update = {"fib_stage": fib_stage_now}
+                elif fib_old_stage == 0 and fib_rsi_triggered:
                     exited, exit_price = True, last_price
                     rsi_disp = f"{fib_rsi_info['rsi']:.1f}" if fib_rsi_info.get("rsi") is not None else "?"
                     exit_reason = f"1st 5 Min FIB: RSI stoploss before T1 (RSI {rsi_disp} on last closed 5m candle)"
@@ -4469,22 +4500,26 @@ def _run_paper_trade_check_impl() -> dict:
                 # closed or progressed further must not silently stop
                 # live's own exit checks). No order placement/
                 # modification at all (unlike #11): pre-T1 is RSI-only
-                # with no broker floor; once T1 is reached, exit fires the
-                # moment EITHER T2 is reached or spot reverses back
-                # through T1 - a single plain market exit via the generic
-                # live_exited mechanism. Same outcome-before-stage-record
-                # ordering as paper, for the same reason (a same-pass T1+T2
-                # move must resolve to "t2", not get swallowed by the
-                # stage-record branch).
+                # with no broker floor; once T1 is reached, the floor
+                # ratchets forward through T2/T3 as each is reached, and
+                # exit fires the moment EITHER T4 is reached (final
+                # target) or spot reverses back through whichever tier is
+                # the current floor - a single plain market exit via the
+                # generic live_exited mechanism. Same outcome-before-
+                # stage-record ordering as paper, for the same reason (a
+                # same-pass multi-tier move must resolve to its real
+                # outcome, not get swallowed by the stage-record branch).
                 live_fib_current_stage = trade["live_fib_stage"] or 0
-                if live_fib_reversed_or_t2 == "t2":
+                if live_fib_reversed_or_t2 == "target":
                     live_exited = True
-                    live_exit_reason_val = f"1st 5 Min FIB: Target 2 hit ({trade['fib_t2']:.2f} on the underlying)"
+                    live_exit_reason_val = f"1st 5 Min FIB: Target 4 hit ({trade['fib_t4']:.2f} on the underlying)"
                 elif live_fib_reversed_or_t2 == "reversed":
                     live_exited = True
-                    live_exit_reason_val = f"1st 5 Min FIB: reversed back through T1 ({trade['fib_t1']:.2f}) - booked near T1"
-                elif live_fib_stage_now == 1 and live_fib_current_stage == 0:
-                    live_fib_stage_update = 1
+                    live_floor_n = live_fib_stage_now
+                    live_floor_val = trade[f"fib_t{live_floor_n}"]
+                    live_exit_reason_val = f"1st 5 Min FIB: reversed back through T{live_floor_n} ({live_floor_val:.2f}) - booked near T{live_floor_n}"
+                elif live_fib_stage_now is not None and live_fib_stage_now > live_fib_current_stage:
+                    live_fib_stage_update = live_fib_stage_now
                 elif live_fib_current_stage == 0 and not live_exited and trade["live_status"] == "OPEN" and fib_rsi_triggered:
                     live_exited = True
                     rsi_disp = f"{fib_rsi_info['rsi']:.1f}" if fib_rsi_info.get("rsi") is not None else "?"
@@ -5336,13 +5371,20 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
 
         elif strategy == "FIRST5MIN_FIB":
             stage = t.get("fib_stage") or 0
-            t1_val, t2_val = t.get("fib_t1"), t.get("fib_t2")
+            t1_val = t.get("fib_t1")
             if stage >= 1:
-                # T1 already reached - watching for T2 or a reversal back
-                # through T1, no RSI involved anymore.
-                t1_disp = f"{t1_val:.2f}" if t1_val is not None else "?"
-                t2_disp = f"{t2_val:.2f}" if t2_val is not None else "?"
-                t["stop_info"] = f"1st 5 Min FIB: T1 ({t1_disp}) reached - exits at T2 ({t2_disp}) or on reversal back through T1"
+                # T1+ already reached - the floor is whichever tier was
+                # last reached, ratcheting forward as price advances.
+                # Watching for the NEXT tier or a reversal back through
+                # the current floor - no RSI involved anymore.
+                floor_val = t.get(f"fib_t{stage}")
+                floor_disp = f"{floor_val:.2f}" if floor_val is not None else "?"
+                if stage >= 4:
+                    t["stop_info"] = f"1st 5 Min FIB: T4 ({floor_disp}) - final target, should have exited"
+                else:
+                    next_val = t.get(f"fib_t{stage + 1}")
+                    next_disp = f"{next_val:.2f}" if next_val is not None else "?"
+                    t["stop_info"] = f"1st 5 Min FIB: T{stage} ({floor_disp}) reached - exits at T{stage + 1} ({next_disp}) or on reversal back through T{stage}"
                 t["atr_value"] = None
                 t["rsi_value"] = None
             elif t1_val is None:
@@ -5986,7 +6028,7 @@ STRATEGY_DESCRIPTIONS = {
     "RSI_MOMENTUM": "10) RSI Momentum Exit (Rajaram's method): runs off the UNDERLYING's own RSI and EMA-of-Close (not the option premium) - Call exits once RSI has held below the CALL threshold for N consecutive 5-min candles AND that candle's Close is below the EMA (Put mirrors this: RSI above its threshold + Close above the EMA). Automatically widens its RSI threshold for a Deep ITM option (needs a bigger RSI move before exiting, since Deep ITM premium moves less per point of underlying) and tightens (fewer confirming candles needed) during the mid-day session when theta decay bites hardest. No fixed stop-loss floor - purely momentum/structure driven, per the original method. Every number (RSI/EMA periods, thresholds, candle counts, Deep-ITM %, mid-day window) is editable below so different combinations can be tested against each other. WARNING if live trading is on: by your own choice, live positions under this strategy have NO broker-side stop-loss at all (matches paper exactly) - the RSI/EMA check is the ONLY thing that closes them, so a position can sit fully unprotected if this app goes down, your connection drops, or (at the start of a trading day) there simply isn't enough candle history yet for RSI to be computable.",
     "CAMARILLA_LADDER": "11) Camarilla Ladder Exit (hybrid): before the underlying's price ever reaches its first Camarilla target (T1, standard public formula off the PREVIOUS day's High/Low/Close - not a guess at any proprietary indicator), this runs RSI Simple Exit's bare rule (#12) - RSI<70/>45 for 2 closed candles, no EMA leg - same no-broker-stop-until-triggered design (switched from RSI Momentum's EMA-gated check after a live example showed EMA confirmation firing too late). The moment spot price first reaches T1, that RSI check stops being used entirely and a real broker-side stop-loss order takes over instead: placed at breakeven (your entry price) the instant T1 hits, then MOVED UP (never down) each time a further tier is reached - to T1's own option premium once T2 hits, to T2's premium once T3 hits, and so on through T4. Exit happens when that stop is hit, whichever tier it's currently sitting at - there's no fixed target/booking, this only ever tightens the floor as price proves itself, using Upstox's regular Modify Order (not GTT - a plain SL order updated in place). WARNING if live trading is on: exactly like RSI Simple/Momentum, there is NO broker-side protection at all until spot first touches T1 - if this app goes down before that point, this position has nothing resting at the broker.",
     "RSI_SIMPLE": "12) RSI Simple Exit: the bare rule with nothing else added - exit Buy once 2 consecutive CLOSED 5-min candles (of the underlying) show RSI<70, exit Sell once 2 consecutive closed candles show RSI>45. No EMA/structure check, no Deep-ITM widening, no mid-day tightening - added after live testing of #10 and #11 found the plain version working better than either one with more conditions layered on top. Shares #10's core RSI period/threshold/confirm-candles settings above (not its EMA period, Deep-ITM, or mid-day settings - none of those apply here). Live trading note: unlike #10/#11, this one is NOT wired into live's own exit trigger - a live position under this strategy still gets the normal broker-side -2% stop and 0.5% trail, same as strategies #2-#9. Say the word if you'd rather it match #10/#11's no-floor, RSI-only live behavior instead.",
-    "FIRST5MIN_FIB": "13) 1st 5 Min FIB levels strategy: a separate strategy from #11/#12, though it shares the same pre-T1 RSI-only stoploss idea. T1/T2 are computed once at entry from TODAY's own FIRST 5-min candle (09:15-09:20 IST): that candle's High is the 1.00 level, Low is the 0.00 level, Range = High-Low - Buy's T1 = High + Range*0.5 (the 1.50 level), T2 = High + Range*1.0 (the 2.00 level); Sell mirrors this below the Low. A bigger opening candle produces bigger targets and vice versa, by design. Before spot ever reaches T1: pure RSI stoploss, no broker floor - RSI<70/>45 for 2 closed candles, identical rule to #12. Once spot reaches T1: 100% of the position exits the moment EITHER spot reaches T2 (target hit) OR spot reverses back through T1 (booked near T1 instead) - whichever comes first, no partial booking, no further ratcheting past that. Simpler than strategy #11 on purpose: no order-modification, no captured-premium tracking - just a plain market exit the instant either condition fires, live and paper alike. WARNING if live trading is on: no broker-side protection at all, for the ENTIRE life of this trade, not just pre-T1 - if this app goes down at any point, this position has nothing resting at the broker.",
+    "FIRST5MIN_FIB": "13) 1st 5 Min FIB levels strategy: a separate strategy from #11/#12, though it shares the same pre-T1 RSI-only stoploss idea. T1-T4 are computed once at entry from TODAY's own FIRST 5-min candle (09:15-09:20 IST): that candle's High is the 1.00 level, Low is the 0.00 level, Range = High-Low - Buy's T1=High+Range*0.5 (1.50), T2=High+Range*1.0 (2.00), T3=High+Range*1.5 (2.50), T4=High+Range*2.0 (3.00); Sell mirrors this below the Low. A bigger opening candle produces bigger targets and vice versa, by design. Before spot ever reaches T1: pure RSI stoploss, no broker floor - RSI<70 (Buy) />the shared PUT threshold above (Sell) for 2 closed candles, identical rule to #12. Once T1 is reached, it's a 4-tier ratchet: the floor becomes whichever tier was last reached (T1, then T2, then T3), advancing forward each time the next tier is hit; if spot instead reverses back through the CURRENT floor before reaching the next tier, 100% exits right there, booked near that floor. Reaching T4 is always an immediate full exit - the final tier, nothing further to ratchet to. No partial booking at any stage, just the floor moving forward. Simpler than strategy #11 on purpose: no order-modification, no captured-premium tracking - just a plain market exit the instant an outcome fires, live and paper independently (each tracks its own stage separately, so one side closing early never affects the other's checks). WARNING if live trading is on: no broker-side protection at all, for the ENTIRE life of this trade, not just pre-T1 - if this app goes down at any point, this position has nothing resting at the broker.",
 }
 
 
