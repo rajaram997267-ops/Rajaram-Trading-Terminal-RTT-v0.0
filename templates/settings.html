@@ -200,6 +200,7 @@
       <option value="RSI_MOMENTUM" {% if exit_strategy == "RSI_MOMENTUM" %}selected{% endif %}>10) RSI Momentum Exit (spot RSI + EMA9)</option>
       <option value="CAMARILLA_LADDER" {% if exit_strategy == "CAMARILLA_LADDER" %}selected{% endif %}>11) Camarilla Ladder Exit (RSI pre-T1, ratchet stop post-T1)</option>
       <option value="RSI_SIMPLE" {% if exit_strategy == "RSI_SIMPLE" %}selected{% endif %}>12) RSI Simple Exit (bare 2-candle rule, no extras)</option>
+      <option value="FIRST5MIN_FIB" {% if exit_strategy == "FIRST5MIN_FIB" %}selected{% endif %}>13) 1st 5 Min FIB levels strategy</option>
     </select>
     <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
   </div>
