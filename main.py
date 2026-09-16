@@ -1077,6 +1077,21 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
             fallback_note = f"No {opt_type} option chain data for {symbol} - fell back to equity paper trading"
         else:
             fallback_note = f"Could not fetch option premium for {symbol} {opt_type} - fell back to equity paper trading"
+        # This used to only ever live in last_error, which the exit-check
+        # loop clears to NULL on the very first successful poll (every
+        # ~5s) - meaning the reason a trade fell back to equity was
+        # already unrecoverable within seconds, long before anyone got a
+        # chance to look. Baking a short version directly into
+        # paper_option_label instead means it survives for the life of
+        # the trade and shows up in the exact same column the closed-
+        # trades table already displays - no separate lookup needed to
+        # notice an equity-fallback trade ever again.
+        fallback_short = {
+            "No Upstox token saved - fell back to equity paper trading": "no token",
+            f"No {opt_type} option chain data for {symbol} - fell back to equity paper trading": "no option chain data",
+            f"Could not fetch option premium for {symbol} {opt_type} - fell back to equity paper trading": "premium fetch failed",
+        }[fallback_note]
+        paper_option_label = f"EQUITY (option fallback: {fallback_short})"
 
     now = datetime.utcnow().isoformat()
     entry_strategy = get_exit_strategy()
@@ -6357,9 +6372,33 @@ def debug_instruments():
     """Diagnostic-only: forces a fresh download of Upstox's instrument
     master and shows exactly what came back - real column names, sample
     rows, and any error - so a mismatch in the parsing code can be spotted
-    and fixed precisely. Includes the option-chain parsing results too."""
+    and fixed precisely. Includes the option-chain parsing results too.
+
+    Pass ?symbol=XYZ to check one specific symbol directly, rather than
+    guessing from the 5-item samples below - this is what actually
+    answers "why did this alert fall back to equity": whether the exact
+    string an alert uses is present as an option-chain key, present only
+    under the equity map, or not found under either, which points at a
+    genuinely different fix (a naming alias to add) than a premium-fetch
+    problem would."""
     _load_instrument_master()
-    return jsonify({"equities": _instrument_debug, "options": _option_debug})
+    result = {"equities": _instrument_debug, "options": _option_debug}
+    symbol = request.args.get("symbol")
+    if symbol:
+        sym_upper = symbol.upper()
+        contracts = _option_chain_cache.get(sym_upper, [])
+        result["symbol_check"] = {
+            "symbol_queried": sym_upper,
+            "found_in_equity_map": sym_upper in _instrument_cache,
+            "equity_instrument_key": _instrument_cache.get(sym_upper),
+            "found_in_option_chain": sym_upper in _option_chain_cache,
+            "option_contract_count": len(contracts),
+            "sample_contracts": contracts[:5],
+            "all_option_chain_keys_containing_symbol": [
+                k for k in _option_chain_cache if sym_upper in k or k in sym_upper
+            ][:10],
+        }
+    return jsonify(result)
 
 
 @app.route("/api/paper-trading/debug-proxy-ip")
