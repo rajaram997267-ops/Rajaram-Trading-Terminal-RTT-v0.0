@@ -3594,6 +3594,21 @@ def _run_paper_trade_check_impl() -> dict:
         t["paper_instrument_key"] for t in open_trades if t["paper_instrument_key"]
     } | {
         t["live_instrument_key"] for t in open_trades if t["live_instrument_key"]
+    } | {
+        # The underlying itself was never subscribed before - every
+        # spot-price-driven strategy (RSI Momentum/Simple, Camarilla
+        # Ladder, 1st 5-Min FIB, EMA-spot family) only ever saw the
+        # underlying's price once every 5 minutes, at the CLOSE of the
+        # last completed candle - completely blind to anything that
+        # happened and reversed within that candle. Confirmed on a real
+        # HINDZINC trade: price wicked up through T2 toward T3 and
+        # reversed, all before that candle closed, so the ratchet never
+        # advanced past T1 - the touch was real, but nothing was ever
+        # watching for it in real time. Subscribing the underlying here
+        # too gives get_spot_ws_price() (see below) a live tick to use
+        # for tier-crossing/ratchet checks specifically, falling back to
+        # the candle close only when a live tick isn't available.
+        key for key in (get_instrument_key(t["symbol"]) for t in open_trades) if key
     }
     update_ws_subscriptions(active_keys)
 
@@ -3651,6 +3666,22 @@ def _run_paper_trade_check_impl() -> dict:
             # series itself (check_exit reads closes directly), so this
             # didn't exist as a variable until now.
             spot_last_price = spot_candles[-1][3] if spot_candles else None
+
+            # Live-tick-aware spot price, for Camarilla Ladder/1st 5-Min
+            # FIB's tier-crossing and reversal checks specifically - NOT
+            # used for RSI (RSI stays candle-close-only, matching standard
+            # methodology and avoiding wick-driven noise in that
+            # calculation). Falls back to the candle close above when a
+            # live tick isn't available or has gone stale (same
+            # ws_price-or-candle-fallback pattern the option's own price
+            # already uses) - never blocks on this, just uses whatever's
+            # freshest. This is what actually catches a genuine intrabar
+            # touch of a target that reverses before that candle closes.
+            spot_live_price = spot_last_price
+            if strategy in ("CAMARILLA_LADDER", "FIRST5MIN_FIB") and spot_key:
+                spot_tick = get_ws_price(spot_key)
+                if spot_tick is not None:
+                    spot_live_price = spot_tick
 
             # RSI Momentum Exit's trigger, computed ONCE here (rather than
             # separately in the paper branch below and the live section
@@ -3716,11 +3747,11 @@ def _run_paper_trade_check_impl() -> dict:
             camarilla_new_stage = None
             live_camarilla_new_stage = None
             camarilla_tiers = None
-            if strategy == "CAMARILLA_LADDER" and trade["camarilla_t1"] is not None and spot_last_price is not None:
+            if strategy == "CAMARILLA_LADDER" and trade["camarilla_t1"] is not None and spot_live_price is not None:
                 camarilla_tiers = [trade["camarilla_t1"], trade["camarilla_t2"], trade["camarilla_t3"], trade["camarilla_t4"]]
                 camarilla_current_stage = trade["camarilla_ratchet_stage"] or 0
                 camarilla_new_stage = camarilla_ratchet_stage_reached(
-                    trade["direction"], spot_last_price, camarilla_tiers, camarilla_current_stage
+                    trade["direction"], spot_live_price, camarilla_tiers, camarilla_current_stage
                 )
                 # Live's own independent pass, against live's OWN
                 # live_camarilla_ratchet_stage column - NOT a reuse of
@@ -3733,7 +3764,7 @@ def _run_paper_trade_check_impl() -> dict:
                 # paper/live decoupling.
                 live_camarilla_current_stage = trade["live_camarilla_ratchet_stage"] or 0
                 live_camarilla_new_stage = camarilla_ratchet_stage_reached(
-                    trade["direction"], spot_last_price, camarilla_tiers, live_camarilla_current_stage
+                    trade["direction"], spot_live_price, camarilla_tiers, live_camarilla_current_stage
                 )
 
             # RSI Simple Exit's trigger (#12), computed once here for the
@@ -3786,11 +3817,11 @@ def _run_paper_trade_check_impl() -> dict:
                     put_warning_threshold=get_rsi_put_warning_threshold(),
                     confirm_candles=get_rsi_confirm_candles(),
                 )
-            if strategy == "FIRST5MIN_FIB" and trade["fib_t1"] is not None and spot_last_price is not None:
+            if strategy == "FIRST5MIN_FIB" and trade["fib_t1"] is not None and spot_live_price is not None:
                 fib_tiers = [trade["fib_t1"], trade["fib_t2"], trade["fib_t3"], trade["fib_t4"]]
                 fib_current_stage = trade["fib_stage"] or 0
                 fib_stage_now, fib_reversed_or_t2 = fib_stage_transition(
-                    trade["direction"], fib_current_stage, fib_tiers, spot_last_price
+                    trade["direction"], fib_current_stage, fib_tiers, spot_live_price
                 )
                 # Live's own independent pass - same spot price/targets,
                 # but gated on live's OWN stage, never paper's. Computed
@@ -3798,7 +3829,7 @@ def _run_paper_trade_check_impl() -> dict:
                 # be OPEN on a trade whose paper side is CLOSED).
                 live_fib_current_stage = trade["live_fib_stage"] or 0
                 live_fib_stage_now, live_fib_reversed_or_t2 = fib_stage_transition(
-                    trade["direction"], live_fib_current_stage, fib_tiers, spot_last_price
+                    trade["direction"], live_fib_current_stage, fib_tiers, spot_live_price
                 )
             elif strategy == "FIRST5MIN_FIB" and trade["fib_t1"] is None and access_token:
                 # First candle wasn't available yet at entry (rare - only
