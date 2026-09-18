@@ -1047,7 +1047,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
         return False, f"Sector filter is on and {symbol}'s sector doesn't currently qualify for a {category} entry"
 
     option = get_atm_option(symbol, opt_type, price_val) if access_token else None
-    premium = get_ltp(option["instrument_key"], access_token) if option else None
+    premium = get_ltp_with_retry(option["instrument_key"], access_token) if option else None
 
     paper_instrument_key = None
     paper_option_label = None
@@ -1192,7 +1192,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
             if not option:
                 _mark_live_failed(trade_id, f"No {opt_type} option chain data found for {symbol} (nearest monthly expiry)")
             else:
-                premium = get_ltp(option["instrument_key"], access_token)
+                premium = get_ltp_with_retry(option["instrument_key"], access_token)
                 if not premium or premium <= 0:
                     _mark_live_failed(trade_id, f"Could not fetch option premium for {symbol} {opt_type}")
                 else:
@@ -2786,6 +2786,29 @@ def get_ltp(instrument_key: str, access_token: str) -> float | None:
         return None
     except Exception:
         return None
+
+
+def get_ltp_with_retry(instrument_key: str, access_token: str, retries: int = 2, delay: float = 0.6) -> float | None:
+    """Same as get_ltp, but retried a couple of times with a short pause
+    before giving up - used ONLY at the two entry-time premium-fetch call
+    sites (paper AND live), where a single transient blip (a momentary
+    Upstox rate-limit or timeout during a burst of many alerts firing
+    together - the likely cause, confirmed against real trades: isolated
+    failures scattered across otherwise-successful batches, not the same
+    symbol failing every time) was permanently sending an otherwise-fine
+    trade down the equity-fallback path, or for live, blocking a real
+    order from ever being placed. get_ltp() itself is deliberately left
+    untouched everywhere else it's called (the exit-check loop's own
+    polling already self-heals within a few seconds on its own, so
+    adding a blocking retry there would only slow down every poll for no
+    benefit)."""
+    for attempt in range(retries + 1):
+        price = get_ltp(instrument_key, access_token)
+        if price:
+            return price
+        if attempt < retries:
+            time.sleep(delay)
+    return None
 
 
 # ---------------------------------------------------------------------------
