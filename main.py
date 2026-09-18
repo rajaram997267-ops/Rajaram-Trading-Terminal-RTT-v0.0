@@ -5104,7 +5104,10 @@ def api_chart(symbol):
       these in dark blue, since the inside-bar pattern is part of the
       user's own strategy.
     - The previous COMPLETED trading day's high and low, for the PDH/PDL
-      reference lines - also part of the strategy."""
+      reference lines - also part of the strategy.
+    - 1st 5-Min FIB levels (T1-T4) for today, off this session's own
+      first 5-min candle - same formula strategy #13 uses for real
+      trades, fully derivable from symbol+direction alone."""
     access_token = get_setting("upstox_access_token")
     if not access_token:
         return jsonify({"status": "error", "message": "No Upstox access token saved yet."}), 400
@@ -5136,6 +5139,17 @@ def api_chart(symbol):
 
     prev_day_high, prev_day_low, _prev_day_close = fetch_previous_day_high_low(instrument_key, access_token)
 
+    # 1st 5-Min FIB levels (strategy #13) - fully derivable from just
+    # today's own first 5-min candle + direction, exactly like PDH/PDL
+    # above, so this needs no trade-specific state to draw on ANY
+    # symbol's chart, not only one with an open trade. Reuses the exact
+    # same functions the live strategy computes its real targets with,
+    # so what's drawn here always matches what a real trade would use.
+    fib_t1 = fib_t2 = fib_t3 = fib_t4 = None
+    first_candle = fetch_first_5min_candle(instrument_key, access_token)
+    if first_candle:
+        fib_t1, fib_t2, fib_t3, fib_t4 = compute_first_5min_fib_targets(direction, first_candle[0], first_candle[1])
+
     return jsonify({
         "status": "ok",
         "symbol": symbol,
@@ -5146,6 +5160,10 @@ def api_chart(symbol):
         "ema_label": "EMA5(low)" if direction == "Buy" else "EMA5(high)",
         "prev_day_high": prev_day_high,
         "prev_day_low": prev_day_low,
+        "fib_t1": fib_t1,
+        "fib_t2": fib_t2,
+        "fib_t3": fib_t3,
+        "fib_t4": fib_t4,
     })
 
 
