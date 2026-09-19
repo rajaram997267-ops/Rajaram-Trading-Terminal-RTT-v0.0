@@ -879,12 +879,16 @@
       const plotH = cssHeight - topPad - bottomPad;
 
       // Price range - includes candle highs/lows, the EMA line, and
-      // PDH/PDL if present, so nothing gets drawn outside the visible area.
+      // PDH/PDL and 1st 5-Min FIB T1-T4 if present, so nothing gets
+      // drawn outside the visible area.
       let minP = Math.min(...ohlc.map(c => c.l));
       let maxP = Math.max(...ohlc.map(c => c.h));
       (data.ema || []).forEach(v => { if (v !== null && v !== undefined) { minP = Math.min(minP, v); maxP = Math.max(maxP, v); } });
       if (data.prev_day_high) maxP = Math.max(maxP, data.prev_day_high);
       if (data.prev_day_low) minP = Math.min(minP, data.prev_day_low);
+      [data.fib_t1, data.fib_t2, data.fib_t3, data.fib_t4].forEach(v => {
+        if (v !== null && v !== undefined) { minP = Math.min(minP, v); maxP = Math.max(maxP, v); }
+      });
       const pad = (maxP - minP) * 0.08 || 1;
       minP -= pad;
       maxP += pad;
@@ -930,6 +934,14 @@
       }
       drawRefLine(data.prev_day_high, "#ffb800", "PDH");
       drawRefLine(data.prev_day_low, "#c792ea", "PDL");
+      // 1st 5-Min FIB levels (strategy #13) - an escalating cyan-to-violet
+      // ladder, deliberately a distinct color family from PDH/PDL's
+      // amber/purple AND from "#0d47a1" (already used for inside-bar
+      // candles below) so all reference lines stay easy to tell apart.
+      drawRefLine(data.fib_t1, "#00e5ff", "T1");
+      drawRefLine(data.fib_t2, "#00b8d4", "T2");
+      drawRefLine(data.fib_t3, "#2979ff", "T3");
+      drawRefLine(data.fib_t4, "#7c4dff", "T4");
 
       // Candles - inside bars override to dark blue regardless of
       // bullish/bearish, since that's the pattern being highlighted.
