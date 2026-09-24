@@ -3587,10 +3587,18 @@ def run_paper_trade_check() -> dict:
     (every 5s, see _exit_check_loop) and a manual "Check Exits Now" click
     (same function, different thread) could overlap - each doing its own
     round of Upstox REST calls at the same time, competing for the same
-    DB rows. Non-blocking: if a check is already in flight, this returns
-    immediately instead of queuing up a second one behind it."""
-    if not _exit_check_lock.acquire(blocking=False):
-        return {"checked": 0, "closed": 0, "note": "A check was already running - skipped this one."}
+    DB rows.
+
+    Waits up to 3s for an in-progress check to finish, rather than
+    skipping instantly - a plain non-blocking skip meant a manual click
+    landing mid-poll did NOTHING at all (silently), which is exactly
+    what made repeated clicking feel broken: a single trade's own poll
+    normally finishes well inside 3s, so this makes a manual click
+    actually run in the near-totality of cases instead of routinely
+    bouncing off an in-flight background poll. Still gives up (rather
+    than queuing indefinitely) if something is genuinely stuck."""
+    if not _exit_check_lock.acquire(timeout=3):
+        return {"checked": 0, "closed": 0, "note": "A check was already running and didn't finish in time - try again."}
     try:
         return _run_paper_trade_check_impl()
     finally:
@@ -3667,7 +3675,21 @@ def _run_paper_trade_check_impl() -> dict:
             needs_candles = strategy in ("EMA", "TARGETS", "ATR_TRAIL")
             ws_price = get_ws_price(instrument_key)
             candles = get_5min_candles_with_warmup(instrument_key, access_token) if (needs_candles or ws_price is None) else None
-            last_price = ws_price if ws_price is not None else (candles[-1][3] if candles else None)
+            # last_price used to fall straight to the candle close here
+            # whenever the WS tick wasn't available - which, for an
+            # option, can be up to 5 minutes stale and materially wrong
+            # (options move fast; a few minutes is a lot). Falls to a
+            # genuinely LIVE quote fetch instead now, only dropping to
+            # the candle close as a true last resort if that live call
+            # itself also fails. This directly targets "last checked
+            # price should be live" - the candle-close path was the
+            # actual reason it sometimes wasn't.
+            if ws_price is not None:
+                last_price = ws_price
+            else:
+                last_price = get_ltp(instrument_key, access_token)
+                if last_price is None and candles:
+                    last_price = candles[-1][3]
             entry_price = trade["entry_price"]
 
             # EMA_SPOT_TRAIL is the one strategy that needs a candle
@@ -3892,8 +3914,14 @@ def _run_paper_trade_check_impl() -> dict:
                 if live_ws_price is not None:
                     live_last_price = live_ws_price
                 else:
-                    live_candles_fallback = fetch_5min_candles(live_instrument_key, access_token)
-                    live_last_price = live_candles_fallback[-1][3] if live_candles_fallback else None
+                    # Same fix as last_price above: a genuinely live
+                    # quote instead of falling straight to a candle close
+                    # that can be minutes stale - matters even more here
+                    # since this is real money, not paper.
+                    live_last_price = get_ltp(live_instrument_key, access_token)
+                    if live_last_price is None:
+                        live_candles_fallback = fetch_5min_candles(live_instrument_key, access_token)
+                        live_last_price = live_candles_fallback[-1][3] if live_candles_fallback else None
             else:
                 live_last_price = last_price
 
@@ -6352,9 +6380,17 @@ def paper_trading_manual_exit(trade_id):
                 if ws_price is not None:
                     exit_price = ws_price
                 else:
-                    candles = fetch_5min_candles(instrument_key, access_token)
-                    if candles:
-                        exit_price = candles[-1][3]
+                    # Genuinely live quote before ever falling to a
+                    # candle close (which can be minutes stale) - same
+                    # fix as run_paper_trade_check's own price
+                    # resolution. This was the direct cause of exiting
+                    # at a price meaningfully off from what was on
+                    # screen at click time.
+                    exit_price = get_ltp(instrument_key, access_token)
+                    if exit_price is None:
+                        candles = fetch_5min_candles(instrument_key, access_token)
+                        if candles:
+                            exit_price = candles[-1][3]
         except Exception:
             pass  # fall back to last_checked_price below
 
