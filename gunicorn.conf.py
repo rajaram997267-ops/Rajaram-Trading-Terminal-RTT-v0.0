@@ -22,3 +22,8 @@
 
 workers = 1
 timeout = 90   # was gunicorn's default of 30 - the instrument-file cold load can exceed that
+
+# NOTE - do NOT raise workers above 1. main.py starts the exit-check loop
+# (ensure_exit_check_loop_started) on import, so every extra worker would run
+# its own copy of that loop and could double-fire live exits and duplicate
+# orders. The in-process lock only protects within a single process.

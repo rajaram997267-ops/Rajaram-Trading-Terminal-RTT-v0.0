@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hmac
 import io
 import json
 import math
@@ -27,6 +28,42 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 IST_OFFSET = timedelta(hours=5, minutes=30)
 
 app = Flask(__name__)
+
+
+# --- Access control -------------------------------------------------------
+# Staged on purpose: each protection switches on only once its env var is set
+# on Render, so deploying this file alone changes nothing and can never lock
+# you out or stop Chartink's alerts. Set APP_USER + APP_PASS to password-
+# protect the whole app (browser login prompt), and WEBHOOK_SECRET to require
+# ?key=<secret> on the Chartink webhook URL (update the URL in Chartink at
+# the same time you set it). Without them the app is fully open, as before.
+APP_USER = os.environ.get("APP_USER", "")
+APP_PASS = os.environ.get("APP_PASS", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+
+@app.before_request
+def _access_guard():
+    # Render's health check hits "HEAD /" - HEAD returns headers only, so
+    # letting it through leaks nothing, and demanding a login here would
+    # make Render see 401 and treat the service as unhealthy.
+    if request.method == "HEAD" and request.path == "/":
+        return None
+    if request.path == "/webhook/chartink":
+        if not WEBHOOK_SECRET:
+            return None
+        key = request.args.get("key", "")
+        if not hmac.compare_digest(key, WEBHOOK_SECRET):
+            return jsonify({"status": "forbidden"}), 403
+        return None
+    if not APP_PASS:
+        return None
+    auth = request.authorization
+    if (auth and hmac.compare_digest(auth.username or "", APP_USER)
+            and hmac.compare_digest(auth.password or "", APP_PASS)):
+        return None
+    return make_response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="RTT"'})
+
 
 # Alert names for indices (BANKNIFTY, NIFTY...) vs. how Upstox's
 # instrument master actually names those same indices under NSE_INDEX.
@@ -6723,4 +6760,4 @@ init_db()  # runs on import too, so gunicorn (used in production) creates the ta
 ensure_exit_check_loop_started()  # same: starts on import, tab-independent from here on
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=os.environ.get("FLASK_DEBUG") == "1")
