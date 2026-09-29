@@ -135,7 +135,7 @@
 
   <div class="settings-box">
     <span>Upstox access token:</span>
-    <input type="text" id="tokenInput" placeholder="Paste today's Upstox access token here">
+    <input type="password" id="tokenInput" placeholder="Paste today's Upstox access token here">
     <button class="secondary" onclick="saveToken()">Save token</button>
     <span class="token-status {% if token_saved %}saved{% endif %}" id="tokenStatus">
       {% if token_saved %}Token saved for today{% else %}No token saved yet{% endif %}
