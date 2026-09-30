@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Rajaram Trading Terminal - RTT v0.0</title>
@@ -13,7 +14,39 @@
       --muted: #6b7280;
       --green: #00c896;
       --gold: #ffb800;
+      --red: #ff5370;
     }
+    :root[data-theme="light-gray"] {
+      --red: #dc2626;
+      --bg: #e9ebee;
+      --panel: #ffffff;
+      --border: #d0d4da;
+      --text: #1a1d23;
+      --muted: #6b7280;
+      --green: #0e9f6e;
+      --gold: #b45309;
+    }
+    :root[data-theme="sky-blue"] {
+      --red: #dc2626;
+      --bg: #eaf4fb;
+      --panel: #ffffff;
+      --border: #bfe0f2;
+      --text: #10222c;
+      --muted: #4a6572;
+      --green: #0e9f6e;
+      --gold: #b45309;
+    }
+    :root[data-theme="off-white"] {
+      --red: #dc2626;
+      --bg: #f7f5f0;
+      --panel: #ffffff;
+      --border: #e2ddd2;
+      --text: #1f1c16;
+      --muted: #6b6455;
+      --green: #0e9f6e;
+      --gold: #b45309;
+    }
+
     * { box-sizing: border-box; }
     body {
       font-family: 'Segoe UI', Arial, sans-serif;
@@ -161,7 +194,7 @@
       border-left: 2px solid transparent;
       cursor: default;
     }
-    .list-row:hover { background: rgba(255,255,255,0.03); }
+    .list-row:hover { background: rgba(127,127,127,0.12); }
     .list-row.confirmed {
       border-left-color: var(--gold);
       background: rgba(255,184,0,0.04);
@@ -397,7 +430,7 @@
       font-size: 13px;
       border-left: 2px solid transparent;
     }
-    .sector-row:hover { background: rgba(255,255,255,0.04); }
+    .sector-row:hover { background: rgba(127,127,127,0.12); }
     .sector-row.selected {
       background: rgba(0,200,150,0.08);
       border-left-color: var(--green);
