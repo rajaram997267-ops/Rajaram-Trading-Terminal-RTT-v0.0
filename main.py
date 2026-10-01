@@ -2023,8 +2023,8 @@ def _load_prev_closes_background(access_token: str) -> None:
         if not key:
             continue
         url = (
-            f"https://api.upstox.com/v2/historical-candle/"
-            f"{urllib.parse.quote(key, safe='|')}/day/{today}/{from_date}"
+            f"https://api.upstox.com/v3/historical-candle/"
+            f"{urllib.parse.quote(key, safe='|')}/days/1/{today}/{from_date}"
         )
         req = urllib.request.Request(
             url,
@@ -2114,7 +2114,7 @@ def _fetch_sector_performance(access_token: str) -> dict | None:
     # v2 LTP supports up to 500 instruments in a single call - our whole
     # F&O universe (~180 symbols) fits in one request.
     url = (
-        "https://api.upstox.com/v2/market-quote/ltp?instrument_key="
+        "https://api.upstox.com/v3/market-quote/ltp?instrument_key="
         + urllib.parse.quote(",".join(instrument_keys), safe=",|")
     )
     req = urllib.request.Request(
@@ -2258,8 +2258,8 @@ def fetch_previous_day_high_low(instrument_key: str, access_token: str) -> tuple
     today = _ist_today_str()
     from_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=10)).strftime("%Y-%m-%d")
     url = (
-        f"https://api.upstox.com/v2/historical-candle/"
-        f"{urllib.parse.quote(instrument_key, safe='|')}/day/{today}/{from_date}"
+        f"https://api.upstox.com/v3/historical-candle/"
+        f"{urllib.parse.quote(instrument_key, safe='|')}/days/1/{today}/{from_date}"
     )
     req = urllib.request.Request(
         url,
@@ -2441,7 +2441,7 @@ def fetch_5min_candles_with_time(instrument_key: str, access_token: str) -> list
     time label - used only by the dashboard's on-demand per-alert chart
     (see /api/chart/<symbol>), fetched lazily on click, never for the
     whole alert list at once."""
-    url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/1minute"
+    url = f"https://api.upstox.com/v3/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/minutes/1"
     req = urllib.request.Request(
         url,
         headers={
@@ -2462,7 +2462,7 @@ def fetch_5min_candles(instrument_key: str, access_token: str) -> list[tuple[flo
     supports 1minute or 30minute - not 5minute directly) and combines them
     into 5-minute candles ourselves. Returns (open, high, low, close),
     oldest first."""
-    url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/1minute"
+    url = f"https://api.upstox.com/v3/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/minutes/1"
     req = urllib.request.Request(
         url,
         headers={
@@ -2508,8 +2508,8 @@ def fetch_prev_session_5min_candles(instrument_key: str, access_token: str) -> l
     from_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=7)).strftime("%Y-%m-%d")
     to_date = (datetime.utcnow() + IST_OFFSET - timedelta(days=1)).strftime("%Y-%m-%d")
     url = (
-        f"https://api.upstox.com/v2/historical-candle/"
-        f"{urllib.parse.quote(instrument_key, safe='|')}/1minute/{to_date}/{from_date}"
+        f"https://api.upstox.com/v3/historical-candle/"
+        f"{urllib.parse.quote(instrument_key, safe='|')}/minutes/1/{to_date}/{from_date}"
     )
     req = urllib.request.Request(
         url,
@@ -2626,7 +2626,7 @@ def fetch_intraday_candles_with_volume(instrument_key: str, access_token: str) -
     raw 1-minute candles (not resampled) - needed for the Volume Profile
     POC calculation, which fetch_5min_candles' OHLC-only tuples don't
     carry. Returns (open, high, low, close, volume), oldest first."""
-    url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/1minute"
+    url = f"https://api.upstox.com/v3/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/minutes/1"
     req = urllib.request.Request(
         url,
         headers={
@@ -2813,7 +2813,7 @@ def get_ltp(instrument_key: str, access_token: str) -> float | None:
     """Fetches the current last-traded price for a single instrument (used
     to price an option's premium before sizing lots). Returns None (never
     raises) on any failure."""
-    url = "https://api.upstox.com/v2/market-quote/ltp?instrument_key=" + urllib.parse.quote(instrument_key, safe="|")
+    url = "https://api.upstox.com/v3/market-quote/ltp?instrument_key=" + urllib.parse.quote(instrument_key, safe="|")
     req = urllib.request.Request(
         url,
         headers={
@@ -3408,7 +3408,7 @@ def cancel_order(order_id: str, access_token: str) -> bool:
     successful cancel request; never raises. Treats 'already
     filled/cancelled' errors as a non-fatal no-op, since that's exactly
     what happens when the SL itself already fired first."""
-    url = "https://api-hft.upstox.com/v2/order/cancel?order_id=" + urllib.parse.quote(order_id)
+    url = "https://api-hft.upstox.com/v3/order/cancel?order_id=" + urllib.parse.quote(order_id)
     req = urllib.request.Request(
         url,
         method="DELETE",
