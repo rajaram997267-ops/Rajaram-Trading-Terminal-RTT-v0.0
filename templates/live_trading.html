@@ -253,7 +253,7 @@
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry price</th><th>Entry RSI</th>
-        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Status</th><th>Entry order id</th><th>Error</th><th></th>
+        <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Status</th><th>Entry order id</th><th>Error</th><th></th>
       </tr>
       {% for t in open_trades %}
       <tr>
@@ -265,7 +265,7 @@
         <td>{{ t.last_checked_price or "-" }}</td>
         <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl if t.unrealized_pnl is not none else "-" }}</td>
         <td class="{% if t.unrealized_pnl_pct and t.unrealized_pnl_pct > 0 %}pnl-pos{% elif t.unrealized_pnl_pct and t.unrealized_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl_pct if t.unrealized_pnl_pct is not none else "-" }}{% if t.unrealized_pnl_pct is not none %}%{% endif %}</td>
-        <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
+        <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{% if not t.rr_is_true %}≈{% endif %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
         <td><span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span></td>
         <td>{{ t.live_entry_order_id or "-" }}</td>
         <td class="error-note">{{ t.live_error or "" }}</td>
@@ -335,7 +335,7 @@
           <table>
             <tr>
               <th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry</th><th>Entry RSI</th><th>Exit</th><th>Exit RSI</th>
-              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th>
+              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th>
             </tr>
             {% for t in group.trades %}
             <tr>
@@ -348,7 +348,7 @@
               <td>{{ t.live_exit_rsi if t.live_exit_rsi is not none else (t.exit_rsi if t.exit_rsi is not none else "-") }}</td>
               <td class="{% if t.live_pnl_value and t.live_pnl_value > 0 %}pnl-pos{% elif t.live_pnl_value and t.live_pnl_value < 0 %}pnl-neg{% endif %}">{{ t.live_pnl_value }}</td>
               <td class="{% if t.live_pnl_pct and t.live_pnl_pct > 0 %}pnl-pos{% elif t.live_pnl_pct and t.live_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.live_pnl_pct if t.live_pnl_pct is not none else "-" }}{% if t.live_pnl_pct is not none %}%{% endif %}</td>
-              <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
+              <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{% if not t.rr_is_true %}≈{% endif %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
               <td>{{ t.live_exit_reason or t.exit_reason }}</td>
               <td><span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span></td>
               <td>{{ t.live_entry_order_id or "-" }}</td>
@@ -421,7 +421,7 @@
       return (t.rr_multiple || 0) > 0 ? "pnl-pos" : ((t.rr_multiple || 0) < 0 ? "pnl-neg" : "");
     }
     function rrText(t) {
-      return (t.rr_multiple === null || t.rr_multiple === undefined) ? "-" : (t.rr_multiple >= 0 ? "+" : "") + t.rr_multiple.toFixed(2) + "R";
+      return (t.rr_multiple === null || t.rr_multiple === undefined) ? "-" : (t.rr_is_true ? "" : "≈") + (t.rr_multiple >= 0 ? "+" : "") + t.rr_multiple.toFixed(2) + "R";
     }
 
     function renderOpenTrades(trades) {
@@ -458,7 +458,7 @@
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry price</th><th>Entry RSI</th>
-              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Status</th><th>Entry order id</th><th>Error</th><th></th></tr>
+              <th>Last checked price</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Status</th><th>Entry order id</th><th>Error</th><th></th></tr>
           ${rows}
         </table>
       `;
@@ -541,7 +541,7 @@
             <div class="date-trades">
               <table>
                 <tr><th>Symbol</th><th>Direction</th><th>Live Qty</th><th>Entry</th><th>Entry RSI</th><th>Exit</th><th>Exit RSI</th>
-                    <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th></tr>
+                    <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Exit reason</th><th>Status</th><th>Entry order id</th><th>Exit order id</th></tr>
                 ${rows}
               </table>
             </div>

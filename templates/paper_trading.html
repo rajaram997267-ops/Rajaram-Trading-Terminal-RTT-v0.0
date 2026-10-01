@@ -317,7 +317,7 @@
     <table>
       <tr>
         <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry RSI</th><th>Entry time</th>
-        <th>Last checked price</th><th>Stop</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Last checked</th><th>Note</th><th></th>
+        <th>Last checked price</th><th>Stop</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Last checked</th><th>Note</th><th></th>
       </tr>
       {% for t in open_trades %}
       <tr>
@@ -331,7 +331,7 @@
         <td>{% if t.stop_info %}<div style="font-size:12px; color: var(--green);">{{ t.stop_info }}</div>{% endif %}{% if t.atr_value is not none %}<div class="sub" style="font-size:11px; color: var(--muted);">ATR: {{ t.atr_value }}</div>{% endif %}{% if t.rsi_value is not none %}<div class="sub" style="font-size:11px; color: var(--muted);">RSI: {{ t.rsi_value }}</div>{% endif %}</td>
         <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl if t.unrealized_pnl is not none else "-" }}</td>
         <td class="{% if t.unrealized_pnl_pct and t.unrealized_pnl_pct > 0 %}pnl-pos{% elif t.unrealized_pnl_pct and t.unrealized_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl_pct if t.unrealized_pnl_pct is not none else "-" }}{% if t.unrealized_pnl_pct is not none %}%{% endif %}</td>
-        <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
+        <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{% if not t.rr_is_true %}≈{% endif %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
         <td>{{ (t.last_checked_time or "")[:19] }}</td>
         <td class="error-note">{{ t.last_error or "" }}</td>
         <td><button class="secondary" style="padding: 5px 10px; font-size: 11px;" onclick="manualExit({{ t.id }})">Exit Now</button></td>
@@ -364,7 +364,7 @@
           <table>
             <tr>
               <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Entry RSI</th><th>Exit</th><th>Exit RSI</th>
-              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th>
+              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th>
             </tr>
             {% for t in group.trades %}
             <tr>
@@ -377,7 +377,7 @@
               <td>{{ t.exit_rsi if t.exit_rsi is not none else "-" }}</td>
               <td class="{% if t.pnl and t.pnl > 0 %}pnl-pos{% elif t.pnl and t.pnl < 0 %}pnl-neg{% endif %}">{{ t.pnl }}</td>
               <td class="{% if t.pnl_pct and t.pnl_pct > 0 %}pnl-pos{% elif t.pnl_pct and t.pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.pnl_pct if t.pnl_pct is not none else "-" }}{% if t.pnl_pct is not none %}%{% endif %}</td>
-              <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
+              <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{% if not t.rr_is_true %}≈{% endif %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
               <td>{{ t.balance_after }}</td>
               <td>{{ t.exit_reason }}</td>
               <td>{{ (t.exit_time or "")[:19] }}</td>
@@ -438,7 +438,7 @@
       return (t.rr_multiple || 0) > 0 ? "pnl-pos" : ((t.rr_multiple || 0) < 0 ? "pnl-neg" : "");
     }
     function rrText(t) {
-      return (t.rr_multiple === null || t.rr_multiple === undefined) ? "-" : (t.rr_multiple >= 0 ? "+" : "") + t.rr_multiple.toFixed(2) + "R";
+      return (t.rr_multiple === null || t.rr_multiple === undefined) ? "-" : (t.rr_is_true ? "" : "≈") + (t.rr_multiple >= 0 ? "+" : "") + t.rr_multiple.toFixed(2) + "R";
     }
 
     function renderOpenTrades(trades) {
@@ -474,7 +474,7 @@
       container.innerHTML = `
         <table>
           <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry price</th><th>Entry RSI</th><th>Entry time</th>
-              <th>Last checked price</th><th>Stop</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Last checked</th><th>Note</th><th></th></tr>
+              <th>Last checked price</th><th>Stop</th><th>Unrealized P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Last checked</th><th>Note</th><th></th></tr>
           ${rows}
         </table>
       `;
@@ -557,7 +557,7 @@
             <div class="date-trades">
               <table>
                 <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Entry RSI</th><th>Exit</th><th>Exit RSI</th>
-                    <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th>R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th></tr>
+                    <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time</th></tr>
                 ${rows}
               </table>
             </div>
