@@ -503,7 +503,9 @@ def init_db():
                 live_entry_rsi DOUBLE PRECISION,
                 live_exit_rsi DOUBLE PRECISION,
                 mae_pct DOUBLE PRECISION,
-                live_mae_pct DOUBLE PRECISION
+                live_mae_pct DOUBLE PRECISION,
+                planned_risk_pct DOUBLE PRECISION,
+                live_planned_risk_pct DOUBLE PRECISION
             )
             """
         )
@@ -559,6 +561,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_rsi DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS mae_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_mae_pct DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS planned_risk_pct DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_planned_risk_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t1 DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t2 DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t3 DOUBLE PRECISION",
@@ -1193,6 +1197,13 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
             if first_candle:
                 fib_t1, fib_t2, fib_t3, fib_t4, fib_t5, fib_t6, fib_t7, fib_t8 = compute_first_5min_fib_targets(category, first_candle[0], first_candle[1])
 
+    # Each strategy's real known-at-entry risk, captured once now so later
+    # R-multiple reporting always reflects whichever strategy was actually
+    # live for THIS trade, even if the default strategy is switched later -
+    # see strategy_planned_risk_pct/strategy_live_planned_risk_pct.
+    planned_risk_pct_val = strategy_planned_risk_pct(entry_strategy)
+    live_planned_risk_pct_val = strategy_live_planned_risk_pct(entry_strategy)
+
     with get_db() as conn:
         row = conn.execute(
             """
@@ -1201,14 +1212,16 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                  paper_instrument_key, paper_option_label, last_error,
                  strategy, original_quantity, alert_name, scan_name, spot_entry_price,
                  paper_strike, entry_rsi, camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4,
-                 fib_t1, fib_t2, fib_t3, fib_t4, fib_t5, fib_t6, fib_t7, fib_t8)
-            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 fib_t1, fib_t2, fib_t3, fib_t4, fib_t5, fib_t6, fib_t7, fib_t8,
+                 planned_risk_pct, live_planned_risk_pct)
+            VALUES (?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             RETURNING id
             """,
             (symbol, category, entry_price, now, quantity, paper_instrument_key, paper_option_label,
              fallback_note, entry_strategy, quantity, alert_name or None, scan_name or None, spot_entry_price,
              paper_strike_val, entry_rsi_val, camarilla_t1, camarilla_t2, camarilla_t3, camarilla_t4,
-             fib_t1, fib_t2, fib_t3, fib_t4, fib_t5, fib_t6, fib_t7, fib_t8),
+             fib_t1, fib_t2, fib_t3, fib_t4, fib_t5, fib_t6, fib_t7, fib_t8,
+             planned_risk_pct_val, live_planned_risk_pct_val),
         ).fetchone()
         conn.commit()
 
@@ -5708,31 +5721,89 @@ def attach_running_balance(closed_trades_desc: list[dict], starting_capital: flo
         t["balance_after"] = round(running, 2)
 
 
-def compute_rr(reward_pct: float | None, mae_pct: float | None) -> float | None:
-    """Realized R-multiple: how many times the trade's worst drawdown
-    (mae_pct, the running Max Adverse Excursion - see run_paper_trade_check)
-    its actual/current %gain (reward_pct) came out to. Most strategies
-    here don't use one single fixed stop-loss, so MAE stands in for
-    'risk' - this is the standard way to get an R:R figure after the
-    fact without one. None (shown as '-') when the trade never drew down
-    meaningfully, since dividing by ~0 would report a huge, meaningless
-    multiple rather than a useful one."""
+# Strategies whose PAPER-side simulation enforces one fixed, known-at-
+# entry stop-loss (a hard -2% on the option premium, checked explicitly
+# in run_paper_trade_check - see each strategy's block there and its
+# entry in STRATEGY_DESCRIPTIONS). Every other strategy is deliberately
+# floorless, pattern/structure-driven, or floored on the SPOT price
+# (not a fixed option-premium %) - for those, a single entry-time number
+# would misrepresent the real risk, so they fall back to the MAE-based
+# proxy below instead of a fabricated fixed R.
+FIXED_RISK_STRATEGIES_PAPER = frozenset({
+    "HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4",
+    "ATR_TRAIL", "EMA_SPOT_TRAIL",
+})
+PAPER_HARD_STOP_PCT = 2.0
+
+# Strategies where a LIVE position gets NO broker-side stop order at all
+# by design (see the sl_note branches at live entry) - RSI Momentum,
+# Camarilla Ladder and the FIB strategy are explicitly unprotected until/
+# unless their own software condition fires. Every other strategy gets a
+# real resting -2% SL order at the broker the moment it fills, regardless
+# of that strategy's own PAPER-side logic - so the real contractual risk
+# on the live side is simpler and more uniform than the paper side.
+NO_BROKER_STOP_STRATEGIES_LIVE = frozenset({
+    "RSI_MOMENTUM", "CAMARILLA_LADDER", "FIRST5MIN_FIB",
+})
+LIVE_HARD_STOP_PCT = 2.0
+
+
+def strategy_planned_risk_pct(entry_strategy: str | None) -> float | None:
+    """The PAPER side's known-at-entry risk for this strategy, in %, or
+    None if this strategy has no fixed floor (see
+    FIXED_RISK_STRATEGIES_PAPER). Computed once at trade open and stored
+    on the trade (planned_risk_pct) so it reflects whatever strategy was
+    actually active then, even if the default strategy changes later."""
+    return PAPER_HARD_STOP_PCT if entry_strategy in FIXED_RISK_STRATEGIES_PAPER else None
+
+
+def strategy_live_planned_risk_pct(entry_strategy: str | None) -> float | None:
+    """Same idea as strategy_planned_risk_pct, but for the LIVE side's
+    real broker-side risk (see NO_BROKER_STOP_STRATEGIES_LIVE) - stored
+    separately (live_planned_risk_pct) since live and paper can have
+    different real risk under the identical strategy label."""
+    return None if entry_strategy in NO_BROKER_STOP_STRATEGIES_LIVE else LIVE_HARD_STOP_PCT
+
+
+def compute_rr(reward_pct: float | None, mae_pct: float | None, planned_risk_pct: float | None = None) -> float | None:
+    """Realized R-multiple. When planned_risk_pct is known (a fixed,
+    stated-at-entry stop-loss % for this strategy - see
+    strategy_planned_risk_pct/strategy_live_planned_risk_pct), this is a
+    TRUE R-multiple: actual %gain divided by the risk that was actually
+    on the table at entry, exactly like a trading journal's R. Otherwise
+    falls back to the old proxy: how many times the trade's worst
+    drawdown (mae_pct, the running Max Adverse Excursion) its actual/
+    current %gain came out to - the standard stand-in for 'risk' when a
+    strategy has no single fixed stop. None (shown as '-') only in the
+    proxy case when the trade never drew down meaningfully, since
+    dividing by ~0 would report a huge, meaningless multiple rather than
+    a useful one; a true planned-risk R has no such cutoff, since the
+    denominator is fixed and real regardless of how little the trade
+    actually drew down."""
     if reward_pct is None:
         return None
+    if planned_risk_pct is not None and planned_risk_pct > 0:
+        return round(reward_pct / planned_risk_pct, 2)
     risk = abs(mae_pct) if mae_pct is not None and mae_pct < 0 else 0
     if risk < 0.05:
         return None
     return round(reward_pct / risk, 2)
 
 
-def attach_rr(trades: list[dict], reward_field: str, mae_field: str) -> None:
+def attach_rr(trades: list[dict], reward_field: str, mae_field: str, risk_field: str | None = None) -> None:
     """Adds 'rr_multiple' to each trade in the list - see compute_rr.
     reward_field/mae_field name the keys already on each trade dict to
     read the reward (a %gain, realized or unrealized) and risk (stored
     MAE %) from - e.g. ("pnl_pct", "mae_pct") for paper closed trades,
-    ("unrealized_pnl_pct", "live_mae_pct") for live open trades."""
+    ("unrealized_pnl_pct", "live_mae_pct") for live open trades.
+    risk_field, when given, names the column holding this trade's fixed
+    planned-risk % (planned_risk_pct or live_planned_risk_pct) - also
+    sets 'rr_is_true' so templates can show a true R differently from
+    the MAE-based proxy."""
     for t in trades:
-        t["rr_multiple"] = compute_rr(t.get(reward_field), t.get(mae_field))
+        planned_risk = t.get(risk_field) if risk_field else None
+        t["rr_multiple"] = compute_rr(t.get(reward_field), t.get(mae_field), planned_risk)
+        t["rr_is_true"] = bool(planned_risk)
 
 
 def group_trades_by_date(trades: list[dict], date_field: str = "exit_time", pnl_field: str = "pnl") -> list[dict]:
@@ -5773,7 +5844,7 @@ def paper_trading():
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
-    attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct")
+    attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct", "planned_risk_pct")
     attach_stop_info(open_trades, get_setting("upstox_access_token"))
 
     total_pnl = sum(t["pnl"] for t in closed_trades if t["pnl"] is not None)
@@ -5784,7 +5855,7 @@ def paper_trading():
     token_saved = bool(get_setting("upstox_access_token"))
     capital = get_capital()
     attach_running_balance(closed_trades, capital)
-    attach_rr(closed_trades, "pnl_pct", "mae_pct")
+    attach_rr(closed_trades, "pnl_pct", "mae_pct", "planned_risk_pct")
     closed_by_date = group_trades_by_date(closed_trades)
     current_capital = get_current_capital()
     live_trading_enabled = get_live_trading_enabled()
@@ -6029,7 +6100,7 @@ def live_trading_page():
     closed_trades = [dict(t) for t in closed_trades]
     failed_trades = [dict(t) for t in failed_trades]
     attach_live_unrealized_pnl(open_trades)
-    attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct")
+    attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
         entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
@@ -6037,7 +6108,7 @@ def live_trading_page():
         t["live_pnl_value"] = round((exit_p - entry) * qty, 2)
         capital_used = entry * qty
         t["live_pnl_pct"] = round((t["live_pnl_value"] / capital_used) * 100, 2) if capital_used else None
-    attach_rr(closed_trades, "live_pnl_pct", "live_mae_pct")
+    attach_rr(closed_trades, "live_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     closed_by_date = group_trades_by_date(closed_trades, date_field="live_exit_time", pnl_field="live_pnl_value")
@@ -6088,7 +6159,7 @@ def live_trading_data():
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
     attach_live_unrealized_pnl(open_trades)
-    attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct")
+    attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
         entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
@@ -6096,7 +6167,7 @@ def live_trading_data():
         t["live_pnl_value"] = round((exit_p - entry) * qty, 2)
         capital_used = entry * qty
         t["live_pnl_pct"] = round((t["live_pnl_value"] / capital_used) * 100, 2) if capital_used else None
-    attach_rr(closed_trades, "live_pnl_pct", "live_mae_pct")
+    attach_rr(closed_trades, "live_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
     failed_trades = [dict(t) for t in failed_trades]
 
     live_stats = compute_live_stats(open_trades, closed_trades)
@@ -6126,9 +6197,9 @@ def paper_trading_data():
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
-    attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct")
+    attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct", "planned_risk_pct")
     attach_running_balance(closed_trades, get_capital())
-    attach_rr(closed_trades, "pnl_pct", "mae_pct")
+    attach_rr(closed_trades, "pnl_pct", "mae_pct", "planned_risk_pct")
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     access_token = get_setting("upstox_access_token")
