@@ -3176,7 +3176,7 @@ def update_ws_subscriptions(instrument_keys: set[str]) -> None:
     instruments currently matter (every open trade's option contract).
     Safe to call even before the streamer connects - the next connect
     picks up the current _ws_subscribed_keys set from scratch."""
-    global _ws_subscribed_keys
+    global _ws_subscribed_keys, _ws_streamer
     added = instrument_keys - _ws_subscribed_keys
     removed = _ws_subscribed_keys - instrument_keys
     _ws_subscribed_keys = set(instrument_keys)
@@ -3188,7 +3188,20 @@ def update_ws_subscriptions(instrument_keys: set[str]) -> None:
         if removed:
             _ws_streamer.unsubscribe(list(removed))
     except Exception as e:
+        # The streamer object can outlive its actual socket: if the
+        # underlying connection dies without the SDK firing a "close"/
+        # "error" event (unverified whether this SDK version always does -
+        # see the comment where those are registered), _ws_debug["status"]
+        # is left stuck on "streaming" forever with no ticks arriving, and
+        # every subsequent subscribe just repeats this same failure. Mark
+        # it dead ourselves so _ws_watchdog_loop's immediate-kick branch
+        # (status in ("error","disconnected")) fires on its very next
+        # 20s check instead of only catching this via the slower 90s
+        # staleness timer - and null the reference so we don't keep
+        # calling into a socket we now know is gone.
+        _ws_debug["status"] = "error"
         _ws_debug["error"] = f"subscribe error: {e}"
+        _ws_streamer = None
 
 
 def _get_order_proxy_opener():
