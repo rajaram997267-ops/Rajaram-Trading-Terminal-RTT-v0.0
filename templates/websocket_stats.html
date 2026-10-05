@@ -343,7 +343,24 @@
         row("Connected Since", data.connected_since ? new Date(data.connected_since + "Z").toLocaleTimeString() : "-") +
         row("Connection Uptime", fmtDuration(data.uptime_seconds)) +
         row("Last Message At", data.status ? (data.current_tick_age !== null ? `${data.current_tick_age}s ago` : "never") : "-") +
-        row("WebSocket Error", data.error ? `<span style="color:var(--red);">${data.error}</span>` : `${dotFor(true)}None`);
+        row("WebSocket Error", data.error ? `<span style="color:var(--red);">${data.error}</span>` : `${dotFor(true)}None`) +
+        // Checks every 20s (see _ws_watchdog_loop) and force-reconnects a
+        // feed that's gone stale. This is proof the watchdog THREAD is
+        // alive and looping - separate from whether the feed itself is
+        // healthy. If this age ever climbs past ~60s while the feed is
+        // also stale, the watchdog thread has died (or never started) -
+        // a different, worse problem than a feed that's merely
+        // reconnecting, and one "WebSocket Thread: Running" above can't
+        // reveal, since that flag just means the thread was launched
+        // once, not that it's still alive now.
+        row(
+          "Watchdog Last Ran",
+          data.watchdog_age_seconds === null || data.watchdog_age_seconds === undefined
+            ? `<span style="color:var(--red);">never - not running</span>`
+            : (data.watchdog_age_seconds > 60
+                ? `<span style="color:var(--red);">${data.watchdog_age_seconds}s ago - thread may be dead</span>`
+                : `${dotFor(true)}${data.watchdog_age_seconds}s ago`)
+        );
 
       const pricesTable = document.getElementById("pricesTable");
       const prices = data.sample_prices || {};
