@@ -2890,6 +2890,20 @@ _ws_lock = threading.Lock()
 _ws_streamer = None
 _ws_subscribed_keys: set[str] = set()
 _ws_thread_started = False
+# Guards the check-then-set on _ws_thread_started in ensure_websocket_started.
+# That function is called from several independent threads - every HTTP
+# request handler that touches live trades AND the always-running
+# _exit_check_loop background thread (separate from gunicorn's own
+# request thread) - so without this lock, two of them could both read
+# _ws_thread_started as False before either sets it True, each spawning
+# its OWN _ws_run + _ws_watchdog_loop pair. Two streamers sharing one
+# access token (Upstox allows only one real connection per token - see
+# the 403 troubleshooting this app has already hit once) then fight over
+# the same _ws_debug dict: one's "open"/"message" callbacks can keep
+# painting over the other's "error"/"close" ones, which would show up as
+# exactly what was seen live - status stuck on "streaming" with ticks
+# frozen, for minutes, with the watchdog seemingly never acting.
+_ws_start_lock = threading.Lock()
 _ws_generation = 0  # bumped each time a new _ws_run thread is started (main or watchdog-triggered)
 _ws_debug: dict = {
     "status": "not_started", "error": None, "last_message_at": None,
@@ -3113,6 +3127,16 @@ def _ws_watchdog_loop() -> None:
     STALE_AFTER_SECONDS = 90
     while True:
         time.sleep(20)
+        # Written on every single iteration, pass or fail, needs_kick or
+        # not - proof the watchdog thread itself is actually alive and
+        # looping, as distinct from the feed it's watching. If this ever
+        # stops advancing while the feed is stale, the watchdog thread
+        # itself has died (or never started, e.g. the two-concurrent-
+        # streamers scenario _ws_start_lock now prevents) - if it keeps
+        # advancing but the feed is still stale, the bug is in needs_kick
+        # itself, not the thread's liveness. Two different failure
+        # classes that looked identical from the WS Speed page before.
+        _ws_debug["watchdog_last_run"] = datetime.utcnow().isoformat()
         try:
             status = _ws_debug.get("status")
             if status in ("stale_reconnecting", "connecting", "not_started", "sdk_not_installed"):
@@ -3163,12 +3187,15 @@ def ensure_websocket_started(access_token: str) -> None:
     call from any request handler - a no-op if it's already running or if
     there's no token yet."""
     global _ws_thread_started, _ws_generation
-    if _ws_thread_started or not access_token:
+    if not access_token:
         return
-    _ws_thread_started = True
-    _ws_generation += 1
-    threading.Thread(target=_ws_run, args=(access_token,), daemon=True).start()
-    threading.Thread(target=_ws_watchdog_loop, daemon=True).start()
+    with _ws_start_lock:
+        if _ws_thread_started:
+            return
+        _ws_thread_started = True
+        _ws_generation += 1
+        threading.Thread(target=_ws_run, args=(access_token,), daemon=True).start()
+        threading.Thread(target=_ws_watchdog_loop, daemon=True).start()
 
 
 def update_ws_subscriptions(instrument_keys: set[str]) -> None:
@@ -6735,6 +6762,18 @@ def api_websocket_stats():
     if connected_since:
         uptime_seconds = round((now - datetime.fromisoformat(connected_since)).total_seconds())
 
+    # Proves the watchdog thread itself is alive and looping (every 20s -
+    # see _ws_watchdog_loop), separately from whether the FEED is alive.
+    # A stale feed + a fresh watchdog_age means needs_kick's own logic
+    # isn't triggering a reconnect; a stale feed + a growing/missing
+    # watchdog_age means the watchdog thread itself isn't running -
+    # these point to different bugs and used to be indistinguishable
+    # from this page.
+    watchdog_last_run = debug_snapshot.get("watchdog_last_run")
+    watchdog_age_seconds = None
+    if watchdog_last_run:
+        watchdog_age_seconds = round((now - datetime.fromisoformat(watchdog_last_run)).total_seconds())
+
     # Feed quality classification, off the CURRENT tick's age - the
     # single most actionable number for live trading execution safety
     # (a stale feed means every strategy is deciding off old prices).
@@ -6773,6 +6812,7 @@ def api_websocket_stats():
         "connected_since": connected_since,
         "uptime_seconds": uptime_seconds,
         "feed_quality": quality,
+        "watchdog_age_seconds": watchdog_age_seconds,
     })
 
 
