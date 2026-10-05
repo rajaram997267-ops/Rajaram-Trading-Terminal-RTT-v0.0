@@ -3116,70 +3116,103 @@ def _ws_run(access_token: str) -> None:
                 return  # a newer connection took over - let this thread end here
 
 
+_WS_STALE_AFTER_SECONDS = 90
+_WS_MIN_SECONDS_BETWEEN_KICKS = 15  # debounce for _ws_check_and_heal being called from request threads
+
+
+def _ws_check_and_heal() -> None:
+    """The actual staleness check + forced-reconnect logic. Used to live
+    only inside _ws_watchdog_loop's own sleep-then-check thread - but on
+    Render's free tier, a background thread that isn't directly servicing
+    an inbound request can apparently go uncheduled for minutes at a time
+    even while the process keeps answering HTTP requests normally (seen
+    live: WATCHDOG LAST RAN read 589s - thread may be dead - while
+    /api/paper-trading/websocket-stats kept returning 200 every ~2s the
+    whole time, per Render's own request logs). A free/sleeping
+    background thread's wake-up isn't something this app can guarantee on
+    that tier, so this check now also rides along on something Render
+    DOES keep responsive - an actual inbound request - by being called
+    from api_websocket_stats() on every poll, not just from the
+    dedicated watchdog thread. The watchdog thread still calls this too,
+    as a backstop for whenever nobody has the WS Speed page open."""
+    global _ws_generation
+    try:
+        status = _ws_debug.get("status")
+        if status in ("stale_reconnecting", "connecting", "not_started", "sdk_not_installed"):
+            return  # already mid-reconnect, or nothing to watch yet
+        last_msg = _ws_debug.get("last_message_at")
+        connected_since = _ws_debug.get("connected_since")
+        now = datetime.utcnow()
+        age = None
+        if last_msg:
+            age = (now - datetime.fromisoformat(last_msg)).total_seconds()
+        elif connected_since:
+            # "streaming" but not a single tick received yet
+            age = (now - datetime.fromisoformat(connected_since)).total_seconds()
+        # An "error" or "disconnected" event fired but the blocked
+        # connect() call never returned to let _ws_run's own loop react -
+        # force a reconnect right away, don't wait out the staleness
+        # window in that case.
+        is_stale = (age is not None and age > _WS_STALE_AFTER_SECONDS)
+        needs_kick = status in ("error", "disconnected") or is_stale
+        if not needs_kick:
+            return
+        # Debounce: several request threads could all call this within
+        # the same couple of seconds (every WS Speed poll, every exit
+        # check) - without this, they'd all see needs_kick=True before
+        # any of them finishes starting a replacement thread, and each
+        # would spawn its own, right back into the multiple-streamers
+        # problem _ws_start_lock was added to prevent.
+        last_kick = _ws_debug.get("last_kick_at")
+        if last_kick:
+            since_kick = (now - datetime.fromisoformat(last_kick)).total_seconds()
+            if since_kick < _WS_MIN_SECONDS_BETWEEN_KICKS:
+                return
+        _ws_debug["last_kick_at"] = now.isoformat()
+        _ws_debug["status"] = "stale_reconnecting"
+        _ws_debug["stale_reconnect_count"] = _ws_debug.get("stale_reconnect_count", 0) + 1
+        _ws_debug["error"] = (
+            f"watchdog: no tick for {int(age)}s, forcing reconnect" if age is not None
+            else f"watchdog: status={status}, forcing reconnect"
+        )
+        try:
+            if _ws_streamer is not None:
+                _ws_streamer.disconnect()
+        except Exception:
+            pass
+        # Bump the generation BEFORE starting the replacement thread, so
+        # the new thread's _ws_run immediately sees itself as the current
+        # generation and any old wedged thread that later regains control
+        # (if disconnect() above didn't fully work) recognizes it's stale
+        # and exits instead of reconnecting itself too and fighting over
+        # _ws_streamer.
+        _ws_generation += 1
+        token = get_setting("upstox_access_token")
+        if token:
+            threading.Thread(target=_ws_run, args=(token,), daemon=True).start()
+    except Exception:
+        pass
+
+
 def _ws_watchdog_loop() -> None:
     """Independent of _ws_run's own thread on purpose - see the note left
     in place of the old in-loop monitor above. Runs for the life of the
     process, checking _ws_debug regardless of whether _ws_run's thread is
-    currently blocked inside streamer.connect(). If the feed has gone
-    quiet for too long, forces a fresh reconnect rather than trusting the
-    old thread to ever notice on its own."""
-    global _ws_generation
-    STALE_AFTER_SECONDS = 90
+    currently blocked inside streamer.connect(). Belt-and-suspenders
+    alongside the same check now also triggered from api_websocket_stats
+    on every page poll - see _ws_check_and_heal's docstring for why
+    relying on this thread ALONE wasn't enough on Render's free tier."""
     while True:
         time.sleep(20)
         # Written on every single iteration, pass or fail, needs_kick or
         # not - proof the watchdog thread itself is actually alive and
         # looping, as distinct from the feed it's watching. If this ever
         # stops advancing while the feed is stale, the watchdog thread
-        # itself has died (or never started, e.g. the two-concurrent-
-        # streamers scenario _ws_start_lock now prevents) - if it keeps
-        # advancing but the feed is still stale, the bug is in needs_kick
-        # itself, not the thread's liveness. Two different failure
-        # classes that looked identical from the WS Speed page before.
+        # itself has gone unscheduled - if it keeps advancing but the
+        # feed is still stale, the bug is in needs_kick itself, not the
+        # thread's liveness.
         _ws_debug["watchdog_last_run"] = datetime.utcnow().isoformat()
-        try:
-            status = _ws_debug.get("status")
-            if status in ("stale_reconnecting", "connecting", "not_started", "sdk_not_installed"):
-                continue  # already mid-reconnect, or nothing to watch yet
-            last_msg = _ws_debug.get("last_message_at")
-            connected_since = _ws_debug.get("connected_since")
-            now = datetime.utcnow()
-            age = None
-            if last_msg:
-                age = (now - datetime.fromisoformat(last_msg)).total_seconds()
-            elif connected_since:
-                # "streaming" but not a single tick received yet
-                age = (now - datetime.fromisoformat(connected_since)).total_seconds()
-            # An "error" or "disconnected" event fired but the blocked
-            # connect() call never returned to let _ws_run's own loop react
-            # - force a reconnect right away, don't wait out the staleness
-            # window in that case.
-            is_stale = (age is not None and age > STALE_AFTER_SECONDS)
-            needs_kick = status in ("error", "disconnected") or is_stale
-            if needs_kick:
-                _ws_debug["status"] = "stale_reconnecting"
-                _ws_debug["stale_reconnect_count"] = _ws_debug.get("stale_reconnect_count", 0) + 1
-                _ws_debug["error"] = (
-                    f"watchdog: no tick for {int(age)}s, forcing reconnect" if age is not None
-                    else f"watchdog: status={status}, forcing reconnect"
-                )
-                try:
-                    if _ws_streamer is not None:
-                        _ws_streamer.disconnect()
-                except Exception:
-                    pass
-                # Bump the generation BEFORE starting the replacement thread,
-                # so the new thread's _ws_run immediately sees itself as the
-                # current generation and any old wedged thread that later
-                # regains control (if disconnect() above didn't fully work)
-                # recognizes it's stale and exits instead of reconnecting
-                # itself too and fighting over _ws_streamer.
-                _ws_generation += 1
-                token = get_setting("upstox_access_token")
-                if token:
-                    threading.Thread(target=_ws_run, args=(token,), daemon=True).start()
-        except Exception:
-            pass
+        _ws_check_and_heal()
 
 
 def ensure_websocket_started(access_token: str) -> None:
@@ -3720,6 +3753,14 @@ def _run_paper_trade_check_impl() -> dict:
         ).fetchall()
 
     ensure_websocket_started(access_token)
+    # Same staleness/reconnect check api_websocket_stats now runs on its
+    # own poll - see _ws_check_and_heal's docstring. This function fires
+    # from both the frontend's own poll AND the always-on background
+    # _exit_check_loop thread, so piggybacking here covers anyone with
+    # Paper/Live Trading open too, not just the WS Speed page, and adds a
+    # second independent trigger path in case Render is starving THIS
+    # background thread specifically rather than the websocket one.
+    _ws_check_and_heal()
     active_keys = {
         t["paper_instrument_key"] for t in open_trades if t["paper_instrument_key"]
     } | {
@@ -6733,6 +6774,13 @@ def api_websocket_stats():
     access_token = get_setting("upstox_access_token")
     if access_token:
         ensure_websocket_started(access_token)
+    # Piggybacks the same staleness check the background watchdog thread
+    # runs every 20s onto this request itself - see _ws_check_and_heal's
+    # docstring. The WS Speed page's own 2s auto-refresh means this fires
+    # far more often than the watchdog thread while someone has it open,
+    # catching a stall almost immediately instead of waiting on a
+    # background thread Render's free tier may not schedule promptly.
+    _ws_check_and_heal()
 
     now = datetime.utcnow()
     with _ws_lock:
