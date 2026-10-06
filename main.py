@@ -1242,14 +1242,27 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
         if not access_token:
             _mark_live_failed(trade_id, "Live trading is on but no Upstox access token is saved")
         else:
-            option = get_atm_option(symbol, opt_type, price_val)
-            if not option:
+            # Reuse the SAME option lookup + quote the paper trade just
+            # used a few lines up, instead of calling get_atm_option/
+            # get_ltp_with_retry a second time for the identical
+            # contract. That redundant second call was a real, provable
+            # source of paper-vs-live entry price drift (two quotes
+            # fetched moments apart can simply differ) on top of the
+            # real market-order fill slippage that's inherent to live
+            # execution and can't be removed - see the paper-vs-live
+            # entry price discussion. Only fall back to a fresh lookup
+            # here if paper didn't already get a usable one (e.g. paper
+            # fell back to equity because no option chain was found).
+            live_option = option if (option and premium and premium > 0) else get_atm_option(symbol, opt_type, price_val)
+            if not live_option:
                 _mark_live_failed(trade_id, f"No {opt_type} option chain data found for {symbol} (nearest monthly expiry)")
             else:
-                premium = get_ltp_with_retry(option["instrument_key"], access_token)
-                if not premium or premium <= 0:
+                option = live_option
+                live_premium = premium if (option and premium and premium > 0) else get_ltp_with_retry(option["instrument_key"], access_token)
+                if not live_premium or live_premium <= 0:
                     _mark_live_failed(trade_id, f"Could not fetch option premium for {symbol} {opt_type}")
                 else:
+                    premium = live_premium
                     available_funds = get_upstox_available_funds(access_token)
                     if available_funds is None:
                         _mark_live_failed(trade_id, "Could not fetch available Upstox funds - live order skipped")
