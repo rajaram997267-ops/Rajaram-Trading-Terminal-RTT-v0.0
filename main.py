@@ -1141,21 +1141,28 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     now = datetime.utcnow().isoformat()
     entry_strategy = get_exit_strategy()
 
-    # Needed by the JOAT-inspired spot-based strategies (#9, Test-B,
-    # Test-C) - their whole exit decision runs off the UNDERLYING's own
-    # price move, not the option premium, so a reference point at entry
-    # is required. Harmless/unused for every other strategy - just one
-    # extra LTP lookup, only when a token is available.
+    # spot_entry_price is ONLY ever read by the JOAT-inspired spot-based
+    # strategies (#9, Test-B, Test-C) - every read of it elsewhere in the
+    # codebase is already inside a "strategy in (JOAT_HYBRID, JOAT_TEST_B,
+    # JOAT_TEST_C)" check, confirmed by grepping every t["spot_entry_price"]
+    # / t.get("spot_entry_price") site. It used to fetch unconditionally
+    # for every trade - a real, wasted LTP round-trip sitting directly in
+    # the critical path between paper's price capture and live's order
+    # placement, on every strategy that doesn't need it (which, per Stats,
+    # is everything actually run so far). Gated to only the strategies
+    # that use it, the same reasoning as the paper/live quote-fetch dedup.
+    # spot_entry_candles stays unconditional - it also feeds entry_rsi_val
+    # below, which every trade displays regardless of strategy.
     spot_entry_price = None
     spot_entry_candles = None
-    if access_token:
-        spot_instrument_key = get_instrument_key(symbol)
-        if spot_instrument_key:
+    spot_instrument_key = get_instrument_key(symbol) if access_token else None
+    if spot_instrument_key:
+        if entry_strategy in ("JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C"):
             spot_entry_price = get_ltp(spot_instrument_key, access_token)
-            try:
-                spot_entry_candles = get_5min_candles_with_warmup(spot_instrument_key, access_token)
-            except Exception:
-                spot_entry_candles = None
+        try:
+            spot_entry_candles = get_5min_candles_with_warmup(spot_instrument_key, access_token)
+        except Exception:
+            spot_entry_candles = None
 
     # Logged on every trade regardless of exit strategy (not just RSI
     # Momentum trades) so every strategy's entries/exits can be compared
