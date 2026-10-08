@@ -505,7 +505,9 @@ def init_db():
                 mae_pct DOUBLE PRECISION,
                 live_mae_pct DOUBLE PRECISION,
                 planned_risk_pct DOUBLE PRECISION,
-                live_planned_risk_pct DOUBLE PRECISION
+                live_planned_risk_pct DOUBLE PRECISION,
+                entry_volume_label TEXT,
+                entry_volume_ratio DOUBLE PRECISION
             )
             """
         )
@@ -563,6 +565,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_mae_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS planned_risk_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_planned_risk_pct DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_volume_label TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_volume_ratio DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t1 DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t2 DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t3 DOUBLE PRECISION",
@@ -1495,6 +1499,11 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                         )
                                         conn.commit()
 
+    # Record the directional-volume reading as of this entry on the trade
+    # row (for the Stats "by entry volume strength" test). Deliberately the
+    # LAST thing this function does and on its own thread - after the live
+    # order has already gone out - so it can never add delay to an order.
+    _log_entry_volume_async(row["id"], symbol, category, now)
     return True, None
 
 
@@ -2705,6 +2714,330 @@ def get_poc_price(instrument_key: str, access_token: str) -> float | None:
     poc_bucket = max(volume_by_bucket, key=volume_by_bucket.get)
     poc_price = lo + (poc_bucket + 0.5) * bucket_size
     return round(poc_price, 2)
+
+
+# ---------------------------------------------------------------------------
+# Directional volume strength - the badge on each Buy/Sell dashboard card,
+# and the reading logged on every trade at entry.
+# ---------------------------------------------------------------------------
+# What it measures, and what it deliberately does NOT claim: NSE candle
+# data carries total traded volume only, never how much of it was buying vs
+# selling. So this ESTIMATES "directional volume" from where each 5-min
+# candle closed inside its own high-low range (the Chaikin-style
+# close-location split): a candle closing near its high credits most of
+# its volume to buyers, near its low to sellers. It is an estimate, and is
+# always labeled "directional volume" - never literal buy/sell volume.
+#
+# It uses the UNDERLYING STOCK's volume, not the option contract's: the
+# alerts are about the stock, and option volume on mid-caps is too thin
+# and noisy to read.
+#
+# It compares against the SAME TIME OF DAY over the last ~10 sessions, not
+# a plain 20-bar moving average. Intraday volume has a built-in shape
+# (heavy open, quiet midday, busier close); a 20-bar average lags that
+# shape, so "above the average" would be nearly always true just after the
+# open and nearly always false at midday on every stock - it would track
+# the clock, not the trade.
+#
+# Display + logging only. It never filters or blocks a trade.
+_VOL_HISTORY_SESSIONS = 10
+_VOL_MIN_HISTORY_SESSIONS = 3     # fewer than this for a time slot -> no reading, not a guess
+_VOL_REFRESH_PACING_SECONDS = 0.2  # gap between per-symbol fetches in the background worker
+_VOL_MAX_SYMBOLS_PER_RUN = 80
+_VOL_RETRY_AFTER_SECONDS = 60      # how soon a failed/empty reading is retried (market hours)
+
+_vol_history_cache: dict[str, dict] = {}   # instrument_key -> {"date", "slots", "failed_at"}
+_vol_reading_cache: dict[str, dict] = {}   # SYMBOL -> reading (see _build_volume_reading)
+_vol_refresh_lock = threading.Lock()
+_vol_refresh_running = False
+
+
+def _vol_fetch_candles(url: str, access_token: str) -> list[list]:
+    """Upstox candle format: [timestamp, open, high, low, close, volume, oi],
+    timestamps like '2026-10-05T09:15:00+05:30' (already IST wall-clock)."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode())
+    return sorted(payload.get("data", {}).get("candles", []), key=lambda c: c[0])
+
+
+def _directional_pressure(high, low, close, volume) -> tuple[float, float]:
+    """(buy_pressure, sell_pressure) for one candle - volume split by where
+    the close sits in the high-low range. A zero-range candle (high == low)
+    has no directional information, so it splits 50/50."""
+    vol = float(volume or 0)
+    if vol <= 0:
+        return 0.0, 0.0
+    rng = float(high or 0) - float(low or 0)
+    if rng <= 0:
+        return vol / 2.0, vol / 2.0
+    buy = vol * (float(close) - float(low)) / rng
+    return buy, vol - buy
+
+
+def _get_volume_history(instrument_key: str, access_token: str) -> dict:
+    """Per 5-min time slot ('09:15', '09:20', ...), the average total volume
+    and average buy/sell directional volume over the last
+    _VOL_HISTORY_SESSIONS sessions. One historical call per stock per day,
+    cached for the day; an empty result (failed fetch) is only cached for
+    5 minutes so a transient error doesn't blank the badge all day."""
+    today = _ist_today_str()
+    cached = _vol_history_cache.get(instrument_key)
+    if cached and cached["date"] == today:
+        if cached["slots"]:
+            return cached["slots"]
+        if cached.get("failed_at") and (time.monotonic() - cached["failed_at"]) < 300:
+            return {}
+    slots: dict[str, dict] = {}
+    try:
+        now_ist = datetime.utcnow() + IST_OFFSET
+        to_date = (now_ist - timedelta(days=1)).strftime("%Y-%m-%d")
+        from_date = (now_ist - timedelta(days=16)).strftime("%Y-%m-%d")  # ~10-11 trading days
+        url = (
+            f"https://api.upstox.com/v3/historical-candle/"
+            f"{urllib.parse.quote(instrument_key, safe='|')}/minutes/5/{to_date}/{from_date}"
+        )
+        raw = _vol_fetch_candles(url, access_token)
+        by_session: dict[str, dict[str, list]] = {}
+        for c in raw:
+            by_session.setdefault(c[0][:10], {})[c[0][11:16]] = c
+        acc: dict[str, dict[str, list[float]]] = {}
+        for day in sorted(by_session, reverse=True)[:_VOL_HISTORY_SESSIONS]:
+            for slot, c in by_session[day].items():
+                buy, sell = _directional_pressure(c[2], c[3], c[4], c[5])
+                a = acc.setdefault(slot, {"vol": [], "buy": [], "sell": []})
+                a["vol"].append(float(c[5] or 0))
+                a["buy"].append(buy)
+                a["sell"].append(sell)
+        for slot, a in acc.items():
+            n = len(a["vol"])
+            slots[slot] = {
+                "vol": sum(a["vol"]) / n, "buy": sum(a["buy"]) / n,
+                "sell": sum(a["sell"]) / n, "n": n,
+            }
+    except Exception:
+        slots = {}
+    _vol_history_cache[instrument_key] = {
+        "date": today, "slots": slots,
+        "failed_at": None if slots else time.monotonic(),
+    }
+    return slots
+
+
+def _volume_strength_label(ratio: float | None, prev_ratio: float | None) -> str | None:
+    """Strong: directional volume at/above its usual level for this time of
+    day AND not falling vs the previous candle (both normalized by their own
+    time slot, so the intraday volume shape can't fake a trend).
+    Moderate: above usual but not rising, or rising while within 80-100% of
+    usual. Weak: everything else."""
+    if ratio is None:
+        return None
+    rising = prev_ratio is not None and ratio >= prev_ratio
+    if ratio >= 1.0 and rising:
+        return "Strong"
+    if ratio >= 1.0 or (ratio >= 0.8 and rising):
+        return "Moderate"
+    return "Weak"
+
+
+def _build_volume_reading(symbol: str, access_token: str, as_of_ist: datetime | None = None) -> dict:
+    """The full reading for one stock, both sides. `as_of_ist` lets the
+    entry logger ask 'what did this look like at the moment of entry'
+    (only candles already closed by then count); the dashboard just uses
+    now. Returns a dict with status 'ok' or a short reason it isn't."""
+    wall_now = datetime.utcnow() + IST_OFFSET
+    now_ist = as_of_ist or wall_now
+    base = {"fetched_at_ist": wall_now}
+    key = get_instrument_key(symbol)
+    if not key:
+        return {**base, "status": "no_instrument"}
+    slots = _get_volume_history(key, access_token)
+    if not slots:
+        return {**base, "status": "no_history"}
+    url = (
+        f"https://api.upstox.com/v3/historical-candle/intraday/"
+        f"{urllib.parse.quote(key, safe='|')}/minutes/5"
+    )
+    raw = _vol_fetch_candles(url, access_token)
+    today = now_ist.strftime("%Y-%m-%d")
+    closed = []
+    for c in raw:
+        if c[0][:10] != today:
+            continue
+        start = datetime.strptime(c[0][:19], "%Y-%m-%dT%H:%M:%S")
+        if start + timedelta(minutes=5) <= now_ist:   # still-forming candle excluded
+            closed.append((start, c))
+    if not closed:
+        return {**base, "status": "no_candles"}
+
+    def side_ratio(c, side: str) -> float | None:
+        slot_base = slots.get(c[0][11:16])
+        if not slot_base or slot_base["n"] < _VOL_MIN_HISTORY_SESSIONS or slot_base[side] <= 0:
+            return None
+        buy, sell = _directional_pressure(c[2], c[3], c[4], c[5])
+        return (buy if side == "buy" else sell) / slot_base[side]
+
+    latest_start, latest = closed[-1]
+    prev = closed[-2][1] if len(closed) >= 2 else None
+    out: dict = {
+        **base, "status": "ok",
+        "candle_start_ist": latest_start,
+        "asof": (latest_start + timedelta(minutes=5)).strftime("%H:%M"),
+    }
+    for side in ("buy", "sell"):
+        r = side_ratio(latest, side)
+        pr = side_ratio(prev, side) if prev else None
+        out[side] = {
+            "ratio": round(r, 2) if r is not None else None,
+            "prev_ratio": round(pr, 2) if pr is not None else None,
+            "label": _volume_strength_label(r, pr),
+        }
+    if out["buy"]["label"] is None and out["sell"]["label"] is None:
+        out["status"] = "no_baseline"
+    return out
+
+
+def _vol_market_open(now_ist: datetime) -> bool:
+    return now_ist.weekday() < 5 and (9, 15) <= (now_ist.hour, now_ist.minute) <= (15, 35)
+
+
+def _volume_reading_is_stale(symbol: str, now_ist: datetime) -> bool:
+    r = _vol_reading_cache.get(symbol)
+    if r is None:
+        return True
+    if not _vol_market_open(now_ist):
+        return False  # after hours / weekend: what we have is as fresh as it will get
+    fetched = r["fetched_at_ist"]
+    if r.get("status") != "ok":
+        return (now_ist - fetched).total_seconds() >= _VOL_RETRY_AFTER_SECONDS
+    boundary = now_ist.replace(minute=now_ist.minute - now_ist.minute % 5, second=0, microsecond=0)
+    # A new 5-min candle closed since the last fetch (+15s grace for Upstox to finalize it)
+    if fetched < boundary + timedelta(seconds=15) <= now_ist:
+        return True
+    # Upstox's intraday feed lags a minute or two behind the clock: if the
+    # candle that should have closed still isn't in our data, keep retrying
+    # every 30s until it lands instead of waiting out a whole extra candle.
+    expected_start = boundary - timedelta(minutes=5)
+    cached_start = r.get("candle_start_ist")
+    if cached_start is not None and cached_start < expected_start and (now_ist - fetched).total_seconds() >= 30:
+        return True
+    return False
+
+
+def _volume_refresh_worker(symbols: list[str], access_token: str) -> None:
+    global _vol_refresh_running
+    try:
+        for sym in symbols[:_VOL_MAX_SYMBOLS_PER_RUN]:
+            try:
+                _vol_reading_cache[sym] = _build_volume_reading(sym, access_token)
+            except Exception as e:
+                _vol_reading_cache[sym] = {
+                    "status": "error", "reason": str(e)[:120],
+                    "fetched_at_ist": datetime.utcnow() + IST_OFFSET,
+                }
+            time.sleep(_VOL_REFRESH_PACING_SECONDS)
+    finally:
+        with _vol_refresh_lock:
+            _vol_refresh_running = False
+
+
+def _kick_volume_refresh(symbols: set[str], access_token: str | None) -> None:
+    """Non-blocking, same pattern as _get_prev_closes: the dashboard request
+    never waits on candle fetches (it makes zero per-alert API calls by
+    design) - it just kicks a background worker for whatever's stale and
+    reads whatever's cached right now."""
+    global _vol_refresh_running
+    if not access_token or not symbols:
+        return
+    now_ist = datetime.utcnow() + IST_OFFSET
+    stale = sorted(s for s in symbols if _volume_reading_is_stale(s, now_ist))
+    if not stale:
+        return
+    with _vol_refresh_lock:
+        if _vol_refresh_running:
+            return
+        _vol_refresh_running = True
+    threading.Thread(target=_volume_refresh_worker, args=(stale, access_token), daemon=True).start()
+
+
+def _volume_for_alert(symbol: str | None, category: str) -> dict | None:
+    r = _vol_reading_cache.get((symbol or "").strip().upper())
+    if not r or r.get("status") != "ok":
+        return None
+    side = r.get("buy" if category == "Buy" else "sell")
+    if not side or side.get("label") is None:
+        return None
+    return {"label": side["label"], "ratio": side["ratio"], "prev_ratio": side["prev_ratio"], "asof": r["asof"]}
+
+
+def _attach_volume_readings(items: list[dict], access_token: str | None, is_today: bool) -> None:
+    """Adds a 'volume' key to each Buy/Sell alert dict. Today's alerts only -
+    a past day's dashboard has no live candles to compare against."""
+    if not is_today or not access_token:
+        return
+    _kick_volume_refresh(
+        {(a.get("symbol") or "").strip().upper() for a in items
+         if a.get("category") in ("Buy", "Sell") and a.get("symbol")},
+        access_token,
+    )
+    for a in items:
+        if a.get("category") in ("Buy", "Sell"):
+            a["volume"] = _volume_for_alert(a.get("symbol"), a["category"])
+
+
+def _log_entry_volume(trade_id: int, symbol: str, category: str, entry_iso_utc: str) -> None:
+    """Records the volume reading AS OF ENTRY on the trade row, so Stats can
+    later answer whether Strong-volume entries actually do better. Runs on
+    its own thread AFTER the live-order path, so it adds no latency to the
+    order; best-effort - any failure just leaves the columns empty."""
+    try:
+        access_token = get_setting("upstox_access_token")
+        if not access_token or category not in ("Buy", "Sell"):
+            return
+        entry_ist = datetime.fromisoformat(entry_iso_utc) + IST_OFFSET
+        reading = _build_volume_reading((symbol or "").strip().upper(), access_token, as_of_ist=entry_ist)
+        if reading.get("status") != "ok":
+            return
+        side = reading["buy" if category == "Buy" else "sell"]
+        if side.get("label") is None:
+            return
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE paper_trades SET entry_volume_label = ?, entry_volume_ratio = ? WHERE id = ?",
+                (side["label"], side["ratio"], trade_id),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _log_entry_volume_async(trade_id: int, symbol: str, category: str, entry_iso_utc: str) -> None:
+    threading.Thread(
+        target=_log_entry_volume, args=(trade_id, symbol, category, entry_iso_utc), daemon=True
+    ).start()
+
+
+@app.route("/api/volume-strength/debug")
+def api_volume_strength_debug():
+    """What the volume badge currently has cached per symbol, and why any
+    symbol has no reading (status: no_history / no_candles / no_baseline /
+    no_instrument / error + reason). Exists so a missing badge is
+    diagnosable without guessing."""
+    out = {}
+    for sym, r in sorted(_vol_reading_cache.items()):
+        out[sym] = {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in r.items()}
+    return jsonify({
+        "refresh_running": _vol_refresh_running,
+        "cached_symbols": len(out),
+        "readings": out,
+    })
 
 
 def poc_qualifies(instrument_key: str, category: str, current_price: float, access_token: str) -> tuple[bool, str]:
@@ -5126,6 +5459,8 @@ def index():
         all_sectors = sorted({a["sector"] for a in alerts})
         grouped = group_by_category(alerts)
         merged_count = sum(len(items) for _, items in grouped)
+        for _, _items in grouped:
+            _attach_volume_readings(_items, access_token, selected_date == today_str)
 
         html = render_template(
             "index.html",
@@ -5203,6 +5538,10 @@ def api_alerts():
     for name in CATEGORY_ORDER:
         if name in by_category:
             merged_alerts.extend(merge_duplicate_symbols(by_category[name]))
+
+    # Directional-volume badge: reads a background-maintained cache, adds
+    # no per-alert API calls to this request - see _attach_volume_readings.
+    _attach_volume_readings(merged_alerts, access_token, selected_date == today_str)
 
     return jsonify(merged_alerts)
 
@@ -6129,13 +6468,16 @@ def api_stats_breakdown():
     so the gap is visible instead of hidden."""
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT alert_name, scan_name, strategy, pnl FROM paper_trades "
+            "SELECT alert_name, scan_name, strategy, pnl, entry_volume_label FROM paper_trades "
             "WHERE status = 'CLOSED' AND pnl IS NOT NULL"
         ).fetchall()
     rows = [dict(r) for r in rows]
 
     by_alert = _summarize_group(rows, "alert_name")
     by_strategy = _summarize_group(rows, "strategy")
+    by_volume = _summarize_group(rows, "entry_volume_label")
+    _vol_order = {"Strong": 0, "Moderate": 1, "Weak": 2}
+    by_volume.sort(key=lambda g: _vol_order.get(g["name"], 3))  # Strong -> Weak, then (not recorded)
 
     # Combined (alert, strategy) pair breakdown.
     pair_rows = []
@@ -6149,6 +6491,14 @@ def api_stats_breakdown():
     return jsonify({
         "by_alert": by_alert,
         "by_strategy": by_strategy,
+        "by_volume": by_volume,
+        "volume_tracking_note": (
+            "Directional volume at entry vs the same time of day over the last ~10 "
+            "sessions - an estimate from candle structure, not true buy/sell volume. "
+            "Only trades opened after this tracking was added have a reading; the "
+            "rest show as '(not recorded)'. Needs a good number of trades per bucket "
+            "before the comparison means anything."
+        ),
         "by_pair": by_pair[:10],  # top 10 combos only - the full cross-product isn't useful to scan
         "total_closed_trades": len(rows),
         "alert_tracking_note": (
