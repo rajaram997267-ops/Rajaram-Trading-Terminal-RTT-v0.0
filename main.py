@@ -3079,6 +3079,25 @@ def _ws_run(access_token: str) -> None:
                 streamer.on("close", lambda *a: _ws_debug.update({"status": "disconnected"}))
             except Exception:
                 pass
+            try:
+                # Confirmed in Upstox's own SDK docs (PHP SDK README, same
+                # event naming shared across their SDKs): fires when the
+                # SDK's OWN auto_reconnect below exhausts its 50 retries
+                # and gives up internally. Without this, a dead
+                # auto-reconnect never tells the app - status stays frozen
+                # on whatever it was before (often "streaming", from
+                # before the drop), which is very likely the real root
+                # cause of the "stuck on Streaming, zero ticks, watchdog
+                # never acts" bug this app spent a long time patching
+                # around with _ws_check_and_heal. Marking status "error"
+                # here feeds straight into that same healing path instead
+                # of requiring a bug hunt each time it happens.
+                streamer.on("autoReconnectStopped", lambda *a: _ws_debug.update({
+                    "status": "error",
+                    "error": f"sdk auto-reconnect exhausted its retries: {a}",
+                }))
+            except Exception:
+                pass
             # Use the SDK's own reconnect handling for ordinary drops
             # (network blips, Upstox-side restarts) - this keeps the SAME
             # connection object/thread alive and reconnecting internally,
