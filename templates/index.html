@@ -220,6 +220,26 @@
       flex-shrink: 0;
     }
     .row-top .price::before { content: "Rs "; opacity: 0.7; font-weight: 400; }
+    .row-vol {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 10px;
+      color: var(--muted);
+    }
+    .vol-pill {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 0 6px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: transparent;
+      white-space: nowrap;
+      cursor: help;
+    }
+    .vol-pill.strong { color: var(--green); border-color: var(--green); }
+    .vol-pill.moderate { color: var(--gold); border-color: var(--gold); }
+    .vol-pill.weak { color: var(--muted); }
     .pct-change {
       font-size: 11px;
       font-weight: 600;
@@ -568,6 +588,9 @@
                     <span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>
                     <span class="price-wrap"><span class="price">{{ alert["trigger_price"] or "-" }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '{{ (alert['symbol'] or '')|escape }}')" title="Fetch live price">&#8635;</button>
                   </div>
+                  {% if alert.get("volume") %}
+                  <div class="row-vol"><span class="vol-pill {{ alert['volume']['label']|lower }}" title="{{ 'Buy' if category == 'Buy' else 'Sell' }}-side directional volume is {{ alert['volume']['ratio'] }}x its usual level for this time of day{% if alert['volume']['prev_ratio'] is not none %} (previous candle: {{ alert['volume']['prev_ratio'] }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ alert['volume']['asof'] }}.">Vol {{ alert['volume']['label'] }} &middot; {{ alert['volume']['ratio'] }}&times;</span><span>as of {{ alert['volume']['asof'] }}</span></div>
+                  {% endif %}
                   <div class="row-bottom">
                     <span class="badges-inline">
                       {% for sn in alert.get("scan_names", [alert.get("scan_name", "Scan alert")]) %}
@@ -650,12 +673,21 @@
       const pctBadge = (a.pct_change_today !== null && a.pct_change_today !== undefined)
         ? `<span class="pct-change ${a.pct_change_today >= 0 ? "pos" : "neg"}">${a.pct_change_today >= 0 ? "+" : ""}${a.pct_change_today}%</span>`
         : "";
+      let volHtml = "";
+      if (a.volume && a.volume.label) {
+        const v = a.volume;
+        const side = cat === "Buy" ? "Buy" : "Sell";
+        const prevTxt = (v.prev_ratio !== null && v.prev_ratio !== undefined) ? ` (previous candle: ${v.prev_ratio}x)` : "";
+        const tip = `${side}-side directional volume is ${v.ratio}x its usual level for this time of day${prevTxt}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of ${v.asof}.`;
+        volHtml = `<div class="row-vol"><span class="vol-pill ${escapeHtml(v.label.toLowerCase())}" title="${escapeHtml(tip)}">Vol ${escapeHtml(v.label)} &middot; ${v.ratio}&times;</span><span>as of ${escapeHtml(v.asof)}</span></div>`;
+      }
       return `
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
             <span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>
             <span class="price-wrap"><span class="price">${escapeHtml(String(a.trigger_price || "-"))}</span>${pctBadge}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '${escapeHtml(a.symbol || "")}')" title="Fetch live price">&#8635;</button>
           </div>
+          ${volHtml}
           <div class="row-bottom">
             <span class="badges-inline">${badgesHtml}</span>
             <span class="time-inline">${escapeHtml(timeText)}</span>

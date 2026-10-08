@@ -161,6 +161,13 @@
   </div>
 
   <div class="chart-box">
+    <h3>Performance by Entry Volume Strength</h3>
+    <div class="sub">Closed paper trades only - directional volume at entry vs the usual level for that time of day</div>
+    <div class="table-scroll"><table class="breakdown" id="volumeTable"></table></div>
+    <div class="breakdown-note" id="volumeNote"></div>
+  </div>
+
+  <div class="chart-box">
     <h3>Best Alert + Exit Strategy combinations</h3>
     <div class="sub">Top 10 pairs by total P&amp;L</div>
     <div class="table-scroll"><table class="breakdown" id="pairTable"></table></div>
@@ -322,6 +329,8 @@
         document.getElementById("alertNote").textContent = data.alert_tracking_note || "";
 
         renderBreakdownTable("strategyTable", data.by_strategy, "Max Loss (Rs)");
+        renderBreakdownTable("volumeTable", data.by_volume, "Max Loss (Rs)");
+        document.getElementById("volumeNote").textContent = data.volume_tracking_note || "";
         renderBreakdownTable("pairTable", data.by_pair);
       } catch (err) {
         console.error("Failed to load breakdown", err);
