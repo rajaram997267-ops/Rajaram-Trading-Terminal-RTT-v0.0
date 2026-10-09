@@ -2745,6 +2745,14 @@ _VOL_MIN_HISTORY_SESSIONS = 3     # fewer than this for a time slot -> no readin
 _VOL_REFRESH_PACING_SECONDS = 0.2  # gap between per-symbol fetches in the background worker
 _VOL_MAX_SYMBOLS_PER_RUN = 80
 _VOL_RETRY_AFTER_SECONDS = 60      # how soon a failed/empty reading is retried (market hours)
+# Since 3 Aug 2026 (NSE Closing Auction Session), F&O stocks - the only stocks
+# RTT trades - stop CONTINUOUS trading at 15:15; a closing auction then runs
+# to 15:35. Candles starting at/after 15:15 hold almost no real volume (a
+# stray auction print can land in one), which produced readings like 0x and
+# 38x. Only candles that START before this minute-of-day count, so the badge
+# freezes at "as of 15:15" (the last genuine candle) instead of measuring
+# the auction.
+_VOL_CONTINUOUS_END_MINUTES = 15 * 60 + 15
 
 _vol_history_cache: dict[str, dict] = {}   # instrument_key -> {"date", "slots", "failed_at"}
 _vol_reading_cache: dict[str, dict] = {}   # SYMBOL -> reading (see _build_volume_reading)
@@ -2872,6 +2880,8 @@ def _build_volume_reading(symbol: str, access_token: str, as_of_ist: datetime | 
         if c[0][:10] != today:
             continue
         start = datetime.strptime(c[0][:19], "%Y-%m-%dT%H:%M:%S")
+        if start.hour * 60 + start.minute >= _VOL_CONTINUOUS_END_MINUTES:
+            continue   # closing-auction window, not continuous trading
         if start + timedelta(minutes=5) <= now_ist:   # still-forming candle excluded
             closed.append((start, c))
     if not closed:
@@ -2905,7 +2915,7 @@ def _build_volume_reading(symbol: str, access_token: str, as_of_ist: datetime | 
 
 
 def _vol_market_open(now_ist: datetime) -> bool:
-    return now_ist.weekday() < 5 and (9, 15) <= (now_ist.hour, now_ist.minute) <= (15, 35)
+    return now_ist.weekday() < 5 and (9, 15) <= (now_ist.hour, now_ist.minute) <= (15, 20)
 
 
 def _volume_reading_is_stale(symbol: str, now_ist: datetime) -> bool:
@@ -2924,7 +2934,8 @@ def _volume_reading_is_stale(symbol: str, now_ist: datetime) -> bool:
     # Upstox's intraday feed lags a minute or two behind the clock: if the
     # candle that should have closed still isn't in our data, keep retrying
     # every 30s until it lands instead of waiting out a whole extra candle.
-    expected_start = boundary - timedelta(minutes=5)
+    last_real_start = now_ist.replace(hour=15, minute=10, second=0, microsecond=0)
+    expected_start = min(boundary - timedelta(minutes=5), last_real_start)
     cached_start = r.get("candle_start_ist")
     if cached_start is not None and cached_start < expected_start and (now_ist - fetched).total_seconds() >= 30:
         return True
