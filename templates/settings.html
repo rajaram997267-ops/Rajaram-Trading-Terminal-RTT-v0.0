@@ -316,6 +316,23 @@
   </div>
 
   <div class="settings-box">
+    <span>Stop new entries from (IST):</span>
+    <input type="text" id="entryCutoffInput" placeholder="e.g. 15:00" style="max-width: 100px; flex: none; text-align: center;" value="{{ entry_cutoff_time }}">
+    <button class="secondary" onclick="saveEntryCutoff()">Save</button>
+    <button class="secondary" onclick="clearEntryCutoff()">Clear</button>
+    <span class="token-status" id="entryCutoffStatus">{% if entry_cutoff_time %}ON - no new trades open from {{ entry_cutoff_time }} IST onward{% else %}OFF - new trades can open until the market closes{% endif %}</span>
+  </div>
+
+  <div class="settings-box">
+    <span>Auto-exit open trades at (IST):</span>
+    <input type="text" id="autoExitInput" placeholder="e.g. 15:25" style="max-width: 100px; flex: none; text-align: center;" value="{{ auto_exit_time }}">
+    <button class="secondary" onclick="saveAutoExit()">Save</button>
+    <button class="secondary" onclick="clearAutoExit()">Clear</button>
+    <span class="token-status" id="autoExitStatus">{% if auto_exit_time %}ON - anything still open at {{ auto_exit_time }} IST is closed automatically, paper and live{% else %}OFF - nothing closes open trades at the end of the day except their own exit strategy{% endif %}</span>
+    <span class="token-status">Since 3 Aug 2026 the underlying stock stops trading at 15:15 (closing auction) while options trade until 15:40, so RSI/EMA exits can't see anything new after 15:15. Live orders are carry-forward, so the broker won't close them for you. A time like 15:25 closes everything before the options market shuts. Live trades are closed with a real market SELL.</span>
+  </div>
+
+  <div class="settings-box">
     <label class="switch">
       <input type="checkbox" id="sectorFilterToggle" {% if sector_filter_enabled %}checked{% endif %} onchange="toggleSectorFilter()">
       <span class="slider"></span>
@@ -540,6 +557,56 @@
     async function clearEntryTimeFilter() {
       document.getElementById("entryTimeFilterInput").value = "";
       await saveEntryTimeFilter();
+    }
+
+    async function saveClockSetting(url, field, inputId, statusId, onText, offText) {
+      const statusEl = document.getElementById(statusId);
+      const raw = document.getElementById(inputId).value.trim();
+      if (raw && !/^\d{1,2}:\d{2}$/.test(raw)) {
+        statusEl.textContent = "Enter time as HH:MM, e.g. 15:25";
+        return;
+      }
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ [field]: raw }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = result[field] ? onText(result[field]) : offText;
+          if (result[field]) document.getElementById(inputId).value = result[field];
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    function saveEntryCutoff() {
+      return saveClockSetting(
+        "/api/paper-trading/entry-cutoff-time", "entry_cutoff_time", "entryCutoffInput", "entryCutoffStatus",
+        (v) => `ON - no new trades open from ${v} IST onward`,
+        "OFF - new trades can open until the market closes"
+      );
+    }
+    async function clearEntryCutoff() {
+      document.getElementById("entryCutoffInput").value = "";
+      await saveEntryCutoff();
+    }
+
+    function saveAutoExit() {
+      return saveClockSetting(
+        "/api/paper-trading/auto-exit-time", "auto_exit_time", "autoExitInput", "autoExitStatus",
+        (v) => `ON - anything still open at ${v} IST is closed automatically, paper and live`,
+        "OFF - nothing closes open trades at the end of the day except their own exit strategy"
+      );
+    }
+    async function clearAutoExit() {
+      document.getElementById("autoExitInput").value = "";
+      await saveAutoExit();
     }
 
     async function toggleSectorFilter() {
