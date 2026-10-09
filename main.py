@@ -707,6 +707,64 @@ def is_after_entry_time_filter() -> bool:
     return now_hhmm >= cutoff
 
 
+# NSE equity derivatives (stock + index options/futures) trade until 15:40
+# since 3 Aug 2026, but F&O STOCKS stop continuous trading at 15:15 (closing
+# auction after that) - so the underlying's candles freeze at 15:15 while
+# the option keeps trading. RSI/EMA-based exits can't see anything new after
+# 15:15, and RTT places live orders as carry-forward (product "D") that the
+# broker does not square off. These two settings are the end-of-day safety:
+DERIVATIVES_CLOSE_HHMM = "15:40"
+
+
+def _ist_hhmm() -> str:
+    return (datetime.utcnow() + IST_OFFSET).strftime("%H:%M")
+
+
+def get_entry_cutoff_time() -> str | None:
+    """'Stop new entries from HH:MM' (IST) - alerts at/after this clock time
+    are skipped, same as the earliest-entry filter skips early ones. Unset
+    means no latest-entry limit."""
+    value = (get_setting("entry_cutoff_time", "") or "").strip()
+    return value or None
+
+
+def get_auto_exit_time() -> str | None:
+    """'Auto-exit open trades at HH:MM' (IST) - any trade still open when
+    this time arrives is closed, paper at the option's price and live with a
+    real market SELL (resting SL/GTT cancelled first). Unset means off."""
+    value = (get_setting("auto_exit_time", "") or "").strip()
+    return value or None
+
+
+def new_entry_blocked_by_clock() -> str | None:
+    """Reason string if the clock says no NEW trade may open right now, else
+    None. Blocks from the entry cutoff, and also from the auto-exit time on -
+    a trade opened after that would just be force-closed on the next pass,
+    paying slippage and charges for nothing."""
+    now_hhmm = _ist_hhmm()
+    cutoff = get_entry_cutoff_time()
+    if cutoff and now_hhmm >= cutoff:
+        return f"past the latest-entry time {cutoff}"
+    auto_exit = get_auto_exit_time()
+    if auto_exit and now_hhmm >= auto_exit:
+        return f"past the auto-exit time {auto_exit}"
+    return None
+
+
+def is_auto_exit_due() -> bool:
+    """True while the auto-exit time has arrived AND the derivatives market
+    is still open (weekdays, before 15:40) - outside that window a market
+    SELL would just be rejected. (Exchange holidays aren't modelled; on one,
+    a stray attempt would simply fail and be recorded as an error.)"""
+    auto_exit = get_auto_exit_time()
+    if not auto_exit:
+        return False
+    now_ist = datetime.utcnow() + IST_OFFSET
+    if now_ist.weekday() >= 5:
+        return False
+    return auto_exit <= now_ist.strftime("%H:%M") < DERIVATIVES_CLOSE_HHMM
+
+
 def get_atr_period() -> int:
     """Lookback period (in 5-min candles) for the ATR_TRAIL exit
     strategy's Average True Range calculation. Defaults to 10."""
@@ -1025,6 +1083,12 @@ def create_paper_trades_for_batch(data: dict) -> None:
     # entirely and only let the system open trades from a chosen clock
     # time onward (e.g. 09:45). Off by default (no filter).
     if not is_after_entry_time_filter():
+        return
+
+    # Latest-entry / auto-exit clock guard (both off unless set in
+    # Settings): no new trades once the cutoff passes, nor once the
+    # auto-exit time has - see new_entry_blocked_by_clock.
+    if new_entry_blocked_by_clock():
         return
 
     with get_db() as conn:
@@ -4171,6 +4235,11 @@ def _run_paper_trade_check_impl() -> dict:
     errors = []
     now = datetime.utcnow().isoformat()
 
+    # End-of-day auto-exit (Settings; off unless a time is set). Evaluated
+    # once per pass so every open trade sees the same answer.
+    auto_exit_due = is_auto_exit_due()
+    auto_exit_label = get_auto_exit_time() or ""
+
     for trade in open_trades:
         checked += 1
         symbol = trade["symbol"]
@@ -4476,6 +4545,14 @@ def _run_paper_trade_check_impl() -> dict:
 
             if trade["status"] != "OPEN":
                 pass  # paper side already closed - only live-side logic below applies
+
+            elif auto_exit_due and last_price is not None:
+                # End-of-day auto-exit: takes precedence over every
+                # strategy's own rule. Needs a price to book against - if
+                # none is available this pass, falls through to the normal
+                # branches below and simply tries again on the next pass.
+                exited, exit_price = True, last_price
+                exit_reason = f"End-of-day auto-exit ({auto_exit_label})"
 
             elif strategy == "EMA":
                 # #1: 5-EMA only, let it run - kept only for backward
@@ -5166,6 +5243,16 @@ def _run_paper_trade_check_impl() -> dict:
                             live_exited = True
                             live_exit_reason_val = f"Trailing stop ({live_stop_pct:g}%) after +2%"
 
+            # End-of-day auto-exit for the live position: real market SELL,
+            # resting SL/GTT cancelled first (all inside
+            # _close_live_position_if_any, same path every other software-
+            # driven live exit uses). Skipped if the broker SL already
+            # fired this pass (live_sl_fired_price set) - that position is
+            # already closed and just needs recording below.
+            if auto_exit_due and trade["live_status"] == "OPEN" and not live_exited:
+                live_exited = True
+                live_exit_reason_val = f"End-of-day auto-exit ({auto_exit_label})"
+
             if live_exited and live_sl_fired_price is not None:
                 # The SL already filled at the broker - nothing left to
                 # place, just record it. Skip _close_live_position_if_any
@@ -5587,6 +5674,17 @@ def api_manual_enter_alert(alert_id):
     category = categorize(alert_dict)
     if category not in ("Buy", "Sell"):
         return jsonify({"status": "error", "message": "Could not determine Buy/Sell for this alert"}), 400
+
+    # A manual Enter is a deliberate override of the latest-entry cutoff
+    # (same as it already overrides the earliest-entry filter) - but not of
+    # the auto-exit time: a trade opened after it would be force-closed on
+    # the very next pass, costing real slippage and charges for nothing.
+    _auto_exit = get_auto_exit_time()
+    if _auto_exit and _ist_hhmm() >= _auto_exit:
+        return jsonify({
+            "status": "error",
+            "message": f"Auto-exit time ({_auto_exit} IST) has passed - a trade opened now would be closed again immediately. New entries resume tomorrow.",
+        }), 409
 
     with get_db() as conn:
         already_open = conn.execute(
@@ -6538,6 +6636,8 @@ def settings_page():
         atr_period=get_atr_period(),
         atr_multiplier=get_atr_multiplier(),
         entry_time_filter=get_entry_time_filter() or "",
+        entry_cutoff_time=get_entry_cutoff_time() or "",
+        auto_exit_time=get_auto_exit_time() or "",
         theta_switch_enabled=get_theta_switch_enabled(),
         live_entry_mode=get_live_entry_mode(),
         gtt_trailing_gap_mode=get_gtt_trailing_gap_mode(),
@@ -6869,6 +6969,39 @@ def paper_trading_entry_time_filter():
     value = parsed.strftime("%H:%M")
     set_setting("entry_time_filter", value)
     return jsonify({"status": "ok", "entry_time_filter": value})
+
+
+def _save_clock_setting(setting_key: str, field: str, lo: str, hi: str, hi_inclusive: bool):
+    """Shared save handler for the two end-of-day clock settings. Empty
+    clears (feature off). Otherwise HH:MM (24h IST) within lo..hi."""
+    data = request.get_json(silent=True) or {}
+    raw = (data.get(field) or "").strip()
+    if not raw:
+        set_setting(setting_key, "")
+        return jsonify({"status": "ok", field: None})
+    try:
+        value = datetime.strptime(raw, "%H:%M").strftime("%H:%M")
+    except ValueError:
+        return jsonify({"status": "error", "message": f"{field} must be HH:MM (24-hour), e.g. 15:25"}), 400
+    if value < lo or value > hi or (value == hi and not hi_inclusive):
+        return jsonify({"status": "error", "message": f"Pick a time between {lo} and {hi} IST (options trade until {DERIVATIVES_CLOSE_HHMM})"}), 400
+    set_setting(setting_key, value)
+    return jsonify({"status": "ok", field: value})
+
+
+@app.route("/api/paper-trading/entry-cutoff-time", methods=["POST"])
+def paper_trading_entry_cutoff_time():
+    """Sets (or clears) the latest-entry time - no new trades from then on.
+    Takes effect on the very next alert; doesn't touch anything open."""
+    return _save_clock_setting("entry_cutoff_time", "entry_cutoff_time", "09:15", DERIVATIVES_CLOSE_HHMM, True)
+
+
+@app.route("/api/paper-trading/auto-exit-time", methods=["POST"])
+def paper_trading_auto_exit_time():
+    """Sets (or clears) the end-of-day auto-exit time. From that time
+    until the derivatives close, every open trade - paper and live - is
+    closed automatically. Takes effect on the next exit-check pass."""
+    return _save_clock_setting("auto_exit_time", "auto_exit_time", "09:15", DERIVATIVES_CLOSE_HHMM, False)
 
 
 @app.route("/api/paper-trading/sector-filter-toggle", methods=["POST"])
