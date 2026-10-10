@@ -507,7 +507,10 @@ def init_db():
                 planned_risk_pct DOUBLE PRECISION,
                 live_planned_risk_pct DOUBLE PRECISION,
                 entry_volume_label TEXT,
-                entry_volume_ratio DOUBLE PRECISION
+                entry_volume_ratio DOUBLE PRECISION,
+                shadow_tracked INTEGER,
+                shadow_weak_price DOUBLE PRECISION,
+                shadow_weak_time TEXT
             )
             """
         )
@@ -567,6 +570,9 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_planned_risk_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_volume_label TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_volume_ratio DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS shadow_tracked INTEGER",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS shadow_weak_price DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS shadow_weak_time TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t1 DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t2 DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS camarilla_t3 DOUBLE PRECISION",
@@ -3067,14 +3073,65 @@ def _attach_volume_readings(items: list[dict], access_token: str | None, is_toda
             a["volume"] = _volume_for_alert(a.get("symbol"), a["category"])
 
 
+def _volume_rank(a: dict) -> int:
+    """Dashboard sort key: Strong first, then Moderate, then alerts with no
+    reading yet, and known-Weak last. Python's sort is stable, so within a
+    rank the existing newest-first order is kept."""
+    v = a.get("volume")
+    label = v.get("label") if v else None
+    return {"Strong": 0, "Moderate": 1, "Weak": 3}.get(label, 2)
+
+
+def _attach_volume_to_trades(trades: list[dict]) -> None:
+    """Adds 'volume' - the CURRENT reading for each open trade's own
+    direction - so the Paper/Live pages can show it without switching to the
+    dashboard. Same cache the dashboard uses (zero extra API calls here); also
+    kicks a refresh for these symbols so a position's reading stays fresh
+    even when the dashboard isn't open."""
+    access_token = get_setting("upstox_access_token")
+    mine = [t for t in trades if t.get("direction") in ("Buy", "Sell") and t.get("symbol")]
+    if access_token and mine:
+        _kick_volume_refresh({(t["symbol"] or "").strip().upper() for t in mine}, access_token)
+    for t in trades:
+        t["volume"] = (
+            _volume_for_alert(t.get("symbol"), t["direction"])
+            if access_token and t.get("direction") in ("Buy", "Sell") else None
+        )
+
+
+def _volume_label_after_entry(symbol: str, direction: str, entry_iso_utc: str) -> str | None:
+    """The current label for a trade's direction - but only if it comes from
+    a candle that closed AFTER the trade opened (a candle that closed before
+    entry says nothing about what happened since)."""
+    r = _vol_reading_cache.get((symbol or "").strip().upper())
+    if not r or r.get("status") != "ok" or r.get("candle_start_ist") is None:
+        return None
+    side = r.get("buy" if direction == "Buy" else "sell")
+    if not side or side.get("label") is None:
+        return None
+    entry_ist = datetime.fromisoformat(entry_iso_utc) + IST_OFFSET
+    if r["candle_start_ist"] + timedelta(minutes=5) <= entry_ist:
+        return None
+    return side["label"]
+
+
 def _log_entry_volume(trade_id: int, symbol: str, category: str, entry_iso_utc: str) -> None:
     """Records the volume reading AS OF ENTRY on the trade row, so Stats can
     later answer whether Strong-volume entries actually do better. Runs on
     its own thread AFTER the live-order path, so it adds no latency to the
     order; best-effort - any failure just leaves the columns empty."""
     try:
+        if category not in ("Buy", "Sell"):
+            return
+        # Mark this trade as part of the shadow test FIRST (see the hook in
+        # _run_paper_trade_check_impl): only trades opened after this
+        # tracking existed can be fairly included, whether or not an entry
+        # reading turns out to be available below.
+        with get_db() as conn:
+            conn.execute("UPDATE paper_trades SET shadow_tracked = 1 WHERE id = ?", (trade_id,))
+            conn.commit()
         access_token = get_setting("upstox_access_token")
-        if not access_token or category not in ("Buy", "Sell"):
+        if not access_token:
             return
         entry_ist = datetime.fromisoformat(entry_iso_utc) + IST_OFFSET
         reading = _build_volume_reading((symbol or "").strip().upper(), access_token, as_of_ist=entry_ist)
@@ -4230,6 +4287,15 @@ def _run_paper_trade_check_impl() -> dict:
     }
     update_ws_subscriptions(active_keys)
 
+    # Keep each open position's volume reading fresh (non-blocking; same
+    # background worker the dashboard uses) - the shadow test below and
+    # the Paper/Live pages both read it.
+    _kick_volume_refresh(
+        {(t["symbol"] or "").strip().upper() for t in open_trades
+         if t["direction"] in ("Buy", "Sell") and t["symbol"]},
+        access_token,
+    )
+
     checked = 0
     closed = 0
     errors = []
@@ -4283,6 +4349,27 @@ def _run_paper_trade_check_impl() -> dict:
                 if last_price is None and candles:
                     last_price = candles[-1][3]
             entry_price = trade["entry_price"]
+
+            # SHADOW TEST of a "weak-volume exit" rule - RECORDS ONLY, never
+            # exits anything. The first time this trade's volume reads Weak
+            # (on a candle that closed after entry), note the option price
+            # and time, once. Stats then compares "what if we'd exited right
+            # there" against what actually happened, on every tracked trade,
+            # with no change to any real exit. Wrapped on its own so it can
+            # never interfere with the exit logic below.
+            try:
+                if (trade["status"] == "OPEN" and trade["shadow_tracked"] == 1
+                        and trade["shadow_weak_price"] is None and last_price):
+                    if _volume_label_after_entry(symbol, trade["direction"], trade["entry_time"]) == "Weak":
+                        with get_db() as _shadow_conn:
+                            _shadow_conn.execute(
+                                "UPDATE paper_trades SET shadow_weak_price = ?, shadow_weak_time = ? "
+                                "WHERE id = ? AND shadow_weak_price IS NULL",
+                                (last_price, now, trade["id"]),
+                            )
+                            _shadow_conn.commit()
+            except Exception:
+                pass
 
             # EMA_SPOT_TRAIL is the one strategy that needs a candle
             # series from the UNDERLYING stock, not the option premium -
@@ -5559,6 +5646,7 @@ def index():
         merged_count = sum(len(items) for _, items in grouped)
         for _, _items in grouped:
             _attach_volume_readings(_items, access_token, selected_date == today_str)
+            _items.sort(key=_volume_rank)   # Strong volume first (stable)
 
         html = render_template(
             "index.html",
@@ -5640,6 +5728,9 @@ def api_alerts():
     # Directional-volume badge: reads a background-maintained cache, adds
     # no per-alert API calls to this request - see _attach_volume_readings.
     _attach_volume_readings(merged_alerts, access_token, selected_date == today_str)
+    # Strong volume first within each column (stable: newest-first kept within a rank)
+    _cat_pos = {name: i for i, name in enumerate(CATEGORY_ORDER)}
+    merged_alerts.sort(key=lambda a: (_cat_pos.get(a.get("category"), len(_cat_pos)), _volume_rank(a)))
 
     return jsonify(merged_alerts)
 
@@ -6413,6 +6504,7 @@ def paper_trading():
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct", "planned_risk_pct")
+    _attach_volume_to_trades(open_trades)
     attach_stop_info(open_trades, get_setting("upstox_access_token"))
 
     total_pnl = sum(t["pnl"] for t in closed_trades if t["pnl"] is not None)
@@ -6563,6 +6655,54 @@ def _summarize_group(rows: list[dict], group_key: str) -> list[dict]:
     return summary
 
 
+def _is_manual_exit(row: dict) -> bool:
+    return (row.get("exit_reason") or "").startswith("Manual")
+
+
+def _volume_group_label(row: dict) -> str:
+    """Group key for the 'by entry volume' table: the entry label, split by
+    HOW the trade ended. A hand-picked exit isn't the strategy's rule - it
+    carries the trader's own timing and hindsight - so mixing it into the
+    same bucket as rule exits would let that decide the volume comparison."""
+    label = row.get("entry_volume_label")
+    if not label:
+        return "(not recorded)"
+    return f"{label} \u00b7 {'manual exit' if _is_manual_exit(row) else 'rule exit'}"
+
+
+def _shadow_weak_exit_summary(rows: list[dict]) -> dict:
+    """Counterfactual for a 'weak-volume exit' rule, computed from trades that
+    were tracked from entry (shadow_tracked) and ended by the strategy's own
+    exit rule (manual exits excluded - their timing is the trader's).
+    For each: actual % vs the % had it been closed at the first time its
+    volume read Weak while open. A trade whose volume never turned Weak would
+    not have been touched by the rule, so its shadow result equals the actual.
+    Percent of option premium throughout (avoids mixing in quantities/partial
+    exits). Nothing here exits anything - it only measures."""
+    tracked = [
+        r for r in rows
+        if r.get("shadow_tracked") == 1 and not _is_manual_exit(r)
+        and r.get("entry_price") and r.get("pnl_pct") is not None
+    ]
+
+    def shadow_pct(r: dict) -> float:
+        return (r["shadow_weak_price"] - r["entry_price"]) / r["entry_price"] * 100.0
+
+    fired = [r for r in tracked if r.get("shadow_weak_price") is not None]
+
+    def avg(vals: list[float]) -> float | None:
+        return round(sum(vals) / len(vals), 2) if vals else None
+
+    return {
+        "tracked_trades": len(tracked),
+        "weak_fired_trades": len(fired),
+        "avg_actual_pct": avg([r["pnl_pct"] for r in tracked]),
+        "avg_if_exited_at_weak_pct": avg([shadow_pct(r) if r.get("shadow_weak_price") is not None else r["pnl_pct"] for r in tracked]),
+        "fired_avg_actual_pct": avg([r["pnl_pct"] for r in fired]),
+        "fired_avg_if_exited_pct": avg([shadow_pct(r) for r in fired]),
+    }
+
+
 @app.route("/api/stats/breakdown")
 def api_stats_breakdown():
     """Performance breakdown by Alert Name and by Exit Strategy, plus the
@@ -6577,16 +6717,22 @@ def api_stats_breakdown():
     so the gap is visible instead of hidden."""
     with get_db() as conn:
         rows = conn.execute(
-            "SELECT alert_name, scan_name, strategy, pnl, entry_volume_label FROM paper_trades "
+            "SELECT alert_name, scan_name, strategy, pnl, pnl_pct, entry_price, exit_reason, entry_volume_label, "
+            "shadow_tracked, shadow_weak_price FROM paper_trades "
             "WHERE status = 'CLOSED' AND pnl IS NOT NULL"
         ).fetchall()
     rows = [dict(r) for r in rows]
 
     by_alert = _summarize_group(rows, "alert_name")
     by_strategy = _summarize_group(rows, "strategy")
-    by_volume = _summarize_group(rows, "entry_volume_label")
-    _vol_order = {"Strong": 0, "Moderate": 1, "Weak": 2}
-    by_volume.sort(key=lambda g: _vol_order.get(g["name"], 3))  # Strong -> Weak, then (not recorded)
+    by_volume = _summarize_group([{**r, "vol_group": _volume_group_label(r)} for r in rows], "vol_group")
+    _vol_order = {
+        "Strong \u00b7 rule exit": 0, "Strong \u00b7 manual exit": 1,
+        "Moderate \u00b7 rule exit": 2, "Moderate \u00b7 manual exit": 3,
+        "Weak \u00b7 rule exit": 4, "Weak \u00b7 manual exit": 5,
+    }
+    by_volume.sort(key=lambda g: _vol_order.get(g["name"], 6))  # Strong -> Weak, then (not recorded)
+    shadow_weak = _shadow_weak_exit_summary(rows)
 
     # Combined (alert, strategy) pair breakdown.
     pair_rows = []
@@ -6605,9 +6751,12 @@ def api_stats_breakdown():
             "Directional volume at entry vs the same time of day over the last ~10 "
             "sessions - an estimate from candle structure, not true buy/sell volume. "
             "Only trades opened after this tracking was added have a reading; the "
-            "rest show as '(not recorded)'. Needs a good number of trades per bucket "
-            "before the comparison means anything."
+            "rest show as '(not recorded)'. Each bucket is split by how the trade ended: "
+            "'manual exit' rows carry the trader's own timing, so compare 'rule exit' "
+            "rows to judge volume itself. Needs a good number of trades per bucket "
+            "before any comparison means anything."
         ),
+        "shadow_weak_exit": shadow_weak,
         "by_pair": by_pair[:10],  # top 10 combos only - the full cross-product isn't useful to scan
         "total_closed_trades": len(rows),
         "alert_tracking_note": (
@@ -6682,6 +6831,7 @@ def live_trading_page():
     failed_trades = [dict(t) for t in failed_trades]
     attach_live_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
+    _attach_volume_to_trades(open_trades)
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
         entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
@@ -6741,6 +6891,7 @@ def live_trading_data():
     closed_trades = [dict(t) for t in closed_trades]
     attach_live_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
+    _attach_volume_to_trades(open_trades)
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
         entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
@@ -6779,6 +6930,7 @@ def paper_trading_data():
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct", "planned_risk_pct")
+    _attach_volume_to_trades(open_trades)
     attach_running_balance(closed_trades, get_capital())
     attach_rr(closed_trades, "pnl_pct", "mae_pct", "planned_risk_pct")
 
