@@ -168,6 +168,13 @@
   </div>
 
   <div class="chart-box">
+    <h3>Shadow test: would exiting when volume turns Weak have helped?</h3>
+    <div class="sub">Trades closed by their own exit rule and tracked from entry. Measurement only - nothing is exited by this.</div>
+    <div class="table-scroll"><table class="breakdown" id="shadowTable"></table></div>
+    <div class="breakdown-note" id="shadowNote"></div>
+  </div>
+
+  <div class="chart-box">
     <h3>Best Alert + Exit Strategy combinations</h3>
     <div class="sub">Top 10 pairs by total P&amp;L</div>
     <div class="table-scroll"><table class="breakdown" id="pairTable"></table></div>
@@ -291,7 +298,29 @@
       return "";
     }
 
-    function renderBreakdownTable(tableId, rows, extraCol) {
+    function renderShadowTable(sh) {
+      const table = document.getElementById("shadowTable");
+      const note = document.getElementById("shadowNote");
+      if (!sh || !sh.tracked_trades) {
+        table.innerHTML = `<tr><td class="sub">No tracked trades have closed yet - this fills in as new trades open and close.</td></tr>`;
+        note.textContent = "";
+        return;
+      }
+      const pct = (v) => (v === null || v === undefined) ? "-" : `${v > 0 ? "+" : ""}${v}%`;
+      const diff = (a, b) => (a === null || b === null || a === undefined || b === undefined) ? null : Math.round((b - a) * 100) / 100;
+      const row = (name, n, actual, ifExit) => {
+        const d = diff(actual, ifExit);
+        return `<tr><td>${name}</td><td>${n}</td><td class="${pnlClass(actual)}">${pct(actual)}</td><td class="${pnlClass(ifExit)}">${pct(ifExit)}</td><td class="${pnlClass(d)}">${d === null ? "-" : pct(d)}</td></tr>`;
+      };
+      table.innerHTML = `
+        <tr><th>Group</th><th>Trades</th><th>Avg % actual</th><th>Avg % if exited at first Weak</th><th>Difference</th></tr>
+        ${row("All tracked trades", sh.tracked_trades, sh.avg_actual_pct, sh.avg_if_exited_at_weak_pct)}
+        ${row("Only trades where volume turned Weak while open", sh.weak_fired_trades, sh.fired_avg_actual_pct, sh.fired_avg_if_exited_pct)}
+      `;
+      note.textContent = "Percent of option premium. A positive Difference means exiting at the first Weak reading would have beaten what actually happened. Trades whose volume never turned Weak count as unchanged. Counterfactual only; needs 100+ tracked trades before it means anything.";
+    }
+
+    function renderBreakdownTable(tableId, rows, extraCol, noTrophy) {
       const table = document.getElementById(tableId);
       if (!rows || rows.length === 0) {
         table.innerHTML = `<tr><td class="sub">No closed trades yet in this category.</td></tr>`;
@@ -306,8 +335,8 @@
       `;
       rows.forEach((r, i) => {
         html += `
-          <tr class="${i === 0 ? "best-row" : ""}">
-            <td>${escapeHtml(r.name)}${i === 0 ? " 🏆" : ""}</td>
+          <tr class="${i === 0 && !noTrophy ? "best-row" : ""}">
+            <td>${escapeHtml(r.name)}${i === 0 && !noTrophy ? " 🏆" : ""}</td>
             <td>${r.total_trades}</td>
             <td>${r.win_rate}%</td>
             <td class="${pnlClass(r.total_pnl)}">${r.total_pnl}</td>
@@ -329,7 +358,8 @@
         document.getElementById("alertNote").textContent = data.alert_tracking_note || "";
 
         renderBreakdownTable("strategyTable", data.by_strategy, "Max Loss (Rs)");
-        renderBreakdownTable("volumeTable", data.by_volume, "Max Loss (Rs)");
+        renderBreakdownTable("volumeTable", data.by_volume, "Max Loss (Rs)", true);
+        renderShadowTable(data.shadow_weak_exit);
         document.getElementById("volumeNote").textContent = data.volume_tracking_note || "";
         renderBreakdownTable("pairTable", data.by_pair);
       } catch (err) {

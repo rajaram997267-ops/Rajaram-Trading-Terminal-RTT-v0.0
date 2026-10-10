@@ -65,6 +65,11 @@
       gap: 12px;
     }
     h2 { margin: 0 0 4px; }
+    .vol-line { display: flex; align-items: center; gap: 6px; font-size: 10px; color: var(--muted); margin-top: 3px; }
+    .vol-pill { font-size: 10px; font-weight: 600; padding: 0 6px; border-radius: 8px; border: 1px solid var(--border); background: transparent; white-space: nowrap; cursor: help; }
+    .vol-pill.strong { color: var(--green); border-color: var(--green); }
+    .vol-pill.moderate { color: var(--gold); border-color: var(--gold); }
+    .vol-pill.weak { color: var(--red); border-color: var(--red); }
     .sub { color: var(--muted); font-size: 13px; }
     .tabbar {
       display: flex;
@@ -321,7 +326,7 @@
       </tr>
       {% for t in open_trades %}
       <tr>
-        <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}</td>
+        <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}{% if t.volume %}<div class="vol-line"><span class="vol-pill {{ t.volume.label|lower }}" title="{{ 'Buy' if t.direction == 'Buy' else 'Sell' }}-side directional volume is {{ t.volume.ratio }}x its usual level for this time of day{% if t.entry_volume_label %}. At entry: {{ t.entry_volume_label }} ({{ t.entry_volume_ratio }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ t.volume.asof }}.">Vol {{ t.volume.label }} &middot; {{ t.volume.ratio }}&times;</span><span>as of {{ t.volume.asof }}</span></div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
         <td>{{ t.quantity }}{% if t.target1_hit_time %}<div class="sub" style="font-size:11px; color: var(--gold);">T1: {{ t.target1_qty }} @ {{ t.target1_exit_price }}</div>{% endif %}</td>
         <td>{{ t.entry_price }}</td>
@@ -441,6 +446,15 @@
       return (t.rr_multiple === null || t.rr_multiple === undefined) ? "-" : (t.rr_is_true ? "" : "≈") + (t.rr_multiple >= 0 ? "+" : "") + t.rr_multiple.toFixed(2) + "R";
     }
 
+    function volPillHTML(t) {
+      if (!t.volume || !t.volume.label) return "";
+      const v = t.volume;
+      const side = t.direction === "Buy" ? "Buy" : "Sell";
+      const entryTxt = t.entry_volume_label ? ` At entry: ${t.entry_volume_label} (${t.entry_volume_ratio}x).` : "";
+      const tip = `${side}-side directional volume is ${v.ratio}x its usual level for this time of day.${entryTxt} Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of ${v.asof}.`;
+      return `<div class="vol-line"><span class="vol-pill ${escapeHtml(v.label.toLowerCase())}" title="${escapeHtml(tip)}">Vol ${escapeHtml(v.label)} &middot; ${v.ratio}&times;</span><span>as of ${escapeHtml(v.asof)}</span></div>`;
+    }
+
     function renderOpenTrades(trades) {
       const container = document.getElementById("openTradesContainer");
       if (trades.length === 0) {
@@ -454,7 +468,7 @@
         const entryRsiText = (t.entry_rsi === null || t.entry_rsi === undefined) ? "-" : t.entry_rsi;
         return `
         <tr>
-          <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}</td>
+          <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}${volPillHTML(t)}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
           <td>${t.quantity}${t.target1_hit_time ? `<div class="sub" style="font-size:11px; color: var(--gold);">T1: ${t.target1_qty} @ ${t.target1_exit_price}</div>` : ""}</td>
           <td>${t.entry_price}</td>
