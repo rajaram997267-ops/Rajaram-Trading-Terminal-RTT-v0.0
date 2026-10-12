@@ -1126,7 +1126,17 @@ def create_paper_trades_for_batch(data: dict) -> None:
     if symbol is None:
         return
 
-    open_trade_for_symbol(symbol, category, price_val, alert_name=data.get("alert_name", ""), scan_name=data.get("scan_name", ""))
+    if get_volume_entry_enabled():
+        # Volume-rule entry: judge this alert on its own thread (webhook
+        # returns immediately) - only a Strong reading opens a trade.
+        threading.Thread(
+            target=_volume_gated_entry,
+            args=(symbol, category, price_val, data.get("alert_name", ""), data.get("scan_name", "")),
+            daemon=True,
+        ).start()
+        return
+
+    _open_trade_if_free(symbol, category, price_val, alert_name=data.get("alert_name", ""), scan_name=data.get("scan_name", ""))
 
 
 def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_name: str = "", scan_name: str = "") -> tuple[bool, str | None]:
@@ -3099,10 +3109,10 @@ def _attach_volume_to_trades(trades: list[dict]) -> None:
         )
 
 
-def _volume_label_after_entry(symbol: str, direction: str, entry_iso_utc: str) -> str | None:
-    """The current label for a trade's direction - but only if it comes from
-    a candle that closed AFTER the trade opened (a candle that closed before
-    entry says nothing about what happened since)."""
+def _volume_reading_after_entry(symbol: str, direction: str, entry_iso_utc: str) -> dict | None:
+    """The current {label, ratio, asof} for a trade's direction - but only if
+    it comes from a candle that closed AFTER the trade opened (a candle that
+    closed before entry says nothing about what happened since)."""
     r = _vol_reading_cache.get((symbol or "").strip().upper())
     if not r or r.get("status") != "ok" or r.get("candle_start_ist") is None:
         return None
@@ -3112,7 +3122,21 @@ def _volume_label_after_entry(symbol: str, direction: str, entry_iso_utc: str) -
     entry_ist = datetime.fromisoformat(entry_iso_utc) + IST_OFFSET
     if r["candle_start_ist"] + timedelta(minutes=5) <= entry_ist:
         return None
-    return side["label"]
+    return {"label": side["label"], "ratio": side["ratio"], "asof": r["asof"]}
+
+
+def _volume_label_after_entry(symbol: str, direction: str, entry_iso_utc: str) -> str | None:
+    rd = _volume_reading_after_entry(symbol, direction, entry_iso_utc)
+    return rd["label"] if rd else None
+
+
+def _volume_exit_reason(symbol: str, direction: str, entry_iso_utc: str) -> str | None:
+    """Reason string if this open trade's volume has turned Weak since entry
+    (the exit rule), else None."""
+    rd = _volume_reading_after_entry(symbol, direction, entry_iso_utc)
+    if rd and rd["label"] == "Weak":
+        return f"Volume exit (Weak volume: {rd['ratio']}x usual, as of {rd['asof']})"
+    return None
 
 
 def _log_entry_volume(trade_id: int, symbol: str, category: str, entry_iso_utc: str) -> None:
@@ -3154,6 +3178,111 @@ def _log_entry_volume_async(trade_id: int, symbol: str, category: str, entry_iso
     threading.Thread(
         target=_log_entry_volume, args=(trade_id, symbol, category, entry_iso_utc), daemon=True
     ).start()
+
+
+# ---------------------------------------------------------------------------
+# Volume-rule trading (Settings; both switches OFF by default)
+#   ENTRY: a Chartink alert only opens a trade if that stock's volume reads
+#          "Strong" (for the alert's own direction) at the moment it arrives.
+#          Weak / Moderate / no reading -> skipped, nothing opened.
+#   EXIT:  once a trade is open, it is closed the first time its volume reads
+#          "Weak" on a candle that closed after entry. This is ADDED to the
+#          selected strategy's own exits (whichever fires first), so any
+#          protective stop that strategy has keeps working.
+# ---------------------------------------------------------------------------
+_VOL_ENTRY_MAX_READING_AGE_MINUTES = 8   # a reading older than this isn't "right now"
+_VOLUME_ENTRY_LOG_MAX = 60
+_volume_entry_log: list[dict] = []        # recent entry decisions (memory only; resets on restart)
+_entry_lock = threading.Lock()            # one entry path at a time (webhook thread / manual Enter)
+
+
+def get_volume_entry_enabled() -> bool:
+    return get_setting("volume_entry_enabled", "false") == "true"
+
+
+def get_volume_exit_enabled() -> bool:
+    return get_setting("volume_exit_enabled", "false") == "true"
+
+
+def _log_volume_entry_decision(symbol: str, category: str, outcome: str, detail: str = "") -> None:
+    _volume_entry_log.append({
+        "at": (datetime.utcnow() + IST_OFFSET).strftime("%H:%M:%S"),
+        "symbol": symbol, "category": category, "outcome": outcome, "detail": detail,
+    })
+    del _volume_entry_log[:-_VOLUME_ENTRY_LOG_MAX]
+
+
+def _open_trade_if_free(symbol: str, category: str, price_val: float,
+                        alert_name: str = "", scan_name: str = "") -> tuple[bool, str | None]:
+    """The single-position check AND the open, together under one lock, so
+    two entry paths can never both decide 'nothing is open' and both open."""
+    with _entry_lock:
+        with get_db() as conn:
+            already_open = conn.execute(
+                "SELECT id FROM paper_trades WHERE status = 'OPEN' LIMIT 1"
+            ).fetchone()
+        if already_open:
+            return False, "A trade is already open"
+        return open_trade_for_symbol(symbol, category, price_val, alert_name=alert_name, scan_name=scan_name)
+
+
+def _volume_gated_entry(symbol: str, category: str, price_val: float,
+                        alert_name: str = "", scan_name: str = "") -> None:
+    """Runs on its own thread so the webhook returns immediately. Judges ONE
+    alert at the moment it arrives, using a freshly built reading (the same
+    one the dashboard badge shows). Enters only on Strong; every outcome is
+    logged so a skipped alert is never a mystery."""
+    sym = (symbol or "").strip().upper()
+    try:
+        access_token = get_setting("upstox_access_token")
+        if not access_token:
+            _log_volume_entry_decision(sym, category, "skipped", "no Upstox token saved")
+            return
+        reading = _build_volume_reading(sym, access_token)
+        _vol_reading_cache[sym] = reading   # so the dashboard shows what the rule saw
+        if reading.get("status") != "ok":
+            _log_volume_entry_decision(sym, category, "skipped", f"no usable volume reading ({reading.get('status')})")
+            return
+        side = reading["buy" if category == "Buy" else "sell"]
+        label, ratio = side.get("label"), side.get("ratio")
+        candle_end = reading["candle_start_ist"] + timedelta(minutes=5)
+        age_min = ((datetime.utcnow() + IST_OFFSET) - candle_end).total_seconds() / 60.0
+        if age_min > _VOL_ENTRY_MAX_READING_AGE_MINUTES:
+            _log_volume_entry_decision(sym, category, "skipped", f"volume reading is stale (as of {reading['asof']})")
+            return
+        if label != "Strong":
+            _log_volume_entry_decision(sym, category, "skipped", f"volume {label} ({ratio}x), not Strong")
+            return
+        created, reason = _open_trade_if_free(sym, category, price_val, alert_name=alert_name, scan_name=scan_name)
+        if created:
+            _log_volume_entry_decision(sym, category, "ENTERED", f"Strong {ratio}x as of {reading['asof']}")
+        else:
+            _log_volume_entry_decision(sym, category, "skipped", f"Strong {ratio}x but {reason or 'entry was skipped'}")
+    except Exception as e:
+        _log_volume_entry_decision(sym, category, "error", str(e)[:120])
+
+
+@app.route("/api/volume-entry/log")
+def api_volume_entry_log():
+    return jsonify({
+        "entry_enabled": get_volume_entry_enabled(),
+        "exit_enabled": get_volume_exit_enabled(),
+        "decisions": list(reversed(_volume_entry_log)),   # newest first
+    })
+
+
+@app.route("/api/paper-trading/volume-entry-toggle", methods=["POST"])
+def paper_trading_volume_entry_toggle():
+    enabled = bool((request.get_json(silent=True) or {}).get("enabled"))
+    set_setting("volume_entry_enabled", "true" if enabled else "false")
+    return jsonify({"status": "ok", "volume_entry_enabled": enabled})
+
+
+@app.route("/api/paper-trading/volume-exit-toggle", methods=["POST"])
+def paper_trading_volume_exit_toggle():
+    enabled = bool((request.get_json(silent=True) or {}).get("enabled"))
+    set_setting("volume_exit_enabled", "true" if enabled else "false")
+    return jsonify({"status": "ok", "volume_exit_enabled": enabled})
 
 
 @app.route("/api/volume-strength/debug")
@@ -4305,6 +4434,7 @@ def _run_paper_trade_check_impl() -> dict:
     # once per pass so every open trade sees the same answer.
     auto_exit_due = is_auto_exit_due()
     auto_exit_label = get_auto_exit_time() or ""
+    volume_exit_enabled = get_volume_exit_enabled()
 
     for trade in open_trades:
         checked += 1
@@ -4370,6 +4500,17 @@ def _run_paper_trade_check_impl() -> dict:
                             _shadow_conn.commit()
             except Exception:
                 pass
+
+            # Volume exit rule (Settings; off by default): close the trade the
+            # first time its volume reads Weak on a candle that closed after
+            # entry. Computed here so the paper and live branches below see
+            # the same answer. Wrapped so a bad reading can't break the loop.
+            volume_exit_reason = None
+            try:
+                if volume_exit_enabled:
+                    volume_exit_reason = _volume_exit_reason(symbol, trade["direction"], trade["entry_time"])
+            except Exception:
+                volume_exit_reason = None
 
             # EMA_SPOT_TRAIL is the one strategy that needs a candle
             # series from the UNDERLYING stock, not the option premium -
@@ -4640,6 +4781,13 @@ def _run_paper_trade_check_impl() -> dict:
                 # branches below and simply tries again on the next pass.
                 exited, exit_price = True, last_price
                 exit_reason = f"End-of-day auto-exit ({auto_exit_label})"
+
+            elif volume_exit_reason and last_price is not None:
+                # Volume exit rule: layered ON TOP of the strategy's own
+                # exits (whichever fires first), so any stop the strategy
+                # has still applies. Same price-needed fallthrough as above.
+                exited, exit_price = True, last_price
+                exit_reason = volume_exit_reason
 
             elif strategy == "EMA":
                 # #1: 5-EMA only, let it run - kept only for backward
@@ -5340,6 +5488,12 @@ def _run_paper_trade_check_impl() -> dict:
                 live_exited = True
                 live_exit_reason_val = f"End-of-day auto-exit ({auto_exit_label})"
 
+            # Volume exit rule for the live position (same close routine as
+            # every other software-driven live exit).
+            if volume_exit_reason and trade["live_status"] == "OPEN" and not live_exited:
+                live_exited = True
+                live_exit_reason_val = volume_exit_reason
+
             if live_exited and live_sl_fired_price is not None:
                 # The SL already filled at the broker - nothing left to
                 # place, just record it. Skip _close_live_position_if_any
@@ -5792,7 +5946,7 @@ def api_manual_enter_alert(alert_id):
     if not symbol or price_val <= 0:
         return jsonify({"status": "error", "message": "This alert doesn't have a usable symbol/price"}), 400
 
-    created, skip_reason = open_trade_for_symbol(
+    created, skip_reason = _open_trade_if_free(
         symbol, category, price_val,
         alert_name=alert_dict.get("alert_name", ""),
         scan_name=alert_dict.get("scan_name", ""),
@@ -6787,6 +6941,8 @@ def settings_page():
         entry_time_filter=get_entry_time_filter() or "",
         entry_cutoff_time=get_entry_cutoff_time() or "",
         auto_exit_time=get_auto_exit_time() or "",
+        volume_entry_enabled=get_volume_entry_enabled(),
+        volume_exit_enabled=get_volume_exit_enabled(),
         theta_switch_enabled=get_theta_switch_enabled(),
         live_entry_mode=get_live_entry_mode(),
         gtt_trailing_gap_mode=get_gtt_trailing_gap_mode(),
