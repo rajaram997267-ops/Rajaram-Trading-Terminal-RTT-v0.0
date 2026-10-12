@@ -334,6 +334,31 @@
 
   <div class="settings-box">
     <label class="switch">
+      <input type="checkbox" id="volumeEntryToggle" {% if volume_entry_enabled %}checked{% endif %} onchange="toggleVolumeRule('entry')">
+      <span class="slider"></span>
+    </label>
+    <span>Volume entry rule: only enter when volume is Strong</span>
+    <span class="token-status" id="volumeEntryStatus">{% if volume_entry_enabled %}ON - each alert is judged the moment it arrives: Strong volume opens the trade, anything else is skipped{% else %}OFF - every alert that passes the other filters opens a trade, as before{% endif %}</span>
+  </div>
+
+  <div class="settings-box">
+    <label class="switch">
+      <input type="checkbox" id="volumeExitToggle" {% if volume_exit_enabled %}checked{% endif %} onchange="toggleVolumeRule('exit')">
+      <span class="slider"></span>
+    </label>
+    <span>Volume exit rule: exit when volume turns Weak</span>
+    <span class="token-status" id="volumeExitStatus">{% if volume_exit_enabled %}ON - an open trade (paper and live) is closed the first time its volume reads Weak after entry, in addition to its strategy's own exits{% else %}OFF - open trades are closed only by their strategy's own exit rules{% endif %}</span>
+    <span class="token-status">"Strong" and "Weak" are the badge labels on the dashboard (directional volume vs the usual level for that time of day). The exit rule is added on top of the selected strategy, so any stop that strategy has keeps working; with RSI Momentum there is no broker-side stop, and a live position is still only closed by this app. Both switches only affect trades opened or checked from now on.</span>
+  </div>
+
+  <div class="settings-box" style="flex-direction: column; align-items: stretch;">
+    <span style="font-weight: 600;">Recent volume-entry decisions <button class="secondary" onclick="loadVolumeLog()" style="margin-left: 8px;">Refresh</button></span>
+    <div id="volumeLog" class="token-status">Loading...</div>
+    <span class="token-status">Kept in memory only - clears when the app restarts.</span>
+  </div>
+
+  <div class="settings-box">
+    <label class="switch">
       <input type="checkbox" id="sectorFilterToggle" {% if sector_filter_enabled %}checked{% endif %} onchange="toggleSectorFilter()">
       <span class="slider"></span>
     </label>
@@ -362,6 +387,7 @@
       try { localStorage.setItem("rtt-theme", t); } catch (e) {}
       document.documentElement.setAttribute("data-theme", t);
     }
+    loadVolumeLog();
     (function initThemeSelect() {
       var t = "dark";
       try { t = localStorage.getItem("rtt-theme") || "dark"; } catch (e) {}
@@ -607,6 +633,55 @@
     async function clearAutoExit() {
       document.getElementById("autoExitInput").value = "";
       await saveAutoExit();
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement("div");
+      div.textContent = String(str);
+      return div.innerHTML;
+    }
+
+    async function toggleVolumeRule(kind) {
+      const isEntry = kind === "entry";
+      const checkbox = document.getElementById(isEntry ? "volumeEntryToggle" : "volumeExitToggle");
+      const statusEl = document.getElementById(isEntry ? "volumeEntryStatus" : "volumeExitStatus");
+      const enabled = checkbox.checked;
+      try {
+        const res = await fetch(isEntry ? "/api/paper-trading/volume-entry-toggle" : "/api/paper-trading/volume-exit-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await res.json();
+        const on = isEntry ? result.volume_entry_enabled : result.volume_exit_enabled;
+        statusEl.textContent = isEntry
+          ? (on ? "ON - each alert is judged the moment it arrives: Strong volume opens the trade, anything else is skipped"
+                : "OFF - every alert that passes the other filters opens a trade, as before")
+          : (on ? "ON - an open trade (paper and live) is closed the first time its volume reads Weak after entry, in addition to its strategy's own exits"
+                : "OFF - open trades are closed only by their strategy's own exit rules");
+      } catch (err) {
+        checkbox.checked = !enabled;
+      }
+    }
+
+    async function loadVolumeLog() {
+      const el = document.getElementById("volumeLog");
+      try {
+        const res = await fetch("/api/volume-entry/log");
+        const data = await res.json();
+        if (!data.decisions.length) {
+          el.textContent = data.entry_enabled
+            ? "No alerts judged yet since the app last started."
+            : "Nothing yet - the volume entry rule is off, so alerts aren't being judged.";
+          return;
+        }
+        el.innerHTML = data.decisions.slice(0, 20).map((d) => {
+          const colour = d.outcome === "ENTERED" ? "var(--green)" : (d.outcome === "error" ? "var(--red)" : "var(--muted)");
+          return `<div><span style="color:${colour}; font-weight:600;">${escapeHtml(d.outcome)}</span> ${escapeHtml(d.at)} ${escapeHtml(d.symbol)} (${escapeHtml(d.category)}) - ${escapeHtml(d.detail)}</div>`;
+        }).join("");
+      } catch (err) {
+        el.textContent = "Couldn't load the log.";
+      }
     }
 
     async function toggleSectorFilter() {
