@@ -189,8 +189,24 @@
     <span>Starting capital (Rs):</span>
     <input type="text" id="capitalInput" style="max-width: 160px; flex: none;" value="{{ capital|int }}">
     <button class="secondary" onclick="saveCapital()">Save amount</button>
-    <span class="token-status" id="capitalStatus">Only used to seed the account - once trades start closing, the balance compounds automatically</span>
+    <span class="token-status" id="capitalStatus">The seed for the account. Changing it re-bases the whole history (every "Balance after" shifts) - to just add money, use "Add / remove paper funds" below.</span>
     <button style="background: var(--red); margin-left: auto;" onclick="resetPaperTrading()">Reset paper trading</button>
+  </div>
+
+  <div class="settings-box">
+    <span>Add / remove paper funds (Rs):</span>
+    <input type="text" id="fundsAmount" placeholder="e.g. 50000" style="max-width: 130px; flex: none; text-align: right;">
+    <input type="text" id="fundsNote" placeholder="note (optional)" style="max-width: 200px; flex: none;">
+    <button class="secondary" onclick="addFunds()">Add funds</button>
+    <span class="token-status" id="fundsStatus">Paper balance now: Rs {{ current_capital }}. Adds to the balance only - no trade, P&amp;L, win rate or Stats number changes, and history stays exactly as it is. Use a negative amount to remove funds.</span>
+    {% if capital_adjustments %}
+    <div id="fundsLog" style="flex-basis: 100%; font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.6;">
+      <div style="font-weight: 600; color: var(--text);">Funds history (total {{ "%+.2f"|format(adjustments_total) }})</div>
+      {% for a in capital_adjustments %}
+      <div>{{ a.when_ist }} IST &middot; <span style="color: {% if a.amount > 0 %}var(--green){% else %}var(--red){% endif %};">{{ "%+.2f"|format(a.amount) }}</span>{% if a.note %} &middot; {{ a.note }}{% endif %}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
   </div>
 
   <div class="settings-box" style="border-color: {% if live_trading_enabled %}var(--red){% else %}var(--border){% endif %};">
@@ -805,8 +821,40 @@
       }
     }
 
+    async function addFunds() {
+      const statusEl = document.getElementById("fundsStatus");
+      const raw = document.getElementById("fundsAmount").value.replace(/,/g, "").trim();
+      const note = document.getElementById("fundsNote").value.trim();
+      const amount = parseFloat(raw);
+      if (!raw || !isFinite(amount) || amount === 0) {
+        statusEl.textContent = "Enter a non-zero amount, e.g. 50000 (negative removes funds)";
+        return;
+      }
+      const verb = amount > 0 ? "Add" : "Remove";
+      if (!confirm(`${verb} Rs ${Math.abs(amount)} ${amount > 0 ? "to" : "from"} the paper account? Your trade history is not affected.`)) {
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/capital-adjust", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ amount, note }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = `Done - paper balance is now Rs ${result.current_capital}`;
+          setTimeout(() => location.reload(), 600);
+        } else {
+          statusEl.textContent = result.message || "Failed to update funds";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update funds - see console";
+        console.error(err);
+      }
+    }
+
     async function resetPaperTrading() {
-      if (!confirm("This deletes ALL paper trades (open and closed) and restarts from your starting capital. Continue?")) {
+      if (!confirm("This deletes ALL paper trades (open and closed) AND your funds history, and restarts from your starting capital.\n\nJust want more paper money? Cancel and use \"Add / remove paper funds\" - it keeps every trade.\n\nContinue with the full reset?")) {
         return;
       }
       const res = await fetch("/api/paper-trading/reset", { method: "POST" });

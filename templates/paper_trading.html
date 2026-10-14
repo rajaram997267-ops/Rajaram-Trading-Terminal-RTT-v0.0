@@ -296,7 +296,8 @@
   <div class="stats">
     <div class="stat-card">
       <div class="label">Current capital (Rs)</div>
-      <div class="value {% if current_capital > capital %}pos{% elif current_capital < capital %}neg{% endif %}" id="statCurrentCapital">{{ current_capital }}</div>
+      <div class="value {% if current_capital > capital_base %}pos{% elif current_capital < capital_base %}neg{% endif %}" id="statCurrentCapital">{{ current_capital }}</div>
+      {% if adjustments_total %}<div style="font-size: 10px; color: var(--muted); margin-top: 2px;" title="Funds you added to (or removed from) the paper account. Not P&L - never counted in Total P&L, win rate or Stats.">incl. {{ "%+.0f"|format(adjustments_total) }} funds {{ "added" if adjustments_total > 0 else "removed" }}</div>{% endif %}
     </div>
     <div class="stat-card">
       <div class="label">Open trade</div>
