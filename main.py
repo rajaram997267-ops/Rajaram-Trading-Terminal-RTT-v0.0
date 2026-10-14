@@ -523,6 +523,20 @@ def init_db():
             )
             """
         )
+        # Funds added to / removed from the PAPER account, kept apart from the
+        # trades themselves so topping up never touches (or re-bases) the
+        # trade history - see get_current_capital / attach_running_balance.
+        # Append-only: a mistake is corrected with an offsetting entry.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS paper_capital_adjustments (
+                id SERIAL PRIMARY KEY,
+                amount DOUBLE PRECISION NOT NULL,
+                note TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
         # ADD COLUMN IF NOT EXISTS so existing Render/Neon databases (created
         # before live trading existed) pick up the new columns without
         # needing a manual migration.
@@ -607,6 +621,25 @@ def get_capital() -> float:
         return float(value)
     except (ValueError, TypeError):
         return DEFAULT_CAPITAL
+
+
+def get_capital_adjustments() -> list[dict]:
+    """Every top-up / withdrawal on the paper account, oldest first. Each is
+    {id, amount (negative = withdrawal), note, created_at (UTC ISO)}."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, amount, note, created_at FROM paper_capital_adjustments "
+            "ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_adjustments_total() -> float:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) AS total FROM paper_capital_adjustments"
+        ).fetchone()
+    return float(row["total"] or 0)
 
 
 def get_live_trading_enabled() -> bool:
@@ -1046,8 +1079,10 @@ def save_alert_batch(data: dict):
 def get_current_capital() -> float:
     """The account balance available for the next trade: the starting
     capital plus every closed trade's P&L so far, compounding - this is
-    what actually answers 'how would 1 lakh grow over the month'."""
-    base = get_capital()
+    what actually answers 'how would 1 lakh grow over the month'. Funds
+    added later through the capital-adjustments ledger count too - they are
+    NOT P&L, so they never appear in Total P&L, win rate or Stats."""
+    base = get_capital() + get_adjustments_total()
     with get_db() as conn:
         row = conn.execute(
             "SELECT COALESCE(SUM(pnl), 0) AS total FROM paper_trades WHERE status = 'CLOSED'"
@@ -6523,13 +6558,27 @@ def attach_live_unrealized_pnl(open_trades: list[dict]) -> None:
         t["unrealized_pnl_pct"] = round((pnl / capital_used) * 100, 2) if capital_used else 0
 
 
-def attach_running_balance(closed_trades_desc: list[dict], starting_capital: float) -> None:
+def attach_running_balance(closed_trades_desc: list[dict], starting_capital: float,
+                           adjustments: list[dict] | None = None) -> None:
     """closed_trades_desc: newest first (as queried). Adds 'balance_after'
     to each trade - the account balance right after that trade closed,
     computed by walking the trades oldest-to-newest and accumulating P&L.
-    This is what actually shows the compounding progression over time."""
+    This is what actually shows the compounding progression over time.
+
+    `adjustments` (the funds ledger) are applied at the moment they were
+    made: a top-up counts for every trade that closed at/after it and for
+    none before it. So adding funds today leaves every earlier trade's
+    'balance after' exactly as it was - only the balance from then on
+    steps up. (Editing the starting capital instead would re-base all of
+    history, which is the thing this ledger exists to avoid.)"""
     running = starting_capital
+    pending = sorted(adjustments or [], key=lambda a: (a["created_at"], a.get("id") or 0))
+    i = 0
     for t in reversed(closed_trades_desc):  # oldest first for the running sum
+        closed_at = t.get("exit_time") or ""
+        while i < len(pending) and pending[i]["created_at"] <= closed_at:
+            running += pending[i]["amount"] or 0
+            i += 1
         running += t["pnl"] or 0
         t["balance_after"] = round(running, 2)
 
@@ -6668,7 +6717,9 @@ def paper_trading():
 
     token_saved = bool(get_setting("upstox_access_token"))
     capital = get_capital()
-    attach_running_balance(closed_trades, capital)
+    capital_adjustments = get_capital_adjustments()
+    adjustments_total = round(sum(a["amount"] for a in capital_adjustments), 2)
+    attach_running_balance(closed_trades, capital, capital_adjustments)
     attach_rr(closed_trades, "pnl_pct", "mae_pct", "planned_risk_pct")
     closed_by_date = group_trades_by_date(closed_trades)
     current_capital = get_current_capital()
@@ -6694,6 +6745,8 @@ def paper_trading():
         wins=wins,
         token_saved=token_saved,
         capital=capital,
+        adjustments_total=adjustments_total,
+        capital_base=round(capital + adjustments_total, 2),
         current_capital=round(current_capital, 2),
         live_trading_enabled=live_trading_enabled,
         exit_strategy=exit_strategy,
@@ -6758,9 +6811,14 @@ def api_stats_pnl_curve():
 
     paper_points = []
     running = get_capital()
-    for r in paper_rows:
-        running += r["pnl"] or 0
-        paper_points.append({"time": r["exit_time"], "balance": round(running, 2)})
+    # Trades and fund top-ups in one time-ordered pass, so a deposit shows
+    # up as a step on the curve at the moment it was made (not as if the
+    # money had been there from the start).
+    events = [(r["exit_time"], 0, r["pnl"] or 0) for r in paper_rows]
+    events += [(a["created_at"], 1, a["amount"] or 0) for a in get_capital_adjustments()]
+    for when, _kind, delta in sorted(events, key=lambda e: (e[0], e[1])):
+        running += delta
+        paper_points.append({"time": when, "balance": round(running, 2)})
 
     live_points = []
     running_live = 0.0
@@ -6926,9 +6984,15 @@ def api_stats_breakdown():
 def settings_page():
     token_saved = bool(get_setting("upstox_access_token"))
     capital = get_capital()
+    _adjustments = list(reversed(get_capital_adjustments()))   # newest first for display
+    for _a in _adjustments:
+        _a["when_ist"] = (datetime.fromisoformat(_a["created_at"]) + IST_OFFSET).strftime("%d %b %Y %H:%M")
     html = render_template(
         "settings.html",
         active_tab="settings",
+        capital_adjustments=_adjustments,
+        adjustments_total=round(sum(a["amount"] for a in _adjustments), 2),
+        current_capital=round(get_current_capital(), 2),
         token_saved=token_saved,
         capital=capital,
         live_trading_enabled=get_live_trading_enabled(),
@@ -7087,7 +7151,7 @@ def paper_trading_data():
     attach_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct", "planned_risk_pct")
     _attach_volume_to_trades(open_trades)
-    attach_running_balance(closed_trades, get_capital())
+    attach_running_balance(closed_trades, get_capital(), get_capital_adjustments())
     attach_rr(closed_trades, "pnl_pct", "mae_pct", "planned_risk_pct")
 
     live_stats = compute_live_stats(open_trades, closed_trades)
@@ -7129,6 +7193,37 @@ def paper_trading_capital():
         return jsonify({"status": "error", "message": "Amount must be positive"}), 400
     set_setting("paper_trade_capital", str(capital))
     return jsonify({"status": "ok", "capital": capital})
+
+
+@app.route("/api/paper-trading/capital-adjust", methods=["POST"])
+def paper_trading_capital_adjust():
+    """Add (positive) or remove (negative) paper funds WITHOUT touching any
+    trade or its history. Append-only ledger; fix a mistake with an
+    offsetting entry. The balance can't be taken to zero or below."""
+    data = request.get_json(silent=True) or {}
+    try:
+        amount = float(data.get("amount"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Enter a valid amount"}), 400
+    if not math.isfinite(amount) or amount == 0:
+        return jsonify({"status": "error", "message": "Enter a non-zero amount (negative removes funds)"}), 400
+    if abs(amount) > 1_000_000_000:
+        return jsonify({"status": "error", "message": "Amount is unrealistically large"}), 400
+    amount = round(amount, 2)
+    note = (data.get("note") or "").strip()[:120]
+    current = get_current_capital()
+    if current + amount <= 0:
+        return jsonify({
+            "status": "error",
+            "message": f"That would take the paper balance to zero or below (current balance: Rs {round(current, 2)})",
+        }), 400
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO paper_capital_adjustments (amount, note, created_at) VALUES (?, ?, ?)",
+            (amount, note or None, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    return jsonify({"status": "ok", "amount": amount, "current_capital": round(get_current_capital(), 2)})
 
 
 @app.route("/api/paper-trading/live-toggle", methods=["POST"])
@@ -7398,6 +7493,10 @@ def paper_trading_reset():
     simultaneous trades) to this one (one at a time)."""
     with get_db() as conn:
         conn.execute("DELETE FROM paper_trades")
+        # A reset means "back to the starting capital", so the funds ledger
+        # goes with it - otherwise old top-ups would linger on an empty
+        # history with nothing to explain them.
+        conn.execute("DELETE FROM paper_capital_adjustments")
         conn.commit()
     return jsonify({"status": "ok"})
 
