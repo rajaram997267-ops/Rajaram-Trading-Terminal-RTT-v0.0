@@ -349,7 +349,7 @@
     {% endif %}
   </div>
 
-  <h3 class="section-title">Closed trades <span style="font-size:11px; color: var(--muted); font-weight: normal;">(Balance after shows the compounding progression)</span></h3>
+  <h3 class="section-title">Closed trades <span style="font-size:11px; color: var(--muted); font-weight: normal;">(Balance after shows the compounding progression){% if total_closed > closed_trades|length %} &middot; listing the latest {{ closed_trades|length }} of {{ total_closed }}; the cards above count all {{ total_closed }}{% endif %}</span></h3>
   <div id="closedTradesContainer">
     {% if closed_by_date %}
       {% for group in closed_by_date %}
@@ -589,13 +589,23 @@
         renderOpenTrades(data.open);
         renderClosedTrades(data.closed);
         document.getElementById("statOpen").textContent = data.open.length;
-        document.getElementById("statClosed").textContent = data.closed.length;
-        const wins = data.closed.filter(t => (t.pnl || 0) > 0).length;
-        const winRate = data.closed.length ? ((wins / data.closed.length) * 100).toFixed(1) : 0;
+        // Headline cards come from the all-time summary - data.closed is only the
+        // latest 200 rows, so computing from it made these cards a rolling window.
+        // (Falls back to the list only if an older server doesn't send the summary.)
+        const cs = data.closed_summary;
+        const closedCount = cs ? cs.total_closed : data.closed.length;
+        document.getElementById("statClosed").textContent = closedCount;
+        let winRate;
+        if (cs) {
+          winRate = cs.win_rate;
+        } else {
+          const wins = data.closed.filter(t => (t.pnl || 0) > 0).length;
+          winRate = data.closed.length ? ((wins / data.closed.length) * 100).toFixed(1) : 0;
+        }
         document.getElementById("statWinRate").textContent = winRate + "%";
-        const totalPnl = data.closed.reduce((sum, t) => sum + (t.pnl || 0), 0);
+        const totalPnl = cs ? cs.total_pnl : data.closed.reduce((sum, t) => sum + (t.pnl || 0), 0);
         const pnlEl = document.getElementById("statPnl");
-        pnlEl.textContent = totalPnl.toFixed(2);
+        pnlEl.textContent = Number(totalPnl).toFixed(2);
         pnlEl.classList.remove("pos", "neg");
         if (totalPnl > 0) pnlEl.classList.add("pos");
         if (totalPnl < 0) pnlEl.classList.add("neg");
