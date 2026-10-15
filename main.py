@@ -642,6 +642,25 @@ def get_adjustments_total() -> float:
     return float(row["total"] or 0)
 
 
+def get_paper_closed_summary() -> dict:
+    """Closed-trade count, wins and total P&L over ALL closed paper trades.
+    The Paper page only LISTS the latest 200 (to keep the page light), but its
+    headline cards used to be computed from that same 200-row list - so
+    'Closed trades' sat at 200 forever and Win rate / Total P&L silently
+    became 'last 200 trades only' while Current Capital counted everything."""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n, "
+            "COALESCE(SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END), 0) AS wins, "
+            "COALESCE(SUM(pnl), 0) AS total FROM paper_trades WHERE status = 'CLOSED'"
+        ).fetchone()
+    n, wins, total = int(row["n"] or 0), int(row["wins"] or 0), float(row["total"] or 0)
+    return {
+        "total_closed": n, "wins": wins, "total_pnl": round(total, 2),
+        "win_rate": round(wins / n * 100, 1) if n else 0,
+    }
+
+
 def get_live_trading_enabled() -> bool:
     """Master safety switch for placing real orders on Upstox. Defaults to
     OFF - live orders only fire once this is explicitly turned on via
@@ -1255,6 +1274,13 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
             f"No {opt_type} option chain data for {symbol} - fell back to equity paper trading": "no option chain data",
             f"Could not fetch option premium for {symbol} {opt_type} - fell back to equity paper trading": "premium fetch failed",
         }[fallback_note]
+        if fallback_short == "premium fetch failed" and option:
+            # Say WHY (HTTP 429 = rate limit, empty price = contract hasn't
+            # traded, timeout...) - the one thing that was missing for
+            # telling a rate-limit problem from an illiquid contract.
+            _why = _ltp_last_failure.get(option["instrument_key"])
+            if _why:
+                fallback_short = f"premium fetch failed - {_why}"
         paper_option_label = f"EQUITY (option fallback: {fallback_short})"
 
     now = datetime.utcnow().isoformat()
@@ -3471,6 +3497,12 @@ def compute_live_stats(open_trades: list[dict], closed_trades: list[dict]) -> di
 UPSTOX_ORDER_URL = "https://api-hft.upstox.com/v3/order/place"
 
 
+# Why the most recent quote for each instrument failed (overwritten on each
+# failure; read when a trade falls back to the stock, so the trade row can say
+# WHY instead of just "premium fetch failed"). Memory only.
+_ltp_last_failure: dict[str, str] = {}
+
+
 def get_ltp(instrument_key: str, access_token: str) -> float | None:
     """Fetches the current last-traded price for a single instrument (used
     to price an option's premium before sizing lots). Returns None (never
@@ -3490,9 +3522,17 @@ def get_ltp(instrument_key: str, access_token: str) -> float | None:
         data = payload.get("data") or {}
         for entry in data.values():
             if entry.get("instrument_token") == instrument_key:
-                return entry.get("last_price")
+                price = entry.get("last_price")
+                if not price:
+                    _ltp_last_failure[instrument_key] = "no price returned (last_price empty/0)"
+                return price
+        _ltp_last_failure[instrument_key] = "instrument missing from quote response"
         return None
-    except Exception:
+    except urllib.error.HTTPError as e:
+        _ltp_last_failure[instrument_key] = f"HTTP {e.code}"
+        return None
+    except Exception as e:
+        _ltp_last_failure[instrument_key] = f"{type(e).__name__}"
         return None
 
 
@@ -6710,10 +6750,9 @@ def paper_trading():
     _attach_volume_to_trades(open_trades)
     attach_stop_info(open_trades, get_setting("upstox_access_token"))
 
-    total_pnl = sum(t["pnl"] for t in closed_trades if t["pnl"] is not None)
-    wins = sum(1 for t in closed_trades if (t["pnl"] or 0) > 0)
-    total_closed = len(closed_trades)
-    win_rate = round((wins / total_closed) * 100, 1) if total_closed else 0
+    _summary = get_paper_closed_summary()
+    total_pnl, wins = _summary["total_pnl"], _summary["wins"]
+    total_closed, win_rate = _summary["total_closed"], _summary["win_rate"]
 
     token_saved = bool(get_setting("upstox_access_token"))
     capital = get_capital()
@@ -6871,21 +6910,62 @@ def _is_manual_exit(row: dict) -> bool:
     return (row.get("exit_reason") or "").startswith("Manual")
 
 
+def _is_volume_exit(row: dict) -> bool:
+    return (row.get("exit_reason") or "").startswith("Volume exit")
+
+
+def _is_stock_fallback(row: dict) -> bool:
+    """A trade that fell back to the STOCK because the option price couldn't
+    be fetched - not an options trade, so it doesn't belong in options stats."""
+    return (row.get("paper_option_label") or "").startswith("EQUITY")
+
+
+_EXIT_KIND_ORDER = ("volume exit", "strategy exit", "manual exit", "end-of-day exit")
+_LABEL_ORDER = ("Strong", "Moderate", "Weak")
+
+
+def _exit_kind(row: dict) -> str:
+    reason = row.get("exit_reason") or ""
+    if reason.startswith("Manual"):
+        return "manual exit"
+    if reason.startswith("Volume exit"):
+        return "volume exit"
+    if reason.startswith("End-of-day"):
+        return "end-of-day exit"
+    return "strategy exit"   # the active strategy's own rule (RSI momentum, stop-loss, trail...)
+
+
 def _volume_group_label(row: dict) -> str:
     """Group key for the 'by entry volume' table: the entry label, split by
-    HOW the trade ended. A hand-picked exit isn't the strategy's rule - it
-    carries the trader's own timing and hindsight - so mixing it into the
-    same bucket as rule exits would let that decide the volume comparison."""
+    HOW the trade ended - volume exit, the strategy's own rule, a hand-picked
+    manual exit, or the end-of-day exit. These are different rules and must
+    not share a row: lumping 'every automatic exit' together hid that the old
+    RSI exits and the new Volume exits behave very differently. Stock-fallback
+    trades are kept apart so they can't dilute the options results."""
+    if _is_stock_fallback(row):
+        return "Stock fallback (not options)"
     label = row.get("entry_volume_label")
     if not label:
         return "(not recorded)"
-    return f"{label} \u00b7 {'manual exit' if _is_manual_exit(row) else 'rule exit'}"
+    return f"{label} \u00b7 {_exit_kind(row)}"
+
+
+def _volume_group_sort_key(name: str) -> tuple[int, int]:
+    for i, label in enumerate(_LABEL_ORDER):
+        if name.startswith(label + " \u00b7 "):
+            kind = name.split(" \u00b7 ", 1)[1]
+            return (i, _EXIT_KIND_ORDER.index(kind) if kind in _EXIT_KIND_ORDER else len(_EXIT_KIND_ORDER))
+    return (len(_LABEL_ORDER), 0)
 
 
 def _shadow_weak_exit_summary(rows: list[dict]) -> dict:
     """Counterfactual for a 'weak-volume exit' rule, computed from trades that
     were tracked from entry (shadow_tracked) and ended by the strategy's own
-    exit rule (manual exits excluded - their timing is the trader's).
+    exit rule. Excluded: manual exits (the trader's timing), VOLUME exits (the
+    rule being measured already decided those - their shadow result equals the
+    actual by construction, which would just dilute the answer) and stock
+    fallbacks (not options). So it only measures anything while the Volume
+    exit switch is off.
     For each: actual % vs the % had it been closed at the first time its
     volume read Weak while open. A trade whose volume never turned Weak would
     not have been touched by the rule, so its shadow result equals the actual.
@@ -6894,6 +6974,7 @@ def _shadow_weak_exit_summary(rows: list[dict]) -> dict:
     tracked = [
         r for r in rows
         if r.get("shadow_tracked") == 1 and not _is_manual_exit(r)
+        and not _is_volume_exit(r) and not _is_stock_fallback(r)
         and r.get("entry_price") and r.get("pnl_pct") is not None
     ]
 
@@ -6930,7 +7011,7 @@ def api_stats_breakdown():
     with get_db() as conn:
         rows = conn.execute(
             "SELECT alert_name, scan_name, strategy, pnl, pnl_pct, entry_price, exit_reason, entry_volume_label, "
-            "shadow_tracked, shadow_weak_price FROM paper_trades "
+            "paper_option_label, shadow_tracked, shadow_weak_price FROM paper_trades "
             "WHERE status = 'CLOSED' AND pnl IS NOT NULL"
         ).fetchall()
     rows = [dict(r) for r in rows]
@@ -6938,12 +7019,7 @@ def api_stats_breakdown():
     by_alert = _summarize_group(rows, "alert_name")
     by_strategy = _summarize_group(rows, "strategy")
     by_volume = _summarize_group([{**r, "vol_group": _volume_group_label(r)} for r in rows], "vol_group")
-    _vol_order = {
-        "Strong \u00b7 rule exit": 0, "Strong \u00b7 manual exit": 1,
-        "Moderate \u00b7 rule exit": 2, "Moderate \u00b7 manual exit": 3,
-        "Weak \u00b7 rule exit": 4, "Weak \u00b7 manual exit": 5,
-    }
-    by_volume.sort(key=lambda g: _vol_order.get(g["name"], 6))  # Strong -> Weak, then (not recorded)
+    by_volume.sort(key=lambda g: (_volume_group_sort_key(g["name"]), g["name"]))  # Strong -> Weak, then the rest
     shadow_weak = _shadow_weak_exit_summary(rows)
 
     # Combined (alert, strategy) pair breakdown.
@@ -6962,11 +7038,14 @@ def api_stats_breakdown():
         "volume_tracking_note": (
             "Directional volume at entry vs the same time of day over the last ~10 "
             "sessions - an estimate from candle structure, not true buy/sell volume. "
-            "Only trades opened after this tracking was added have a reading; the "
-            "rest show as '(not recorded)'. Each bucket is split by how the trade ended: "
-            "'manual exit' rows carry the trader's own timing, so compare 'rule exit' "
-            "rows to judge volume itself. Needs a good number of trades per bucket "
-            "before any comparison means anything."
+            "Only trades opened after this tracking was added have a reading; the rest "
+            "show as '(not recorded)'. Each row is split by how the trade ended - the "
+            "Volume rule, the strategy's own rule (e.g. RSI), a manual exit, or the "
+            "end-of-day exit - because those are different rules and must be judged "
+            "separately; manual rows carry the trader's own timing. Trades that fell "
+            "back to the stock (no option price) are listed apart since they aren't "
+            "options trades. Needs a good number of trades per row before any "
+            "comparison means anything."
         ),
         "shadow_weak_exit": shadow_weak,
         "by_pair": by_pair[:10],  # top 10 combos only - the full cross-product isn't useful to scan
@@ -7163,6 +7242,7 @@ def paper_trading_data():
         "open": open_trades,
         "closed": closed_trades,
         "current_capital": round(get_current_capital(), 2),
+        "closed_summary": get_paper_closed_summary(),
         "live_trading_enabled": get_live_trading_enabled(),
         "exit_strategy": get_exit_strategy(),
         "live_open": live_stats["live_open"],
