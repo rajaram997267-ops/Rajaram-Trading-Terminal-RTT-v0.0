@@ -308,6 +308,31 @@ def get_sector(symbol: str) -> str:
 ALL_SECTOR_NAMES = sorted(set(SECTOR_MAP.values()))
 
 
+def ist_stamp(utc_iso: str | None) -> str:
+    """A stored UTC timestamp as an IST wall-clock string, 'YYYY-MM-DD HH:MM:SS'.
+    The database keeps every timestamp as naive UTC (datetime.utcnow()), which is
+    right for storage and sorting but reads as 5h30m 'early' next to the
+    dashboard, the volume badge and the broker, all of which show IST. Trade
+    tables now display this instead of the raw value. '' if missing/unparseable."""
+    if not utc_iso:
+        return ""
+    try:
+        return (datetime.fromisoformat(utc_iso) + IST_OFFSET).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError):
+        return ""
+
+
+def attach_ist_times(trades: list[dict]) -> None:
+    """Adds IST display twins of a trade row's timestamps (the originals are
+    left untouched for sorting/grouping/storage): entry_time_ist,
+    last_checked_ist, exit_time_ist, live_exit_time_ist."""
+    for t in trades:
+        t["entry_time_ist"] = ist_stamp(t.get("entry_time"))
+        t["last_checked_ist"] = ist_stamp(t.get("last_checked_time"))
+        t["exit_time_ist"] = ist_stamp(t.get("exit_time"))
+        t["live_exit_time_ist"] = ist_stamp(t.get("live_exit_time"))
+
+
 def ist_date_str(created_at_iso: str) -> str:
     """Convert a stored UTC timestamp to its IST calendar date (YYYY-MM-DD),
     so 'today' matches the Indian trading day rather than the UTC day."""
@@ -6747,6 +6772,7 @@ def paper_trading():
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct", "planned_risk_pct")
+    attach_ist_times(open_trades)
     _attach_volume_to_trades(open_trades)
     attach_stop_info(open_trades, get_setting("upstox_access_token"))
 
@@ -6760,6 +6786,7 @@ def paper_trading():
     adjustments_total = round(sum(a["amount"] for a in capital_adjustments), 2)
     attach_running_balance(closed_trades, capital, capital_adjustments)
     attach_rr(closed_trades, "pnl_pct", "mae_pct", "planned_risk_pct")
+    attach_ist_times(closed_trades)
     closed_by_date = group_trades_by_date(closed_trades)
     current_capital = get_current_capital()
     live_trading_enabled = get_live_trading_enabled()
@@ -7128,8 +7155,10 @@ def live_trading_page():
     open_trades = [dict(t) for t in open_trades]
     closed_trades = [dict(t) for t in closed_trades]
     failed_trades = [dict(t) for t in failed_trades]
+    attach_ist_times(failed_trades)
     attach_live_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
+    attach_ist_times(open_trades)
     _attach_volume_to_trades(open_trades)
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
@@ -7139,6 +7168,7 @@ def live_trading_page():
         capital_used = entry * qty
         t["live_pnl_pct"] = round((t["live_pnl_value"] / capital_used) * 100, 2) if capital_used else None
     attach_rr(closed_trades, "live_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
+    attach_ist_times(closed_trades)
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     closed_by_date = group_trades_by_date(closed_trades, date_field="live_exit_time", pnl_field="live_pnl_value")
@@ -7190,6 +7220,7 @@ def live_trading_data():
     closed_trades = [dict(t) for t in closed_trades]
     attach_live_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
+    attach_ist_times(open_trades)
     _attach_volume_to_trades(open_trades)
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
@@ -7199,7 +7230,9 @@ def live_trading_data():
         capital_used = entry * qty
         t["live_pnl_pct"] = round((t["live_pnl_value"] / capital_used) * 100, 2) if capital_used else None
     attach_rr(closed_trades, "live_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
+    attach_ist_times(closed_trades)
     failed_trades = [dict(t) for t in failed_trades]
+    attach_ist_times(failed_trades)
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     access_token = get_setting("upstox_access_token")
@@ -7229,9 +7262,11 @@ def paper_trading_data():
     closed_trades = [dict(t) for t in closed_trades]
     attach_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct", "planned_risk_pct")
+    attach_ist_times(open_trades)
     _attach_volume_to_trades(open_trades)
     attach_running_balance(closed_trades, get_capital(), get_capital_adjustments())
     attach_rr(closed_trades, "pnl_pct", "mae_pct", "planned_risk_pct")
+    attach_ist_times(closed_trades)
 
     live_stats = compute_live_stats(open_trades, closed_trades)
     access_token = get_setting("upstox_access_token")
