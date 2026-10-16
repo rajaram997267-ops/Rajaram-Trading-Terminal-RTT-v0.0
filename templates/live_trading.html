@@ -300,13 +300,13 @@
         <div class="date-trades">
           <table>
             <tr>
-              <th>Symbol</th><th>Direction</th><th>Entry time</th><th>Reason</th>
+              <th>Symbol</th><th>Direction</th><th>Entry time (IST)</th><th>Reason</th>
             </tr>
             {% for t in group.trades %}
             <tr>
               <td>{{ t.symbol }}</td>
               <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
-              <td>{{ t.entry_time[:19] if t.entry_time else "-" }}</td>
+              <td>{{ t.entry_time_ist or "-" }}</td>
               <td class="error-note">{{ t.live_error or "Unknown reason" }}</td>
             </tr>
             {% endfor %}
@@ -388,14 +388,14 @@
       });
       const isFirstRender = expandedDates.size === 0 && container.querySelector(".date-group") === null;
 
-      const groups = groupTradesByDate(trades, "entry_time", "pnl");
+      const groups = groupTradesByDate(trades, "entry_time_ist", "pnl");
       const html = groups.map((g, idx) => {
         const expanded = expandedDates.has(g.date) || (isFirstRender && idx === 0);
         const rows = g.trades.map(t => `
           <tr>
             <td>${escapeHtml(t.symbol)}</td>
             <td class="direction-${(t.direction || "").toLowerCase()}">${t.direction || "-"}</td>
-            <td>${(t.entry_time || "").slice(0, 19) || "-"}</td>
+            <td>${t.entry_time_ist || "-"}</td>
             <td class="error-note">${escapeHtml(t.live_error || "Unknown reason")}</td>
           </tr>
         `).join("");
@@ -412,7 +412,7 @@
             </div>
             <div class="date-trades">
               <table>
-                <tr><th>Symbol</th><th>Direction</th><th>Entry time</th><th>Reason</th></tr>
+                <tr><th>Symbol</th><th>Direction</th><th>Entry time (IST)</th><th>Reason</th></tr>
                 ${rows}
               </table>
             </div>
@@ -508,7 +508,7 @@
       });
       const isFirstRender = expandedDates.size === 0 && container.querySelector(".date-group") === null;
 
-      const groups = groupTradesByDate(trades, "live_exit_time", "live_pnl_value");
+      const groups = groupTradesByDate(trades, "live_exit_time_ist", "live_pnl_value");
       const html = groups.map((g, idx) => {
         const pnlClass = g.total_pnl > 0 ? "pnl-pos" : (g.total_pnl < 0 ? "pnl-neg" : "");
         const sign = g.total_pnl > 0 ? "+" : "";
