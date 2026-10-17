@@ -20,6 +20,7 @@ from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 
 from flask import Flask, jsonify, render_template, request, redirect, url_for, make_response
 
@@ -403,22 +404,60 @@ def group_by_category(alerts: list[dict]) -> list[tuple[str, list[dict]]]:
     return result
 
 
-class PGConnWrapper:
-    """Makes a psycopg2 connection usable the same way the rest of this
-    file already uses sqlite3 connections: conn.execute(sql, params) returns
-    a cursor with .fetchall()/.fetchone(), and rows support row["column"]
-    access via RealDictCursor. This lets every existing query in this file
-    work unchanged - only this class and init_db()'s schema needed to
-    change for the Postgres move."""
+_db_pool = None
+_db_pool_lock = threading.Lock()
 
-    def __init__(self, conn):
+
+def _get_pool():
+    """Lazily creates ONE small connection pool for the whole process,
+    shared by every Flask request thread and every background thread
+    (exit-check loop, volume refresh, prev-close loader, etc). Replaces
+    the old pattern of opening a brand-new psycopg2.connect() - a full
+    fresh TLS handshake to Neon - on every single call, which at the
+    exit-check loop's 5s cadence alone was ~17,000 fresh connections/day.
+    This is the fix for the Neon free-tier data-transfer cap being hit."""
+    global _db_pool
+    if _db_pool is None:
+        with _db_pool_lock:
+            if _db_pool is None:
+                if not DATABASE_URL:
+                    raise RuntimeError(
+                        "DATABASE_URL environment variable is not set - add your Neon "
+                        "connection string in Render's Environment settings."
+                    )
+                _db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=DATABASE_URL)
+    return _db_pool
+
+
+class PGConnWrapper:
+    """Makes a pooled psycopg2 connection usable the same way the rest of
+    this file already uses sqlite3 connections: conn.execute(sql, params)
+    returns a cursor with .fetchall()/.fetchone(), and rows support
+    row["column"] access via RealDictCursor. This lets every existing
+    query in this file work completely unchanged.
+
+    Unlike the old version, __exit__ returns the connection to the pool
+    (putconn) instead of closing it - the connection itself stays open
+    and gets reused by the next caller. If a query fails with a
+    connection-level error (e.g. Neon closed an idle connection
+    server-side), the broken connection is discarded from the pool
+    (close=True) instead of being handed back, so the next get_db() call
+    transparently gets a fresh, healthy one."""
+
+    def __init__(self, conn, pool):
         self._conn = conn
+        self._pool = pool
+        self._broken = False
 
     def execute(self, query, params=None):
         pg_query = query.replace("?", "%s")  # sqlite-style -> psycopg2-style
-        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(pg_query, params or ())
-        return cur
+        try:
+            cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute(pg_query, params or ())
+            return cur
+        except psycopg2.OperationalError:
+            self._broken = True
+            raise
 
     def commit(self):
         self._conn.commit()
@@ -428,23 +467,30 @@ class PGConnWrapper:
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            if exc_type is None:
+            if exc_type is None and not self._broken:
                 self._conn.commit()
             else:
-                self._conn.rollback()
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    self._broken = True
         finally:
-            self._conn.close()
+            if self._broken:
+                self._pool.putconn(self._conn, close=True)
+            else:
+                self._pool.putconn(self._conn)
         return False
 
 
 def get_db():
-    if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL environment variable is not set - add your Neon "
-            "connection string in Render's Environment settings."
-        )
-    conn = psycopg2.connect(DATABASE_URL)
-    return PGConnWrapper(conn)
+    """Pulls a connection from the shared pool (_get_pool()) instead of
+    opening a fresh one - this was the missing link: _get_pool() and the
+    pool-aware PGConnWrapper already existed, but this function was never
+    updated to actually use them, so every call still paid for a brand
+    new TLS handshake to Neon regardless."""
+    pool = _get_pool()
+    conn = pool.getconn()
+    return PGConnWrapper(conn, pool)
 
 
 def init_db():
@@ -4415,17 +4461,41 @@ _exit_check_thread_started = False
 _exit_check_lock = threading.Lock()
 
 
+def _is_market_hours_ist() -> bool:
+    """NSE trading hours, weekdays only. The exit-check loop and other
+    background polling only need to run while the market is actually
+    open - outside this window there are no new candles/ticks to react
+    to anyway. This is the other half of the Neon fix: the UptimeRobot
+    keep-alive now keeps the process running 24/7, so without this gate
+    the 5s loop below would hit Postgres all night and all weekend for
+    no reason."""
+    now_ist = datetime.utcnow() + IST_OFFSET
+    if now_ist.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    market_open = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    return market_open <= now_ist <= market_close
+
+
 def _exit_check_loop() -> None:
     """Runs for the life of the process on its own background thread,
-    calling run_paper_trade_check() on a short fixed cadence - this is
-    what makes every % based exit (the -2% stoploss included) a real
-    stop instead of one that only gets evaluated once a minute, and only
-    when a browser tab happens to be open. The frontend's own 60s poll
-    (in paper_trading.html / live_trading.html) still runs too, purely to
-    refresh what's on screen - this loop is what keeps the actual checking
-    tight in between, tab or no tab, as long as the server process is
-    alive. Never lets one bad check kill the loop."""
+    calling run_paper_trade_check() on a short fixed cadence DURING
+    MARKET HOURS ONLY - this is what makes every % based exit (the -2%
+    stoploss included) a real stop instead of one that only gets
+    evaluated once a minute, and only when a browser tab happens to be
+    open. The frontend's own 60s poll (in paper_trading.html /
+    live_trading.html) still runs too, purely to refresh what's on
+    screen - this loop is what keeps the actual checking tight in
+    between, tab or no tab, as long as the server process is alive.
+    Outside market hours (nights, weekends) it sleeps in long intervals
+    instead of hammering the DB every 5s for nothing - this plus the
+    connection-pool fix together address the Neon free-tier
+    data-transfer cap being hit. Never lets one bad check kill the loop."""
+    OFF_HOURS_SLEEP_SECONDS = 300  # check back every 5 min outside market hours
     while True:
+        if not _is_market_hours_ist():
+            time.sleep(OFF_HOURS_SLEEP_SECONDS)
+            continue
         try:
             run_paper_trade_check()
         except Exception as e:
