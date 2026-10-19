@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - Command Center</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: #131722;
+      --border: #1e222d;
+      --text: #e6e9f0;
+      --muted: #6b7280;
+      --green: #00c896;
+      --gold: #ffb800;
+      --red: #ff5370;
+      --cyan: #2dd4ff;
+    }
+    :root[data-theme="light-gray"] {
+      --bg: #e9ebee;
+      --panel: #ffffff;
+      --border: #d0d4da;
+      --text: #1a1d23;
+      --muted: #6b7280;
+      --green: #0e9f6e;
+      --gold: #b45309;
+      --red: #dc2626;
+      --cyan: #0891b2;
+    }
+    * { box-sizing: border-box; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Segoe UI', Arial, sans-serif;
+      margin: 0;
+      padding: 24px 32px 48px;
+    }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+
+    .tabbar { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin: 18px 0 20px; }
+    .tabbar a {
+      padding: 10px 14px; color: var(--muted); text-decoration: none;
+      font-size: 14px; border-bottom: 2px solid transparent;
+    }
+    .tabbar a.active { color: var(--text); border-bottom-color: var(--green); }
+    .tabbar a:hover { color: var(--text); }
+
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+    .stat-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+    .stat-card .label { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+    .stat-card .value { font-size: 22px; font-weight: 700; margin-top: 4px; }
+    .stat-card .value.pos { color: var(--green); }
+    .stat-card .value.cyan { color: var(--cyan); }
+    .stat-card .dot {
+      display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+      background: var(--green); margin-right: 6px; box-shadow: 0 0 6px var(--green);
+    }
+
+    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 24px; }
+    @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
+
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; }
+    .panel h3 { margin: 0 0 2px; font-size: 14px; font-weight: 600; }
+    .panel .panel-sub { font-size: 11px; color: var(--muted); margin-bottom: 12px; }
+
+    #chartBox { width: 100%; height: 340px; }
+
+    .side-stack { display: flex; flex-direction: column; gap: 16px; }
+    .mini-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+    .mini-row:last-child { border-bottom: none; }
+    .mini-row .name { color: var(--text); }
+    .mini-row .tag { font-size: 11px; padding: 2px 7px; border-radius: 4px; font-weight: 600; }
+    .tag.buy { background: rgba(0,200,150,0.15); color: var(--green); }
+    .tag.sell { background: rgba(255,83,112,0.15); color: var(--red); }
+    .tag.warn { background: rgba(255,184,0,0.15); color: var(--gold); }
+
+    /* Pipeline */
+    .pipeline-panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 22px 24px; }
+    .pipeline { display: flex; align-items: stretch; gap: 0; margin-top: 16px; }
+    .stage { flex: 1; display: flex; flex-direction: column; gap: 6px; position: relative; padding: 0 14px; }
+    .stage .num { font-size: 11px; color: var(--cyan); font-weight: 700; letter-spacing: 0.5px; }
+    .stage .node {
+      border: 1px solid var(--border); border-radius: 8px; background: #0e1320;
+      padding: 14px 14px 16px; margin-top: 6px;
+      box-shadow: 0 0 0 1px rgba(45,212,255,0.08);
+      transition: box-shadow 0.2s ease;
+    }
+    .stage .node:hover { box-shadow: 0 0 0 1px rgba(45,212,255,0.3), 0 0 18px rgba(45,212,255,0.12); }
+    .stage .node h4 { margin: 0 0 4px; font-size: 13px; font-weight: 600; }
+    .stage .node p { margin: 0; font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .connector {
+      flex: 0 0 28px; display: flex; align-items: center; justify-content: center;
+      position: relative; top: 26px;
+    }
+    .connector::before {
+      content: ""; width: 100%; height: 1px; background: linear-gradient(90deg, var(--cyan), rgba(45,212,255,0.2));
+    }
+    .connector::after {
+      content: "›"; position: absolute; color: var(--cyan); font-size: 16px; font-weight: 700;
+    }
+    @media (max-width: 1000px) {
+      .pipeline { flex-direction: column; }
+      .connector { display: none; }
+    }
+
+    .footnote { margin-top: 18px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 10px; }
+  </style>
+</head>
+<body>
+
+  <h2>Command Center <span style="color: var(--muted); font-weight: 400; font-size: 14px;">RTT v0.0</span></h2>
+  <div class="sub">From market signals to intelligent execution - a unified view of your existing engines</div>
+
+  <div class="tabbar">
+    <a href="/" class="{% if active_tab == 'dashboard' %}active{% endif %}">Dashboard</a>
+    <a href="/paper-trading" class="{% if active_tab == 'paper' %}active{% endif %}">Paper Trading</a>
+    <a href="/live-trading" class="{% if active_tab == 'live' %}active{% endif %}">Live Trading</a>
+    <a href="/stats" class="{% if active_tab == 'stats' %}active{% endif %}">Stats</a>
+    <a href="/websocket-stats" class="{% if active_tab == 'websocket_stats' %}active{% endif %}">WS Speed</a>
+    <a href="/command-center" class="{% if active_tab == 'command_center' %}active{% endif %}">Command Center</a>
+    <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
+  </div>
+
+  <div class="stats">
+    <div class="stat-card">
+      <div class="label">Market pulse</div>
+      <div class="value cyan"><span class="dot"></span>Live feed</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Open positions</div>
+      <div class="value">{{ open_count }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Volume strength</div>
+      <div class="value" style="font-size: 14px; color: var(--muted); font-weight: 500;">See panel &rarr;</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Risk engine</div>
+      <div class="value pos">Guard active</div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h3>Market Intelligence</h3>
+      <div class="panel-sub">Illustrative chart preview - not wired to live market data yet</div>
+      <div id="chartBox"></div>
+    </div>
+    <div class="side-stack">
+      <div class="panel">
+        <h3>Opportunity Radar</h3>
+        <div class="panel-sub">Preview layout - will read from your existing alert ranking once wired</div>
+        <div class="mini-row"><span class="name">RELIANCE</span><span class="tag buy">BUY</span></div>
+        <div class="mini-row"><span class="name">BAJFINANCE</span><span class="tag sell">SELL</span></div>
+        <div class="mini-row"><span class="name">TATASTEEL</span><span class="tag warn">WATCH</span></div>
+      </div>
+      <div class="panel">
+        <h3>Volume Strength</h3>
+        <div class="panel-sub">Green = continuation, gold = caution, red = exit signal</div>
+        <div class="mini-row"><span class="name">Trend continuation</span><span class="tag buy">STRONG</span></div>
+        <div class="mini-row"><span class="name">Caution zones</span><span class="tag warn">1</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="pipeline-panel">
+    <h3>AI Decision Pipeline</h3>
+    <div class="panel-sub">Existing strategy rules remain authoritative - this visualizes the flow, it does not replace it</div>
+    <div class="pipeline">
+      <div class="stage">
+        <div class="num">01 / SIGNAL</div>
+        <div class="node">
+          <h4>Chartink Alert</h4>
+          <p>Incoming Buy/Sell scan trigger from your webhook</p>
+        </div>
+      </div>
+      <div class="connector"></div>
+      <div class="stage">
+        <div class="num">02 / CONFIRM</div>
+        <div class="node">
+          <h4>Scanner Confirmation</h4>
+          <p>Multi-scan agreement and sector/volume checks</p>
+        </div>
+      </div>
+      <div class="connector"></div>
+      <div class="stage">
+        <div class="num">03 / RANK</div>
+        <div class="node">
+          <h4>Rajaram Score</h4>
+          <p>Opportunity ranking against your existing engine</p>
+        </div>
+      </div>
+      <div class="connector"></div>
+      <div class="stage">
+        <div class="num">04 / GATE</div>
+        <div class="node">
+          <h4>Risk Gate</h4>
+          <p>Trade permission - size, exposure, and safety checks</p>
+        </div>
+      </div>
+      <div class="connector"></div>
+      <div class="stage">
+        <div class="num">05 / EXECUTE</div>
+        <div class="node">
+          <h4>Execution</h4>
+          <p>Paper fill or live order via your broker integration</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footnote">
+    Conceptual layout preview. Chart and pipeline values shown are illustrative, not yet connected to your broker, database, or live feed.
+  </div>
+
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+  <script>
+    (function () {
+      const el = document.getElementById('chartBox');
+      if (!el || !window.LightweightCharts) return;
+
+      const isLight = document.documentElement.getAttribute('data-theme') === 'light-gray';
+      const chart = LightweightCharts.createChart(el, {
+        width: el.clientWidth,
+        height: 340,
+        layout: {
+          background: { color: 'transparent' },
+          textColor: isLight ? '#1a1d23' : '#9aa4b8',
+        },
+        grid: {
+          vertLines: { color: isLight ? '#e5e7eb' : '#1a1f2b' },
+          horzLines: { color: isLight ? '#e5e7eb' : '#1a1f2b' },
+        },
+        timeScale: { borderColor: '#1e222d' },
+        rightPriceScale: { borderColor: '#1e222d' },
+      });
+
+      const series = chart.addCandlestickSeries({
+        upColor: '#00c896', downColor: '#ff5370',
+        borderVisible: false, wickUpColor: '#00c896', wickDownColor: '#ff5370',
+      });
+
+      // Illustrative placeholder series - replace with a real candle fetch
+      // (e.g. your existing /api/chart/<symbol> endpoint) once approved.
+      let price = 24500;
+      const data = [];
+      const start = Math.floor(Date.now() / 1000) - 60 * 60 * 2;
+      for (let i = 0; i < 48; i++) {
+        const open = price;
+        const drift = (Math.random() - 0.48) * 40;
+        const close = open + drift;
+        const high = Math.max(open, close) + Math.random() * 15;
+        const low = Math.min(open, close) - Math.random() * 15;
+        data.push({ time: start + i * 150, open, high, low, close });
+        price = close;
+      }
+      series.setData(data);
+
+      window.addEventListener('resize', function () {
+        chart.applyOptions({ width: el.clientWidth });
+      });
+    })();
+  </script>
+</body>
+</html>

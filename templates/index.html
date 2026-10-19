@@ -544,6 +544,7 @@
     <a href="/live-trading" class="{% if active_tab == 'live' %}active{% endif %}">Live Trading</a>
     <a href="/stats" class="{% if active_tab == 'stats' %}active{% endif %}">Stats</a>
     <a href="/websocket-stats" class="{% if active_tab == 'websocket_stats' %}active{% endif %}">WS Speed</a>
+    <a href="/command-center" class="{% if active_tab == 'command_center' %}active{% endif %}">Command Center</a>
     <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
   </div>
 
@@ -958,9 +959,17 @@
       minP -= pad;
       maxP += pad;
 
-      const xForIndex = (i) => leftPad + (plotW * (i + 0.5)) / n;
+      // Spacing: the old layout stretched however many candles existed across the
+      // whole plot width, so early in the day (4-5 candles) each one sat in a
+      // ~150px slot with a 14px body - far apart. Now each candle gets at most
+      // MAX_SLOT px, with the candle and the gap about the same size, and the
+      // series starts at the left like a live chart. Once a full day of candles
+      // no longer fits at that spacing, it shrinks to fit exactly as before.
+      const MAX_SLOT = 26;
+      const slot = Math.min(plotW / n, MAX_SLOT);
+      const xForIndex = (i) => leftPad + slot * (i + 0.5);
       const yForPrice = (p) => topPad + plotH * (1 - (p - minP) / (maxP - minP));
-      const candleW = Math.max(2, Math.min(14, (plotW / n) * 0.6));
+      const candleW = Math.max(2, Math.min(14, slot * (slot >= MAX_SLOT ? 0.5 : 0.6)));
 
       // Y-axis gridlines + labels
       ctx.strokeStyle = "#1e222d";
@@ -1056,8 +1065,7 @@
       ctx.textAlign = "center";
       ctx.textBaseline = "top";
       ctx.font = "10px Arial";
-      const maxLabels = Math.floor(plotW / 60) || 1;
-      const step = Math.max(1, Math.ceil(n / maxLabels));
+      const step = Math.max(1, Math.ceil(60 / slot));   // keep time labels at least ~60px apart
       for (let i = 0; i < n; i += step) {
         ctx.fillText(labels[i] || "", xForIndex(i), cssHeight - bottomPad + 8);
       }
