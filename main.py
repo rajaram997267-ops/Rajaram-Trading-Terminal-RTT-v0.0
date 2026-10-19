@@ -7156,6 +7156,28 @@ def api_stats_breakdown():
     })
 
 
+@app.route("/command-center")
+def command_center_page():
+    """Preview page - the chart and AI pipeline panel are illustrative
+    (not wired to live data yet, clearly labeled as such in the template).
+    The open-trade count below is real, since it's a trivial, honest
+    query - everything else stays a labeled preview until approved."""
+    with get_db() as conn:
+        open_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM paper_trades WHERE status = 'OPEN'"
+        ).fetchone()["c"]
+    html = render_template(
+        "command_center.html",
+        active_tab="command_center",
+        open_count=open_count,
+    )
+    body = html.encode("utf-8")
+    response = make_response(body)
+    response.headers["Content-Type"] = "text/html; charset=utf-8"
+    response.headers["Content-Length"] = str(len(body))
+    return response
+
+
 @app.route("/settings")
 def settings_page():
     token_saved = bool(get_setting("upstox_access_token"))
