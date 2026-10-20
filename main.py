@@ -344,6 +344,34 @@ def ist_date_str(created_at_iso: str) -> str:
     return (dt + IST_OFFSET).strftime("%Y-%m-%d")
 
 
+# Every column the dashboard uses - deliberately NOT raw_payload. That column
+# holds the full Chartink webhook body, is never read after being saved, and
+# was being re-downloaded from Neon for up to 2,000 rows on every poll: the
+# main reason the 5 GB/month network-transfer allowance ran out.
+ALERT_COLS = "id, batch_id, symbol, trigger_price, scan_name, scan_url, alert_name, triggered_at, created_at"
+
+_ALERTS_CACHE_TTL = 4.0
+_alerts_api_cache: dict = {}   # selected_date -> (fetched_at, merged_alerts)
+
+
+def _alerts_for_ist_date(date_str: str) -> list[dict]:
+    """Only the alerts of ONE IST calendar day, filtered in SQL (created_at is
+    stored as UTC isoformat, so the IST day maps to a UTC range)."""
+    try:
+        day = datetime.strptime(date_str, "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return []
+    start = (day - IST_OFFSET).isoformat()
+    end = (day + timedelta(days=1) - IST_OFFSET).isoformat()
+    with get_db() as conn:
+        rows = conn.execute(
+            f"SELECT {ALERT_COLS} FROM alerts WHERE created_at >= ? AND created_at < ? "
+            "ORDER BY id DESC LIMIT 3000",
+            (start, end),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def categorize(alert: dict) -> str:
     """Group an alert into Sell / Buy / Others based on the scan name (and
     alert name as a fallback) Chartink assigned to it."""
@@ -1160,6 +1188,7 @@ def save_alert_batch(data: dict):
                 ),
             )
         conn.commit()
+    _alerts_api_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1598,13 +1627,16 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                         conn.commit()
 
                             else:
-                                result = place_live_order(option["instrument_key"], "BUY", live_quantity, access_token)
+                                result = place_live_order_checked(
+                                    option["instrument_key"], "BUY", live_quantity, access_token,
+                                    tag=f"rtt-{trade_id}-B",
+                                )
                                 if result["ok"]:
                                     # Fetch the REAL fill price - this is what
                                     # live P&L must be based on, not the
                                     # theoretical premium we used to size the
                                     # order (see get_order_average_price).
-                                    live_entry_price = get_order_average_price(result["order_id"], access_token)
+                                    live_entry_price = result.get("fill_price")  # None if still pending: loop retries it
 
                                     # Immediately place a broker-side SL (Stop-
                                     # Loss LIMIT) stop at -2% from the real fill
@@ -4071,6 +4103,7 @@ def place_live_order(
     order_type: str = "MARKET",
     trigger_price: float = 0.0,
     price: float = 0.0,
+    tag: str = "chartink-auto",
 ) -> dict:
     """Places a real order on Upstox: CNC (Delivery) product, DAY validity -
     matching the decisions for this app (live trading only ever goes long,
@@ -4100,7 +4133,7 @@ def place_live_order(
         "product": "D",  # CNC / Delivery
         "validity": "DAY",
         "price": price,  # ignored by Upstox for MARKET orders; required for SL/LIMIT
-        "tag": "chartink-auto",
+        "tag": tag,
         "instrument_token": instrument_key,
         "order_type": order_type,
         "transaction_type": transaction_type,  # "BUY" or "SELL"
@@ -4136,9 +4169,13 @@ def place_live_order(
             body_text = e.read().decode("utf-8", errors="replace")[:500]
         except Exception:
             body_text = ""
-        return {"ok": False, "error": f"HTTP {e.code}: {body_text}"}
+        # A 4xx is a definite rejection (broker answered, nothing placed). A
+        # 5xx may have been processed before the error - treat as ambiguous.
+        return {"ok": False, "error": f"HTTP {e.code}: {body_text}", "ambiguous": e.code >= 500}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        # Timeout / dropped connection: the order may or may not exist at the
+        # broker. Callers must NOT assume it failed - see place_live_order_checked.
+        return {"ok": False, "error": str(e), "ambiguous": True}
 
 
 def modify_order(
@@ -4411,17 +4448,114 @@ def cancel_gtt_order(gtt_order_id: str, access_token: str) -> bool:
         return False
 
 
+_DEAD_ORDER_STATES = ("rejected", "cancelled")
+
+
+def _order_dict(data) -> dict:
+    if isinstance(data, list):
+        data = data[-1] if data else None
+    return data if isinstance(data, dict) else {}
+
+
+def _order_state(data) -> str:
+    return str(_order_dict(data).get("status") or "").lower()
+
+
+def _fetch_order_book(access_token: str) -> list | None:
+    """Today's Upstox order book, or None if it could not be read."""
+    req = urllib.request.Request(
+        "https://api.upstox.com/v2/order/retrieve-all",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": BROWSER_USER_AGENT,
+        },
+    )
+    try:
+        opener = _get_order_proxy_opener()
+        opener_fn = opener.open if opener else urllib.request.urlopen
+        with opener_fn(req, timeout=10) as resp:
+            payload = json.loads(resp.read().decode())
+        data = payload.get("data")
+        return data if isinstance(data, list) else None
+    except Exception:
+        return None
+
+
+def _find_live_order(access_token: str, tag: str, side: str) -> tuple[bool, dict | None]:
+    """Looks for a not-rejected/cancelled order with this unique tag + side.
+    Returns (book_readable, order_or_None). book_readable False means we
+    could NOT tell - callers must not resend in that case."""
+    book = _fetch_order_book(access_token)
+    if book is None:
+        return False, None
+    live = [
+        o for o in book
+        if o.get("tag") == tag
+        and str(o.get("transaction_type", "")).upper() == side
+        and str(o.get("status", "")).lower() not in _DEAD_ORDER_STATES
+    ]
+    complete = [o for o in live if str(o.get("status", "")).lower() == "complete"]
+    return True, (complete[-1] if complete else (live[-1] if live else None))
+
+
+def _save_live_exit_order_id(trade_id: int, order_id: str | None) -> None:
+    if not order_id:
+        return
+    with get_db() as conn:
+        conn.execute("UPDATE paper_trades SET live_exit_order_id = ? WHERE id = ?", (order_id, trade_id))
+        conn.commit()
+
+
+def place_live_order_checked(instrument_key: str, side: str, quantity: int, access_token: str, tag: str) -> dict:
+    """place_live_order + the three safety checks a real-money order needs:
+      1. A timeout/5xx is reconciled against the order book by unique tag, so a
+         timed-out order that actually went through is found, not forgotten
+         (entry) or duplicated (exit).
+      2. After placement, the order status is polled; an order the broker
+         accepted and then rejected/cancelled returns ok=False.
+      3. If the book can't be read, returns unverified=True - never guesses.
+    Returns {"ok", "order_id", "fill_price", "complete", "pending", "unverified", "error"}."""
+    r = place_live_order(instrument_key, side, quantity, access_token, tag=tag)
+    order_id = r.get("order_id")
+    if not r["ok"]:
+        if not r.get("ambiguous"):
+            return {"ok": False, "error": r["error"]}
+        time.sleep(2)
+        readable, found = _find_live_order(access_token, tag, side)
+        if not readable:
+            return {"ok": False, "unverified": True,
+                    "error": f"{r['error']} - UNVERIFIED: could not read Upstox order book; "
+                             f"check it manually before retrying"}
+        if not found:
+            return {"ok": False, "error": f"{r['error']} (order book checked: no order was placed)"}
+        order_id = found.get("order_id")
+    for _ in range(5):
+        st = get_order_status(order_id, access_token)
+        d = _order_dict(st)
+        state = _order_state(st)
+        if state == "complete":
+            avg = d.get("average_price")
+            return {"ok": True, "order_id": order_id, "complete": True,
+                    "fill_price": float(avg) if avg else None}
+        if state in _DEAD_ORDER_STATES:
+            msg = d.get("status_message") or d.get("status_message_raw") or state
+            return {"ok": False, "order_id": order_id, "error": f"Order {order_id} {state} by broker: {msg}"}
+        time.sleep(1.2)
+    return {"ok": True, "order_id": order_id, "fill_price": None, "pending": True}
+
+
 def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[str | None, str | None, float | None]:
-    """If this paper trade has a live position open (live_status == 'OPEN'),
-    places the closing SELL order on Upstox for the EXACT option contract
-    that was bought at entry (live_instrument_key) - not a freshly
-    recomputed ATM strike, since the ATM strike at entry time is what's
-    actually held, regardless of where the underlying has moved since.
-    Returns (order_id, error, fill_price) - all None if there was no live
-    position to close, which is the normal case for any trade from before
-    live trading was turned on. fill_price is the REAL average price the
-    order executed at (fetched via get_order_average_price), not a
-    theoretical price - callers must use this for live P&L, not last_price."""
+    """Closes this trade's live option position with ONE SELL, safely.
+    Returns (order_id, error, fill_price). order_id is returned ONLY when the
+    SELL is confirmed complete at Upstox - callers mark the trade CLOSED on a
+    non-None order_id, so a pending/rejected SELL must come back as
+    (None, reason, None) and the trade stays OPEN.
+
+    Never double-sells: before sending, the order book is checked (by this
+    trade's unique SELL tag) for an exit order already working or filled -
+    including one from a timed-out earlier attempt or a previous process. If
+    the book can't be read, nothing is sent."""
     if trade.get("live_status") != "OPEN":
         return None, None, None
     if not access_token:
@@ -4431,29 +4565,41 @@ def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[
     if not instrument_key:
         return None, "No live_instrument_key recorded on this trade - could not close live position", None
 
-    # Pull the resting broker-side SL stop first, if one exists - a
-    # software-driven exit (trailing stop, target hit, manual close) and
-    # the SL firing on its own must never both go through, or the
-    # position gets double-sold. Best-effort: if the cancel fails because
-    # the SL already fired, the subsequent SELL below will simply fail
-    # or oversell-protect at the broker, and get picked up as an error.
+    tag = f"rtt-{trade['id']}-S"
+
+    readable, existing = _find_live_order(access_token, tag, "SELL")
+    if not readable:
+        return None, "Could not read Upstox order book to confirm no exit order is already working - not resending, will retry", None
+    if existing:
+        oid = existing.get("order_id")
+        if str(existing.get("status", "")).lower() == "complete":
+            avg = existing.get("average_price")
+            return oid, None, (float(avg) if avg else None)
+        _save_live_exit_order_id(trade["id"], oid)
+        return None, f"Exit order {oid} is still '{existing.get('status')}' at Upstox - not resending", None
+
+    # Pull the resting broker-side SL / GTT first so the two exit paths can
+    # never both fill. If the SL had already fired, that IS the exit.
     sl_order_id = trade.get("live_sl_order_id")
     if sl_order_id:
         cancel_order(sl_order_id, access_token)
+        sl_st = get_order_status(sl_order_id, access_token)
+        if _order_state(sl_st) == "complete":
+            avg = _order_dict(sl_st).get("average_price")
+            return sl_order_id, None, (float(avg) if avg else None)
 
-    # Same idea for GTT mode - pull the resting GTT (whose STOPLOSS leg
-    # is what would otherwise fire on its own) before placing our own
-    # software-driven closing order.
     gtt_order_id = trade.get("live_gtt_order_id")
     if gtt_order_id:
         cancel_gtt_order(gtt_order_id, access_token)
 
     qty = trade.get("live_quantity") or 1
-    result = place_live_order(instrument_key, "SELL", qty, access_token)
-    if result["ok"]:
-        fill_price = get_order_average_price(result["order_id"], access_token)
-        return result["order_id"], None, fill_price
-    return None, f"Failed to close live position: {result['error']}", None
+    r = place_live_order_checked(instrument_key, "SELL", qty, access_token, tag)
+    _save_live_exit_order_id(trade["id"], r.get("order_id"))
+    if r["ok"] and (r.get("complete") or r.get("fill_price")):
+        return r["order_id"], None, r.get("fill_price")
+    if r["ok"]:
+        return None, f"Exit order {r['order_id']} placed but fill not confirmed yet - will re-check", None
+    return None, f"Failed to close live position: {r['error']}", None
 
 
 EXIT_CHECK_INTERVAL_SECONDS = 5
@@ -5470,6 +5616,17 @@ def _run_paper_trade_check_impl() -> dict:
             live_camarilla_update = None
             live_fib_stage_update = None
 
+            # A SELL from an earlier pass may have been accepted but not yet
+            # filled when that pass ended. If it has filled since, record the
+            # close now (even if the exit rule no longer fires). If it is still
+            # working, never send another - _close_live_position_if_any refuses.
+            if trade["live_status"] == "OPEN" and trade["live_exit_order_id"]:
+                _px = get_order_status(trade["live_exit_order_id"], access_token)
+                if _order_state(_px) == "complete":
+                    live_exited = True
+                    live_exit_reason_val = trade["live_exit_reason"] or "Exit order filled (reconciled)"
+                    live_sl_fired_price = _order_dict(_px).get("average_price") or None
+
             # Check whether the resting SL stop already fired on its own
             # since the last pass - if so, the broker closed the position
             # for us; reconcile status instead of treating it as still open.
@@ -5934,23 +6091,21 @@ def index():
         if not selected_date:
             selected_date = today_str
 
+        # Date picker: distinct UTC hours (tiny) mapped to IST calendar dates,
+        # instead of downloading thousands of full alert rows.
         with get_db() as conn:
-            all_alerts = conn.execute(
-                "SELECT * FROM alerts ORDER BY id DESC LIMIT 2000"
+            hour_rows = conn.execute(
+                "SELECT DISTINCT SUBSTR(created_at, 1, 13) AS h FROM alerts ORDER BY h DESC LIMIT 800"
             ).fetchall()
-
-        # Group every stored alert by its IST calendar date, so "today" and
-        # past days both work correctly regardless of server (UTC) time.
         available_dates = sorted(
-            {ist_date_str(a["created_at"]) for a in all_alerts if a["created_at"]},
+            # An hour bucket can straddle IST midnight (UTC+5:30), so map both ends.
+            {ist_date_str(r["h"] + sfx) for r in hour_rows if r["h"] for sfx in (":00:00", ":59:59")} - {""},
             reverse=True,
         )
         if selected_date not in available_dates and available_dates:
             selected_date = available_dates[0]
 
-        alerts = [
-            dict(a) for a in all_alerts if ist_date_str(a["created_at"]) == selected_date
-        ]
+        alerts = _alerts_for_ist_date(selected_date)
         access_token = get_setting("upstox_access_token")
         prev_closes = _get_prev_closes(access_token) if access_token else {}
         for a in alerts:
@@ -6010,15 +6165,17 @@ def api_alerts():
     if not selected_date:
         selected_date = today_str
 
-    with get_db() as conn:
-        all_alerts = conn.execute(
-            "SELECT * FROM alerts ORDER BY id DESC LIMIT 2000"
-        ).fetchall()
-
-    alerts = [
-        dict(a) for a in all_alerts if ist_date_str(a["created_at"]) == selected_date
-    ]
-    access_token = get_setting("upstox_access_token")
+    hit = _alerts_api_cache.get(selected_date)
+    if hit and time.time() - hit[0] < _ALERTS_CACHE_TTL:
+        return jsonify(hit[1])
+    try:
+        alerts = _alerts_for_ist_date(selected_date)
+        access_token = get_setting("upstox_access_token")
+    except (psycopg2.Error, RuntimeError):
+        # Database unreachable: serve the last good copy rather than erroring.
+        if hit:
+            return jsonify(hit[1])
+        return jsonify({"error": "database unavailable"}), 503
     # Reuses the SAME prev-close cache the sector momentum filter already
     # maintains in the background - this costs nothing extra per alert.
     # No live price fetch happens here at all: the % shown is the
@@ -6056,6 +6213,7 @@ def api_alerts():
     _cat_pos = {name: i for i, name in enumerate(CATEGORY_ORDER)}
     merged_alerts.sort(key=lambda a: (_cat_pos.get(a.get("category"), len(_cat_pos)), _volume_rank(a)))
 
+    _alerts_api_cache[selected_date] = (time.time(), merged_alerts)
     return jsonify(merged_alerts)
 
 
@@ -8075,7 +8233,27 @@ def debug_profile():
         return jsonify({"ok": False, "error": str(e)})
 
 
-init_db()  # runs on import too, so gunicorn (used in production) creates the table
+def _init_db_with_retry() -> None:
+    delay = 5
+    while True:
+        try:
+            init_db()
+            print("[init_db] database ready")
+            return
+        except Exception as e:
+            print(f"[init_db] database unavailable ({e}); retrying in {delay}s")
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
+
+
+# Runs on import too (gunicorn). A Neon outage/quota error here used to crash
+# the import, so Render marked the deploy failed and the app never came up.
+# Now the app boots, and creating the tables keeps retrying in the background.
+try:
+    init_db()
+except Exception as _init_err:
+    print(f"[init_db] database unavailable at startup ({_init_err}); retrying in background")
+    threading.Thread(target=_init_db_with_retry, daemon=True, name="init-db-retry").start()
 ensure_exit_check_loop_started()  # same: starts on import, tab-independent from here on
 
 if __name__ == "__main__":
