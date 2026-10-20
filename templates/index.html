@@ -796,7 +796,7 @@
       }
     }
     refreshSectorPerf();
-    setInterval(refreshSectorPerf, 5000);
+    setInterval(() => { if (!document.hidden) refreshSectorPerf(); }, 60000);
 
     // Apply any filter already set as soon as the page loads.
     applyGlobalFilter();
@@ -806,8 +806,10 @@
     // list won't change, so there's no need to keep polling for it.
     async function refreshAlerts() {
       if (SELECTED_DATE !== TODAY_STR) return;
+      if (document.hidden) return;   // no polling from a background tab
       try {
         const res = await fetch("/api/alerts?date=" + encodeURIComponent(SELECTED_DATE));
+        if (!res.ok) return;         // e.g. database briefly unavailable: keep what's on screen
         const alerts = await res.json();
         const container = document.getElementById("alertsContainer");
         document.getElementById("dayCount").textContent = alerts.length;
@@ -827,7 +829,8 @@
         console.error("Refresh failed", err);
       }
     }
-    setInterval(refreshAlerts, 5000);
+    setInterval(refreshAlerts, 10000);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshAlerts(); });
 
     async function manualEnterAlert(id, symbol, category) {
       if (!confirm(`Manually enter a ${category} trade for ${symbol}? This only works if no trade is currently open.`)) {
