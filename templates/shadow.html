@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - Manual vs RSI</title>
+  <style>
+    :root { --bg:#0b0e14; --panel:#131722; --border:#1e222d; --text:#e6e9f0; --muted:#6b7280; --green:#00c896; --gold:#ffb800; --red:#ff5370; }
+    :root[data-theme="light-gray"] { --red:#dc2626; --bg:#e9ebee; --panel:#ffffff; --border:#d0d4da; --text:#1a1d23; --muted:#6b7280; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="sky-blue"] { --red:#dc2626; --bg:#eaf4fb; --panel:#ffffff; --border:#bfe0f2; --text:#10222c; --muted:#4a6572; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="off-white"] { --red:#dc2626; --bg:#f7f5f0; --panel:#ffffff; --border:#e2ddd2; --text:#1f1c16; --muted:#6b6455; --green:#0e9f6e; --gold:#b45309; }
+    * { box-sizing: border-box; }
+    body { font-family:'Segoe UI',Arial,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px 32px 48px; }
+    a { color: var(--green); }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .tabbar { display:flex; gap:4px; border-bottom:1px solid var(--border); margin:18px 0 20px; overflow-x:auto; }
+    .tabbar a { padding:10px 14px; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; white-space:nowrap; }
+    .tabbar a.active { color:var(--text); border-bottom-color:var(--green); }
+    .tabbar a:hover { color:var(--text); }
+    .cards { display:flex; gap:12px; flex-wrap:wrap; margin:0 0 18px; }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 14px; font-size:11px; color:var(--muted); text-transform:uppercase; }
+    .card b { display:block; font-size:20px; margin-top:4px; color:var(--text); text-transform:none; }
+    .wrap { overflow-x:auto; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
+    table { border-collapse:collapse; width:100%; font-size:12px; }
+    th, td { border-bottom:1px solid var(--border); padding:8px 10px; text-align:left; white-space:nowrap; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; }
+    tr:last-child td { border-bottom:none; }
+    .pos { color:var(--green); } .neg { color:var(--red); } .mut { color:var(--muted); }
+    .note { white-space:normal; min-width:220px; color:var(--muted); }
+    .foot { margin-top:14px; font-size:11px; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <h2 style="margin:0">Manual vs RSI <span style="color:var(--muted);font-weight:400;font-size:14px">RTT v0.0 &middot; {{ date }}</span></h2>
+  <div class="sub">Record-only log: for each "Manual exit" trade, when the RSI Simple Exit would have fired and what it would have booked. It never changes a trade.</div>
+
+  <div class="tabbar">
+    <a href="/">Dashboard</a>
+    <a href="/paper-trading">Paper Trading</a>
+    <a href="/live-trading">Live Trading</a>
+    <a href="/stats">Stats</a>
+    <a href="/websocket-stats">WS Speed</a>
+    <a href="/command-center">Command Center</a>
+    <a href="/settings">Settings</a>
+    <a href="/shadow" class="{% if active_tab == 'shadow' %}active{% endif %}">Manual vs RSI</a>
+  </div>
+
+  <div class="cards">
+    <div class="card">Trades logged<b>{{ s.trades_logged }}</b></div>
+    <div class="card">Comparable<b>{{ s.comparable }}</b></div>
+    <div class="card">Manual total<b>{{ s.manual_total }}</b></div>
+    <div class="card">RSI-rule total<b>{{ s.rsi_rule_total }}</b></div>
+    <div class="card">Rule minus manual<b class="{{ 'pos' if s.rsi_rule_minus_manual > 0 else 'neg' if s.rsi_rule_minus_manual < 0 else '' }}">{{ s.rsi_rule_minus_manual }}</b></div>
+    <div class="card">Rule better / manual better<b>{{ s.rule_better_count }} / {{ s.manual_better_count }}</b></div>
+  </div>
+
+  <div class="wrap"><table>
+    <tr><th>Symbol</th><th>Dir</th><th>Qty</th><th>Entry</th><th>Manual exit</th><th>Manual price</th><th>Manual P&amp;L</th>
+        <th>Rule fired</th><th>Rule time</th><th>Rule RSI</th><th>Rule price</th><th>Rule P&amp;L</th><th>Rule - manual</th>
+        <th>Option traded (min)</th><th>Basis / note</th><th>Final</th></tr>
+    {% for r in rows %}
+    <tr>
+      <td>{{ r.symbol }}</td><td>{{ r.direction }}</td><td>{{ r.quantity }}</td><td>{{ r.entry_price }}</td>
+      <td>{{ r.manual_exit_time }}</td><td>{{ r.manual_exit_price }}</td>
+      <td class="{{ 'pos' if (r.manual_pnl or 0) > 0 else 'neg' if (r.manual_pnl or 0) < 0 else '' }}">{{ r.manual_pnl }}</td>
+      <td>{{ 'yes' if r.rsi_fired == 1 else 'no' if r.rsi_fired == 0 else '-' }}</td>
+      <td>{{ r.rsi_fire_time or '-' }}</td>
+      <td>{{ '%.1f' % r.rsi_fire_value if r.rsi_fire_value is not none else '-' }}</td>
+      <td>{{ r.rsi_price if r.rsi_price is not none else '-' }}</td>
+      <td>{{ r.rsi_pnl if r.rsi_pnl is not none else '-' }}</td>
+      <td class="{{ 'pos' if (r.diff_pnl or 0) > 0 else 'neg' if (r.diff_pnl or 0) < 0 else '' }}">{{ r.diff_pnl if r.diff_pnl is not none else '-' }}</td>
+      <td>{{ r.option_minutes_traded if r.option_minutes_traded is not none else '-' }} / {{ r.minutes_held if r.minutes_held is not none else '-' }}</td>
+      <td class="note">{{ r.rsi_basis or '' }} {{ r.note }}</td>
+      <td>{{ 'yes' if r.final == 1 else 'no' }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="16" class="mut">No manual-exit trades logged for this date yet.</td></tr>
+    {% endfor %}
+  </table></div>
+
+  <div class="foot">
+    "Final: no" means the day is still running, so "held to HH:MM" uses the time you opened this page and the rule-vs-manual difference is not meaningful yet.
+    The log is completed automatically after 15:40 IST (Final: yes). &nbsp;
+    <a href="/shadow?date={{ date }}&refresh=1">Recompute now</a> (today only)
+  </div>
+</body>
+</html>
