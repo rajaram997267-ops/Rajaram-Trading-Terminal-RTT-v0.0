@@ -7316,24 +7316,41 @@ def api_stats_breakdown():
 
 @app.route("/command-center")
 def command_center_page():
-    """Preview page - the chart and AI pipeline panel are illustrative
-    (not wired to live data yet, clearly labeled as such in the template).
-    The open-trade count below is real, since it's a trivial, honest
-    query - everything else stays a labeled preview until approved."""
-    with get_db() as conn:
-        open_count = conn.execute(
-            "SELECT COUNT(*) AS c FROM paper_trades WHERE status = 'OPEN'"
-        ).fetchone()["c"]
-    html = render_template(
-        "command_center.html",
-        active_tab="command_center",
-        open_count=open_count,
-    )
+    """Page shell only - every number on it is filled in by the browser from
+    /api/command-center and /api/alerts (live, refreshed every 15s)."""
+    html = render_template("command_center.html", active_tab="command_center")
     body = html.encode("utf-8")
     response = make_response(body)
     response.headers["Content-Type"] = "text/html; charset=utf-8"
     response.headers["Content-Length"] = str(len(body))
     return response
+
+
+@app.route("/api/command-center")
+def api_command_center():
+    """Small, cheap snapshot for the Command Center tiles: two COUNT queries
+    plus cached settings. Alerts/volume come from /api/alerts (4s cache)."""
+    try:
+        with get_db() as conn:
+            paper_open = conn.execute(
+                "SELECT COUNT(*) AS c FROM paper_trades WHERE status = 'OPEN'"
+            ).fetchone()["c"]
+            live_open = conn.execute(
+                "SELECT COUNT(*) AS c FROM paper_trades WHERE live_status = 'OPEN'"
+            ).fetchone()["c"]
+        return jsonify({
+            "in_session_hours": _is_market_hours_ist(),
+            "ist_time": (datetime.utcnow() + IST_OFFSET).strftime("%H:%M"),
+            "paper_open": paper_open,
+            "live_open": live_open,
+            "live_enabled": get_live_trading_enabled(),
+            "token_set": bool(get_setting("upstox_access_token")),
+            "volume_entry": get_volume_entry_enabled(),
+            "volume_exit": get_volume_exit_enabled(),
+            "auto_exit_time": get_auto_exit_time(),
+        })
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
 
 
 @app.route("/settings")
