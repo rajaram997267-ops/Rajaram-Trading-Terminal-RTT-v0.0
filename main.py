@@ -7653,36 +7653,6 @@ def api_diag_equal_price_exits():
     return jsonify({"date": date_str, "count": len(out), "trades": out})
 
 
-_SHADOW_PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RTT - Manual vs RSI rule</title><style>
-body{background:#0b0e14;color:#e6e9f0;font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:20px 24px}
-a{color:#2dd4ff}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px solid #1e222d;padding:6px 8px;text-align:left;white-space:nowrap}
-th{color:#6b7280;font-size:11px;text-transform:uppercase}.pos{color:#00c896}.neg{color:#ff5370}.mut{color:#6b7280}
-.cards{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}.card{background:#131722;border:1px solid #1e222d;border-radius:8px;padding:10px 14px}
-.card b{display:block;font-size:20px;margin-top:2px}.wrap{overflow-x:auto}</style></head><body>
-<h2 style="margin:0">Manual exit vs RSI rule <span class="mut" style="font-size:13px;font-weight:400">{{ date }}</span></h2>
-<div class="mut" style="font-size:12px;margin-top:4px">Record-only log. For each "Manual exit" trade: when the RSI Simple Exit would have fired and what it would have booked.
-<a href="/">Dashboard</a> &middot; <a href="/paper-trading">Paper</a> &middot; <a href="?date={{ date }}&refresh=1">recompute now</a></div>
-<div class="cards">
-<div class="card">Trades logged<b>{{ s.trades_logged }}</b></div>
-<div class="card">Comparable<b>{{ s.comparable }}</b></div>
-<div class="card">Manual total<b>{{ s.manual_total }}</b></div>
-<div class="card">RSI-rule total<b>{{ s.rsi_rule_total }}</b></div>
-<div class="card">Rule minus manual<b class="{{ 'pos' if s.rsi_rule_minus_manual > 0 else 'neg' }}">{{ s.rsi_rule_minus_manual }}</b></div>
-<div class="card">Rule better / manual better<b>{{ s.rule_better_count }} / {{ s.manual_better_count }}</b></div></div>
-<div class="wrap"><table><tr><th>Symbol</th><th>Dir</th><th>Qty</th><th>Entry</th><th>Manual exit</th><th>Manual price</th><th>Manual P&amp;L</th>
-<th>Rule fired</th><th>Rule time</th><th>Rule RSI</th><th>Rule price</th><th>Rule P&amp;L</th><th>Rule - manual</th><th>Opt traded (min)</th><th>Basis / note</th><th>Final</th></tr>
-{% for r in rows %}<tr><td>{{ r.symbol }}</td><td>{{ r.direction }}</td><td>{{ r.quantity }}</td><td>{{ r.entry_price }}</td><td>{{ r.manual_exit_time }}</td><td>{{ r.manual_exit_price }}</td>
-<td class="{{ 'pos' if (r.manual_pnl or 0) > 0 else 'neg' if (r.manual_pnl or 0) < 0 else '' }}">{{ r.manual_pnl }}</td>
-<td>{{ 'yes' if r.rsi_fired == 1 else 'no' if r.rsi_fired == 0 else '-' }}</td><td>{{ r.rsi_fire_time or '-' }}</td><td>{{ '%.1f' % r.rsi_fire_value if r.rsi_fire_value is not none else '-' }}</td>
-<td>{{ r.rsi_price if r.rsi_price is not none else '-' }}</td><td>{{ r.rsi_pnl if r.rsi_pnl is not none else '-' }}</td>
-<td class="{{ 'pos' if (r.diff_pnl or 0) > 0 else 'neg' if (r.diff_pnl or 0) < 0 else '' }}">{{ r.diff_pnl if r.diff_pnl is not none else '-' }}</td>
-<td>{{ r.option_minutes_traded if r.option_minutes_traded is not none else '-' }} / {{ r.minutes_held if r.minutes_held is not none else '-' }}</td>
-<td class="mut" style="white-space:normal">{{ r.rsi_basis or '' }} {{ r.note }}</td><td>{{ 'yes' if r.final == 1 else 'no' }}</td></tr>
-{% else %}<tr><td colspan="16" class="mut">No manual-exit trades logged for this date yet. The log fills automatically after 15:40 IST, or use "recompute now" (today only).</td></tr>{% endfor %}
-</table></div></body></html>"""
-
-
 @app.route("/shadow")
 def shadow_page():
     date_str = request.args.get("date") or (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
@@ -7694,7 +7664,7 @@ def shadow_page():
         rows, summary = _shadow_rows(date_str)
     except (psycopg2.Error, RuntimeError):
         return "Database unavailable", 503
-    return render_template_string(_SHADOW_PAGE, date=date_str, rows=rows, s=summary)
+    return render_template("shadow.html", active_tab="shadow", date=date_str, rows=rows, s=summary)
 
 
 @app.route("/settings")
