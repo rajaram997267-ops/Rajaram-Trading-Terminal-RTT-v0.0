@@ -56,12 +56,12 @@
   </div>
 
   <div class="wrap"><table>
-    <tr><th>Symbol</th><th>Dir</th><th>Qty</th><th>Entry</th><th>Manual exit</th><th>Manual price</th><th>Manual P&amp;L</th>
+    <tr><th>Symbol</th><th>Strategy</th><th>Dir</th><th>Qty</th><th>Entry</th><th>Manual exit</th><th>Manual price</th><th>Manual P&amp;L</th>
         <th>Rule fired</th><th>Rule time</th><th>Rule RSI</th><th>Rule price</th><th>Rule P&amp;L</th><th>Rule - manual</th>
         <th>Option traded (min)</th><th>Basis / note</th><th>Final</th></tr>
     {% for r in rows %}
     <tr>
-      <td>{{ r.symbol }}</td><td>{{ r.direction }}</td><td>{{ r.quantity }}</td><td>{{ r.entry_price }}</td>
+      <td>{{ r.symbol }}</td><td>{{ r.strategy or '-' }}</td><td>{{ r.direction }}</td><td>{{ r.quantity }}</td><td>{{ r.entry_price }}</td>
       <td>{{ r.manual_exit_time }}</td><td>{{ r.manual_exit_price }}</td>
       <td class="{{ 'pos' if (r.manual_pnl or 0) > 0 else 'neg' if (r.manual_pnl or 0) < 0 else '' }}">{{ r.manual_pnl }}</td>
       <td>{{ 'yes' if r.rsi_fired == 1 else 'no' if r.rsi_fired == 0 else '-' }}</td>
@@ -75,7 +75,7 @@
       <td>{{ 'yes' if r.final == 1 else 'no' }}</td>
     </tr>
     {% else %}
-    <tr><td colspan="16" class="mut">No manual-exit trades logged for this date yet.</td></tr>
+    <tr><td colspan="17" class="mut">No manual-exit trades logged for this date yet.</td></tr>
     {% endfor %}
   </table></div>
 
