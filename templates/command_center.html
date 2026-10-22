@@ -103,6 +103,17 @@
       .connector { display: none; }
     }
 
+    .stat-card .value.sm { font-size: 16px; line-height: 1.3; }
+    .stat-card .value.warn { color: var(--gold); }
+    .stat-card .value.neg { color: var(--red); }
+    .stat-card .subtext { font-size: 11px; color: var(--muted); margin-top: 6px; }
+    .mini-row .name.click { cursor: pointer; }
+    .mini-row .name.click:hover { color: var(--cyan); }
+    .mini-row .pct { color: var(--muted); font-size: 11px; margin-left: 8px; }
+    .tag.mute { background: rgba(107,114,128,0.15); color: var(--muted); }
+    .tags { display: flex; gap: 6px; }
+    .empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+    #chartMsg { color: var(--muted); font-size: 12px; padding: 6px 0; min-height: 18px; }
     .footnote { margin-top: 18px; font-size: 11px; color: var(--muted); border-top: 1px solid var(--border); padding-top: 10px; }
   </style>
 </head>
@@ -123,42 +134,44 @@
 
   <div class="stats">
     <div class="stat-card">
-      <div class="label">Market pulse</div>
-      <div class="value cyan"><span class="dot"></span>Live feed</div>
+      <div class="label">Session</div>
+      <div class="value sm cyan" id="tilePulse"><span class="dot"></span>Loading...</div>
+      <div class="subtext" id="tilePulseSub">&nbsp;</div>
     </div>
     <div class="stat-card">
       <div class="label">Open positions</div>
-      <div class="value">{{ open_count }}</div>
+      <div class="value" id="tileOpen">-</div>
+      <div class="subtext" id="tileOpenSub">&nbsp;</div>
     </div>
     <div class="stat-card">
       <div class="label">Volume strength</div>
-      <div class="value" style="font-size: 14px; color: var(--muted); font-weight: 500;">See panel &rarr;</div>
+      <div class="value" id="tileVol">-</div>
+      <div class="subtext" id="tileVolSub">&nbsp;</div>
     </div>
     <div class="stat-card">
       <div class="label">Risk engine</div>
-      <div class="value pos">Guard active</div>
+      <div class="value sm" id="tileRisk">-</div>
+      <div class="subtext" id="tileRiskSub">&nbsp;</div>
     </div>
   </div>
 
   <div class="grid">
     <div class="panel">
-      <h3>Market Intelligence</h3>
-      <div class="panel-sub">Illustrative chart preview - not wired to live market data yet</div>
+      <h3>Market Intelligence <span id="chartSym" style="color: var(--muted); font-weight: 400; font-size: 13px;"></span></h3>
+      <div class="panel-sub">Live 5-min candles with EMA5 and previous-day high/low. Click a symbol in Opportunity Radar to load one.</div>
+      <div id="chartMsg">No symbol selected yet.</div>
       <div id="chartBox"></div>
     </div>
     <div class="side-stack">
       <div class="panel">
         <h3>Opportunity Radar</h3>
-        <div class="panel-sub">Preview layout - will read from your existing alert ranking once wired</div>
-        <div class="mini-row"><span class="name">RELIANCE</span><span class="tag buy">BUY</span></div>
-        <div class="mini-row"><span class="name">BAJFINANCE</span><span class="tag sell">SELL</span></div>
-        <div class="mini-row"><span class="name">TATASTEEL</span><span class="tag warn">WATCH</span></div>
+        <div class="panel-sub">Today's Buy/Sell alerts, strongest volume first</div>
+        <div id="radar"><div class="empty">Loading...</div></div>
       </div>
       <div class="panel">
         <h3>Volume Strength</h3>
-        <div class="panel-sub">Green = continuation, gold = caution, red = exit signal</div>
-        <div class="mini-row"><span class="name">Trend continuation</span><span class="tag buy">STRONG</span></div>
-        <div class="mini-row"><span class="name">Caution zones</span><span class="tag warn">1</span></div>
+        <div class="panel-sub">Today's Buy/Sell alerts by current volume reading</div>
+        <div id="volPanel"><div class="empty">Loading...</div></div>
       </div>
     </div>
   </div>
@@ -210,54 +223,128 @@
   </div>
 
   <div class="footnote">
-    Conceptual layout preview. Chart and pipeline values shown are illustrative, not yet connected to your broker, database, or live feed.
+    Tiles, radar and volume panel update from your database every 15 seconds (paused in a background tab). The chart loads only when you click a symbol. The pipeline diagram above is a conceptual flow, not live state. "Session" reflects Mon-Fri trading hours and does not know exchange holidays.
   </div>
 
   <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
   <script>
     (function () {
-      const el = document.getElementById('chartBox');
-      if (!el || !window.LightweightCharts) return;
+      const $ = (id) => document.getElementById(id);
+      const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+      const volLabel = (a) => (a.volume && a.volume.label) || null;
+      const volRank = (a) => ({ Strong: 0, Moderate: 1, Weak: 3 }[volLabel(a)] ?? 2);
+      const volClass = (l) => ({ Strong: 'buy', Moderate: 'warn', Weak: 'sell' }[l] || 'mute');
 
-      const isLight = document.documentElement.getAttribute('data-theme') === 'light-gray';
-      const chart = LightweightCharts.createChart(el, {
-        width: el.clientWidth,
-        height: 340,
-        layout: {
-          background: { color: 'transparent' },
-          textColor: isLight ? '#1a1d23' : '#9aa4b8',
-        },
-        grid: {
-          vertLines: { color: isLight ? '#e5e7eb' : '#1a1f2b' },
-          horzLines: { color: isLight ? '#e5e7eb' : '#1a1f2b' },
-        },
-        timeScale: { borderColor: '#1e222d' },
-        rightPriceScale: { borderColor: '#1e222d' },
-      });
+      // ---------- tiles + panels ----------
+      function renderStatus(d) {
+        const pulse = $('tilePulse');
+        pulse.className = 'value sm ' + (d.in_session_hours ? 'cyan' : '');
+        pulse.innerHTML = '<span class="dot"></span>' + (d.in_session_hours ? 'In session hours' : 'Outside session hours');
+        $('tilePulseSub').textContent = 'IST ' + d.ist_time;
 
-      const series = chart.addCandlestickSeries({
-        upColor: '#00c896', downColor: '#ff5370',
-        borderVisible: false, wickUpColor: '#00c896', wickDownColor: '#ff5370',
-      });
+        $('tileOpen').textContent = d.paper_open;
+        $('tileOpenSub').textContent = 'Paper ' + d.paper_open + ' \u00b7 Live ' + d.live_open;
 
-      // Illustrative placeholder series - replace with a real candle fetch
-      // (e.g. your existing /api/chart/<symbol> endpoint) once approved.
-      let price = 24500;
-      const data = [];
-      const start = Math.floor(Date.now() / 1000) - 60 * 60 * 2;
-      for (let i = 0; i < 48; i++) {
-        const open = price;
-        const drift = (Math.random() - 0.48) * 40;
-        const close = open + drift;
-        const high = Math.max(open, close) + Math.random() * 15;
-        const low = Math.min(open, close) - Math.random() * 15;
-        data.push({ time: start + i * 150, open, high, low, close });
-        price = close;
+        const risk = $('tileRisk');
+        if (d.live_enabled && !d.token_set) {
+          risk.className = 'value sm neg'; risk.textContent = 'Live ON - no Upstox token!';
+        } else if (d.live_enabled) {
+          risk.className = 'value sm warn'; risk.textContent = 'Live trading ON';
+        } else {
+          risk.className = 'value sm pos'; risk.textContent = 'Live OFF (paper only)';
+        }
+        $('tileRiskSub').textContent = 'Vol entry ' + (d.volume_entry ? 'ON' : 'off') +
+          ' \u00b7 Vol exit ' + (d.volume_exit ? 'ON' : 'off') +
+          ' \u00b7 Auto-exit ' + (d.auto_exit_time || 'off');
       }
-      series.setData(data);
 
-      window.addEventListener('resize', function () {
-        chart.applyOptions({ width: el.clientWidth });
+      function renderAlerts(alerts) {
+        const dirs = (alerts || []).filter((a) => a.category === 'Buy' || a.category === 'Sell');
+        const seen = new Set();
+        const uniq = dirs.filter((a) => { const k = a.symbol + '|' + a.category; if (seen.has(k)) return false; seen.add(k); return true; });
+        uniq.sort((x, y) => volRank(x) - volRank(y));
+
+        const counts = { Strong: 0, Moderate: 0, Weak: 0, none: 0 };
+        uniq.forEach((a) => { counts[volLabel(a) || 'none']++; });
+        $('tileVol').textContent = counts.Strong + ' Strong';
+        $('tileVolSub').textContent = 'of ' + uniq.length + ' Buy/Sell alerts today';
+
+        const radar = $('radar');
+        if (!uniq.length) {
+          radar.innerHTML = '<div class="empty">No Buy/Sell alerts yet today.</div>';
+        } else {
+          radar.innerHTML = uniq.slice(0, 8).map((a) => {
+            const l = volLabel(a);
+            const pct = a.pct_change_today == null ? '' : '<span class="pct">' + (a.pct_change_today > 0 ? '+' : '') + a.pct_change_today + '%</span>';
+            return '<div class="mini-row"><span><span class="name click" data-sym="' + esc(a.symbol) + '" data-dir="' + esc(a.category) + '">' + esc(a.symbol) + '</span>' + pct + '</span>' +
+              '<span class="tags"><span class="tag ' + (a.category === 'Buy' ? 'buy' : 'sell') + '">' + a.category.toUpperCase() + '</span>' +
+              '<span class="tag ' + volClass(l) + '">' + (l ? esc(l).toUpperCase() : 'NO READING') + '</span></span></div>';
+          }).join('');
+        }
+
+        $('volPanel').innerHTML =
+          '<div class="mini-row"><span class="name">Strong (continuation)</span><span class="tag buy">' + counts.Strong + '</span></div>' +
+          '<div class="mini-row"><span class="name">Moderate (caution)</span><span class="tag warn">' + counts.Moderate + '</span></div>' +
+          '<div class="mini-row"><span class="name">Weak (exit signal)</span><span class="tag sell">' + counts.Weak + '</span></div>' +
+          '<div class="mini-row"><span class="name">No reading yet</span><span class="tag mute">' + counts.none + '</span></div>';
+      }
+
+      async function refresh() {
+        if (document.hidden) return;
+        try {
+          const [rs, ra] = await Promise.all([fetch('/api/command-center'), fetch('/api/alerts')]);
+          if (rs.ok) renderStatus(await rs.json());
+          if (ra.ok) renderAlerts(await ra.json());
+        } catch (e) { /* keep what is on screen */ }
+      }
+      refresh();
+      setInterval(refresh, 15000);
+      document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+
+      // ---------- chart (loaded on click only) ----------
+      let chart = null, candles = null, ema = null, lines = [];
+      function ensureChart() {
+        if (chart || !window.LightweightCharts) return !!chart;
+        const el = $('chartBox');
+        const isLight = document.documentElement.getAttribute('data-theme') === 'light-gray';
+        chart = LightweightCharts.createChart(el, {
+          width: el.clientWidth, height: 340,
+          layout: { background: { color: 'transparent' }, textColor: isLight ? '#1a1d23' : '#9aa4b8' },
+          grid: { vertLines: { color: isLight ? '#e5e7eb' : '#1a1f2b' }, horzLines: { color: isLight ? '#e5e7eb' : '#1a1f2b' } },
+          timeScale: { borderColor: '#1e222d', timeVisible: true, secondsVisible: false },
+          rightPriceScale: { borderColor: '#1e222d' },
+        });
+        candles = chart.addCandlestickSeries({ upColor: '#00c896', downColor: '#ff5370', borderVisible: false, wickUpColor: '#00c896', wickDownColor: '#ff5370' });
+        ema = chart.addLineSeries({ color: '#2dd4ff', lineWidth: 2, priceLineVisible: false });
+        window.addEventListener('resize', () => chart.applyOptions({ width: el.clientWidth }));
+        return true;
+      }
+      // Labels are IST "HH:MM". Encode them as if UTC so the axis shows IST wall-clock.
+      function toTime(label) {
+        const n = new Date(Date.now() + 5.5 * 3600 * 1000);
+        const [h, m] = label.split(':').map(Number);
+        return Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate(), h, m) / 1000;
+      }
+      async function loadChart(sym, dir) {
+        $('chartSym').textContent = '\u00b7 ' + sym + ' (' + dir + ')';
+        $('chartMsg').textContent = 'Loading ' + sym + '...';
+        try {
+          const res = await fetch('/api/chart/' + encodeURIComponent(sym) + '?direction=' + encodeURIComponent(dir));
+          const d = await res.json();
+          if (!res.ok || d.status !== 'ok') { $('chartMsg').textContent = d.message || 'Chart unavailable.'; return; }
+          if (!ensureChart()) { $('chartMsg').textContent = 'Chart library failed to load.'; return; }
+          candles.setData(d.ohlc.map((c, i) => ({ time: toTime(d.labels[i]), open: c.o, high: c.h, low: c.l, close: c.c })));
+          ema.setData(d.ema.map((v, i) => (v == null ? null : { time: toTime(d.labels[i]), value: v })).filter(Boolean));
+          lines.forEach((l) => candles.removePriceLine(l)); lines = [];
+          if (d.prev_day_high) lines.push(candles.createPriceLine({ price: d.prev_day_high, color: '#ffb800', lineStyle: 2, title: 'PDH' }));
+          if (d.prev_day_low) lines.push(candles.createPriceLine({ price: d.prev_day_low, color: '#ffb800', lineStyle: 2, title: 'PDL' }));
+          chart.timeScale().fitContent();
+          $('chartMsg').textContent = d.ema_label + ' (cyan), PDH/PDL (gold dashed)';
+        } catch (e) { $('chartMsg').textContent = 'Chart request failed.'; }
+      }
+      $('radar').addEventListener('click', (ev) => {
+        const n = ev.target.closest('.name.click');
+        if (n) loadChart(n.dataset.sym, n.dataset.dir);
       });
     })();
   </script>
