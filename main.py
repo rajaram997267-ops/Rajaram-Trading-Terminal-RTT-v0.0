@@ -7660,9 +7660,17 @@ def api_diag_equal_price_exits():
             held = [r for r in rows if e_ist <= _to_naive_ist(r[0]) < x_ist]
             item["minutes_held"] = int((x_ist - e_ist).total_seconds() // 60)
             item["minutes_option_traded"] = len(held)
-            item["prices_seen_while_held"] = sorted({r[4] for r in held})[:10]
-            item["verdict"] = ("option did not trade while held - price was the stale last-traded price"
-                               if not held else "option DID trade - exit price should have moved; investigate")
+            item["volume_while_held"] = sum((r[5] or 0) for r in held)
+            lo = min((r[3] for r in held), default=None)
+            hi = max((r[2] for r in held), default=None)
+            item["price_range_while_held"] = [lo, hi]
+            if not held:
+                item["verdict"] = "option did not trade while held - exit used the stale last-traded price"
+            elif lo == hi == t["entry_price"]:
+                item["verdict"] = ("option traded but every print (high/low/close) stayed at the entry price - "
+                                   "thin, sticky market; exit==entry is genuine but the price is not reliable")
+            else:
+                item["verdict"] = "option traded at different prices while held - exit price should have moved; investigate"
         except Exception as e:
             item["verdict"] = f"could not check: {type(e).__name__}"
         out.append(item)
