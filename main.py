@@ -22,7 +22,7 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 
-from flask import Flask, jsonify, render_template, request, redirect, url_for, make_response
+from flask import Flask, jsonify, render_template, render_template_string, request, redirect, url_for, make_response
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
@@ -544,6 +544,21 @@ def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rsi_shadow (
+                trade_id INTEGER PRIMARY KEY,
+                trade_date TEXT, symbol TEXT, direction TEXT,
+                quantity INTEGER, entry_price DOUBLE PRECISION,
+                manual_exit_time TEXT, manual_exit_price DOUBLE PRECISION, manual_pnl DOUBLE PRECISION,
+                rsi_fired INTEGER, rsi_fire_time TEXT, rsi_fire_value DOUBLE PRECISION,
+                rsi_price DOUBLE PRECISION, rsi_pnl DOUBLE PRECISION, rsi_basis TEXT,
+                diff_pnl DOUBLE PRECISION,
+                option_minutes_traded INTEGER, minutes_held INTEGER,
+                note TEXT, final INTEGER DEFAULT 0, computed_at TEXT
             )
             """
         )
@@ -1351,37 +1366,20 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                 return False, f"POC filter rejected this entry: {poc_reason}"  # doesn't qualify - skip this alert entirely, no paper or live trade
             entry_reason = poc_reason
     else:
-        capital = get_current_capital()
-        quantity = int(capital // price_val) or 1
-        entry_price = price_val
+        # No equity fallback: if the option can't be traded, the alert is
+        # skipped entirely - no paper trade and (because live is only ever
+        # placed after a paper trade opens) no live order either.
         if not access_token:
-            fallback_note = "No Upstox token saved - fell back to equity paper trading"
+            skip_reason = "No Upstox token saved - entry skipped (equity entries are disabled)"
         elif not option:
-            fallback_note = f"No {opt_type} option chain data for {symbol} - fell back to equity paper trading"
+            skip_reason = (f"No {opt_type} contract available for {symbol} on the target expiry "
+                           f"- entry skipped (equity entries are disabled)")
         else:
-            fallback_note = f"Could not fetch option premium for {symbol} {opt_type} - fell back to equity paper trading"
-        # This used to only ever live in last_error, which the exit-check
-        # loop clears to NULL on the very first successful poll (every
-        # ~5s) - meaning the reason a trade fell back to equity was
-        # already unrecoverable within seconds, long before anyone got a
-        # chance to look. Baking a short version directly into
-        # paper_option_label instead means it survives for the life of
-        # the trade and shows up in the exact same column the closed-
-        # trades table already displays - no separate lookup needed to
-        # notice an equity-fallback trade ever again.
-        fallback_short = {
-            "No Upstox token saved - fell back to equity paper trading": "no token",
-            f"No {opt_type} option chain data for {symbol} - fell back to equity paper trading": "no option chain data",
-            f"Could not fetch option premium for {symbol} {opt_type} - fell back to equity paper trading": "premium fetch failed",
-        }[fallback_note]
-        if fallback_short == "premium fetch failed" and option:
-            # Say WHY (HTTP 429 = rate limit, empty price = contract hasn't
-            # traded, timeout...) - the one thing that was missing for
-            # telling a rate-limit problem from an illiquid contract.
-            _why = _ltp_last_failure.get(option["instrument_key"])
-            if _why:
-                fallback_short = f"premium fetch failed - {_why}"
-        paper_option_label = f"EQUITY (option fallback: {fallback_short})"
+            _why = _ltp_last_failure.get(option["instrument_key"]) or "no price"
+            skip_reason = (f"Could not fetch option premium for {symbol} {opt_type} ({_why}) "
+                           f"- entry skipped (equity entries are disabled)")
+        print(f"[entry-skip] {symbol} {category}: {skip_reason}")
+        return False, skip_reason
 
     now = datetime.utcnow().isoformat()
     entry_strategy = get_exit_strategy()
@@ -2245,7 +2243,7 @@ def get_atm_option(symbol: str, opt_type: str, reference_price: float) -> dict |
         prev_monthly = all_monthlies[idx - 1] if idx > 0 else None
         next_monthly = all_monthlies[idx + 1] if idx + 1 < len(all_monthlies) else None
 
-        if next_monthly:
+        if nearest_monthly:
             nearest_date = datetime.strptime(nearest_monthly, "%Y-%m-%d").date()
             if prev_monthly:
                 cycle_start = datetime.strptime(prev_monthly, "%Y-%m-%d").date() + timedelta(days=1)
@@ -2260,6 +2258,10 @@ def get_atm_option(symbol: str, opt_type: str, reference_price: float) -> dict |
             trading_days_remaining = _count_weekdays_inclusive(today_date, nearest_date)
 
             if total_trading_days > 0 and trading_days_remaining <= total_trading_days / 2:
+                if not next_monthly:
+                    # The next-month contract is wanted but this stock has none
+                    # listed: skip it - never fall back to the near-month.
+                    return None
                 target_expiry = next_monthly
 
     candidates = [c for c in contracts if c["expiry"] == target_expiry and c["opt_type"] == opt_type]
@@ -7353,6 +7355,348 @@ def api_command_center():
         return jsonify({"error": "database unavailable"}), 503
 
 
+# =============================================================================
+# Manual-exit vs RSI-rule shadow log. RECORD-ONLY: nothing here ever opens,
+# closes or alters a trade. For every trade closed with "Manual exit" it
+# re-runs the exact RSI Simple Exit rule (check_rsi_simple_exit, same
+# settings, same warm-up) over that day's candles and records when it would
+# have fired and what it would have booked, next to what the manual exit made.
+# Also records how many minutes the option actually traded while held, which
+# explains exits that print exactly the entry price (contract didn't trade).
+# =============================================================================
+_SHADOW_COLS = [
+    "trade_id", "trade_date", "symbol", "direction", "quantity", "entry_price",
+    "manual_exit_time", "manual_exit_price", "manual_pnl",
+    "rsi_fired", "rsi_fire_time", "rsi_fire_value", "rsi_price", "rsi_pnl", "rsi_basis",
+    "diff_pnl", "option_minutes_traded", "minutes_held", "note", "final", "computed_at",
+]
+
+
+def _to_naive_ist(ts: str) -> datetime:
+    dt = datetime.fromisoformat(ts)
+    if dt.tzinfo is not None:
+        dt = (dt - dt.utcoffset()).replace(tzinfo=None) + IST_OFFSET
+    return dt
+
+
+def _fetch_1min_raw(instrument_key: str, access_token: str) -> list:
+    """Today's raw 1-minute candles [ts, o, h, l, c, vol, oi], oldest first.
+    Minutes in which nothing traded are absent for illiquid contracts."""
+    url = f"https://api.upstox.com/v3/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/minutes/1"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {access_token}", "Accept": "application/json",
+        "User-Agent": BROWSER_USER_AGENT,
+    })
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode())
+    return sorted(payload.get("data", {}).get("candles", []), key=lambda c: c[0])
+
+
+def _spot_5min_buckets(rows: list, now_ist: datetime) -> list:
+    """[(bucket_start_ist, (o, h, l, c))] for COMPLETE 5-min buckets only."""
+    buckets: dict = {}
+    for r in rows:
+        st = _to_naive_ist(r[0])
+        k = st.replace(minute=(st.minute // 5) * 5, second=0, microsecond=0)
+        b = buckets.get(k)
+        if b is None:
+            buckets[k] = [r[1], r[2], r[3], r[4]]
+        else:
+            b[1] = max(b[1], r[2]); b[2] = min(b[2], r[3]); b[3] = r[4]
+    return [(k, tuple(v)) for k, v in sorted(buckets.items()) if k + timedelta(minutes=5) <= now_ist]
+
+
+def _engine_series(warm: list, today_prefix: list, min_candles: int = 30) -> list:
+    """The exact candle list get_5min_candles_with_warmup hands the exit rule."""
+    if len(today_prefix) >= min_candles or not warm:
+        return today_prefix
+    return warm[-(min_candles - len(today_prefix)):] + today_prefix
+
+
+def _option_price_at(opt_rows: list, when_ist: datetime):
+    """Close of the last 1-min option candle that ended at/before when_ist
+    (what an LTP quote would have shown). None if it hasn't traded yet today."""
+    best = None
+    for r in opt_rows:
+        if _to_naive_ist(r[0]) + timedelta(minutes=1) <= when_ist:
+            best = r[4]
+        else:
+            break
+    return best
+
+
+def compute_rsi_shadow(trade: dict, access_token: str, now_ist: datetime | None = None) -> dict:
+    now_ist = now_ist or (datetime.utcnow() + IST_OFFSET)
+    entry_ist = datetime.fromisoformat(trade["entry_time"]) + IST_OFFSET
+    exit_ist = datetime.fromisoformat(trade["exit_time"]) + IST_OFFSET
+    qty = trade.get("original_quantity") or trade.get("quantity") or 1
+    entry_price = trade["entry_price"]
+    manual_pnl = trade.get("pnl")
+    trade_date = entry_ist.strftime("%Y-%m-%d")
+    out = {
+        "trade_id": trade["id"], "trade_date": trade_date, "symbol": trade["symbol"],
+        "direction": trade["direction"], "quantity": qty, "entry_price": entry_price,
+        "manual_exit_time": exit_ist.strftime("%H:%M:%S"), "manual_exit_price": trade.get("exit_price"),
+        "manual_pnl": manual_pnl, "rsi_fired": None, "rsi_fire_time": None, "rsi_fire_value": None,
+        "rsi_price": None, "rsi_pnl": None, "rsi_basis": None, "diff_pnl": None,
+        "option_minutes_traded": None, "minutes_held": None, "note": "",
+        "final": 1 if (trade_date < now_ist.strftime("%Y-%m-%d") or now_ist.strftime("%H:%M") >= "15:30") else 0,
+        "computed_at": datetime.utcnow().isoformat(),
+    }
+    notes = []
+    spot_key = get_instrument_key(trade["symbol"])
+    opt_key = trade.get("paper_instrument_key")
+    if not spot_key or not opt_key or str(trade.get("paper_option_label") or "").startswith("EQUITY"):
+        out["note"] = "not an option trade / no instrument key - not comparable"
+        return out
+    try:
+        spot_rows = _fetch_1min_raw(spot_key, access_token)
+        opt_rows = _fetch_1min_raw(opt_key, access_token)
+    except Exception as e:
+        out["note"] = f"candle fetch failed: {type(e).__name__}"
+        out["final"] = 0
+        return out
+    if not spot_rows:
+        out["note"] = "no underlying candles returned (older than today? intraday data only covers the current session)"
+        out["final"] = 0
+        return out
+
+    # liquidity: did the option trade while held? (explains exit == entry)
+    held = [r for r in opt_rows if entry_ist <= _to_naive_ist(r[0]) < exit_ist]
+    out["option_minutes_traded"] = len(held)
+    out["minutes_held"] = max(0, int((exit_ist - entry_ist).total_seconds() // 60))
+    if trade.get("exit_price") == entry_price:
+        notes.append(f"exit==entry: option traded in {len(held)} of {out['minutes_held']} minutes held")
+
+    buckets = _spot_5min_buckets(spot_rows, now_ist)
+    try:
+        warm = fetch_prev_session_5min_candles(spot_key, access_token)
+    except Exception:
+        warm = []
+    rule = dict(rsi_period=get_rsi_period(), call_threshold=get_rsi_call_threshold(),
+                put_warning_threshold=get_rsi_put_warning_threshold(), confirm_candles=get_rsi_confirm_candles())
+    today_ohlc = [ohlc for _, ohlc in buckets]
+    ends = [k + timedelta(minutes=5) for k, _ in buckets]
+
+    # the live loop's very first pass looks at candles already closed at entry
+    fire_time = fire_rsi = None
+    closed_at_entry = [i for i, e in enumerate(ends) if e <= entry_ist]
+    if closed_at_entry:
+        i = closed_at_entry[-1]
+        hit, info = check_rsi_simple_exit(trade["direction"], _engine_series(warm, today_ohlc[:i + 1]), **rule)
+        if hit:
+            fire_time, fire_rsi = entry_ist, info.get("rsi")
+    if fire_time is None:
+        for i, e in enumerate(ends):
+            if e <= entry_ist:
+                continue
+            hit, info = check_rsi_simple_exit(trade["direction"], _engine_series(warm, today_ohlc[:i + 1]), **rule)
+            if hit:
+                fire_time, fire_rsi = e, info.get("rsi")
+                break
+
+    if fire_time is not None:
+        out["rsi_fired"] = 1
+        out["rsi_fire_time"] = fire_time.strftime("%H:%M:%S")
+        out["rsi_fire_value"] = fire_rsi
+        out["rsi_basis"] = "RSI rule fired"
+        when = fire_time
+        if fire_time <= exit_ist:
+            notes.append("rule would have fired BEFORE the manual exit (exit loop may not have been running)")
+    else:
+        out["rsi_fired"] = 0
+        auto_exit = get_auto_exit_time()
+        end_dt = None
+        if auto_exit:
+            try:
+                hh, mm = auto_exit.split(":")
+                end_dt = entry_ist.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+            except Exception:
+                end_dt = None
+        end_dt = end_dt or entry_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+        when = min(now_ist, end_dt) if trade_date == now_ist.strftime("%Y-%m-%d") else end_dt
+        out["rsi_basis"] = f"rule never fired - held to {when.strftime('%H:%M')}"
+
+    price = _option_price_at(opt_rows, when)
+    out["rsi_price"] = price
+    if price is not None:
+        out["rsi_pnl"] = round((price - entry_price) * qty, 2)
+        if manual_pnl is not None:
+            out["diff_pnl"] = round(out["rsi_pnl"] - manual_pnl, 2)
+    else:
+        notes.append("option had not traded by then - no price to book")
+    out["note"] = "; ".join(notes)
+    return out
+
+
+def _save_rsi_shadow(row: dict) -> None:
+    cols = _SHADOW_COLS
+    sql = (f"INSERT INTO rsi_shadow ({','.join(cols)}) VALUES ({','.join('?' * len(cols))}) "
+           f"ON CONFLICT (trade_id) DO UPDATE SET "
+           + ",".join(f"{c} = EXCLUDED.{c}" for c in cols if c != "trade_id"))
+    with get_db() as conn:
+        conn.execute(sql, tuple(row.get(c) for c in cols))
+        conn.commit()
+
+
+def compute_shadow_for_date(date_str: str, access_token: str) -> int:
+    day = datetime.strptime(date_str, "%Y-%m-%d")
+    start = (day - IST_OFFSET).isoformat()
+    end = (day + timedelta(days=1) - IST_OFFSET).isoformat()
+    with get_db() as conn:
+        trades = [dict(r) for r in conn.execute(
+            "SELECT * FROM paper_trades WHERE status = 'CLOSED' AND exit_reason = 'Manual exit' "
+            "AND exit_time >= ? AND exit_time < ? ORDER BY id", (start, end)).fetchall()]
+        done = {r["trade_id"] for r in conn.execute("SELECT trade_id FROM rsi_shadow WHERE final = 1").fetchall()}
+    n = 0
+    for t in trades:
+        if t["id"] in done:
+            continue
+        _save_rsi_shadow(compute_rsi_shadow(t, access_token))
+        n += 1
+    return n
+
+
+_shadow_thread_started = False
+
+
+def _shadow_daily_loop() -> None:
+    """Once per trading day, shortly after the close, fills the shadow log for
+    that day's manual exits. Only touches the database inside the 15:40-16:30
+    IST window, so it never keeps Neon awake the rest of the day."""
+    done_date = None
+    while True:
+        try:
+            now = datetime.utcnow() + IST_OFFSET
+            today = now.strftime("%Y-%m-%d")
+            if now.weekday() < 5 and "15:40" <= now.strftime("%H:%M") <= "16:30" and done_date != today:
+                token = get_setting("upstox_access_token")
+                if token:
+                    compute_shadow_for_date(today, token)
+                    done_date = today
+        except Exception as e:
+            print(f"[shadow-loop] error: {e}")
+        time.sleep(120)
+
+
+def ensure_shadow_loop_started() -> None:
+    global _shadow_thread_started
+    if _shadow_thread_started:
+        return
+    _shadow_thread_started = True
+    threading.Thread(target=_shadow_daily_loop, daemon=True, name="shadow-daily").start()
+
+
+def _shadow_rows(date_str: str) -> tuple[list[dict], dict]:
+    with get_db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM rsi_shadow WHERE trade_date = ? ORDER BY manual_exit_time", (date_str,)).fetchall()]
+    both = [r for r in rows if r["rsi_pnl"] is not None and r["manual_pnl"] is not None]
+    summary = {
+        "trades_logged": len(rows), "comparable": len(both),
+        "manual_total": round(sum(r["manual_pnl"] for r in both), 2),
+        "rsi_rule_total": round(sum(r["rsi_pnl"] for r in both), 2),
+        "rsi_rule_minus_manual": round(sum(r["diff_pnl"] for r in both), 2),
+        "rule_better_count": sum(1 for r in both if (r["diff_pnl"] or 0) > 0),
+        "manual_better_count": sum(1 for r in both if (r["diff_pnl"] or 0) < 0),
+    }
+    return rows, summary
+
+
+@app.route("/api/shadow/rsi-vs-manual")
+def api_shadow_rsi_vs_manual():
+    date_str = request.args.get("date") or (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    try:
+        if request.args.get("refresh") == "1":
+            token = get_setting("upstox_access_token")
+            if not token:
+                return jsonify({"error": "No Upstox token saved"}), 400
+            compute_shadow_for_date(date_str, token)
+        rows, summary = _shadow_rows(date_str)
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    return jsonify({"date": date_str, "summary": summary, "rows": rows})
+
+
+@app.route("/api/diag/equal-price-exits")
+def api_diag_equal_price_exits():
+    """Explains trades that exited at exactly the entry price: for each, how
+    many minutes the option actually traded while held (today's session only)."""
+    date_str = request.args.get("date") or (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    token = get_setting("upstox_access_token")
+    if not token:
+        return jsonify({"error": "No Upstox token saved"}), 400
+    day = datetime.strptime(date_str, "%Y-%m-%d")
+    start = (day - IST_OFFSET).isoformat()
+    end = (day + timedelta(days=1) - IST_OFFSET).isoformat()
+    with get_db() as conn:
+        trades = [dict(r) for r in conn.execute(
+            "SELECT * FROM paper_trades WHERE status = 'CLOSED' AND exit_price = entry_price "
+            "AND exit_time >= ? AND exit_time < ? ORDER BY id", (start, end)).fetchall()]
+    out = []
+    for t in trades:
+        item = {"trade_id": t["id"], "symbol": t["symbol"], "contract": t.get("paper_option_label"),
+                "entry_price": t["entry_price"], "exit_reason": t["exit_reason"]}
+        try:
+            rows = _fetch_1min_raw(t["paper_instrument_key"], token) if t.get("paper_instrument_key") else []
+            e_ist = datetime.fromisoformat(t["entry_time"]) + IST_OFFSET
+            x_ist = datetime.fromisoformat(t["exit_time"]) + IST_OFFSET
+            held = [r for r in rows if e_ist <= _to_naive_ist(r[0]) < x_ist]
+            item["minutes_held"] = int((x_ist - e_ist).total_seconds() // 60)
+            item["minutes_option_traded"] = len(held)
+            item["prices_seen_while_held"] = sorted({r[4] for r in held})[:10]
+            item["verdict"] = ("option did not trade while held - price was the stale last-traded price"
+                               if not held else "option DID trade - exit price should have moved; investigate")
+        except Exception as e:
+            item["verdict"] = f"could not check: {type(e).__name__}"
+        out.append(item)
+    return jsonify({"date": date_str, "count": len(out), "trades": out})
+
+
+_SHADOW_PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RTT - Manual vs RSI rule</title><style>
+body{background:#0b0e14;color:#e6e9f0;font-family:'Segoe UI',Arial,sans-serif;margin:0;padding:20px 24px}
+a{color:#2dd4ff}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border-bottom:1px solid #1e222d;padding:6px 8px;text-align:left;white-space:nowrap}
+th{color:#6b7280;font-size:11px;text-transform:uppercase}.pos{color:#00c896}.neg{color:#ff5370}.mut{color:#6b7280}
+.cards{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}.card{background:#131722;border:1px solid #1e222d;border-radius:8px;padding:10px 14px}
+.card b{display:block;font-size:20px;margin-top:2px}.wrap{overflow-x:auto}</style></head><body>
+<h2 style="margin:0">Manual exit vs RSI rule <span class="mut" style="font-size:13px;font-weight:400">{{ date }}</span></h2>
+<div class="mut" style="font-size:12px;margin-top:4px">Record-only log. For each "Manual exit" trade: when the RSI Simple Exit would have fired and what it would have booked.
+<a href="/">Dashboard</a> &middot; <a href="/paper-trading">Paper</a> &middot; <a href="?date={{ date }}&refresh=1">recompute now</a></div>
+<div class="cards">
+<div class="card">Trades logged<b>{{ s.trades_logged }}</b></div>
+<div class="card">Comparable<b>{{ s.comparable }}</b></div>
+<div class="card">Manual total<b>{{ s.manual_total }}</b></div>
+<div class="card">RSI-rule total<b>{{ s.rsi_rule_total }}</b></div>
+<div class="card">Rule minus manual<b class="{{ 'pos' if s.rsi_rule_minus_manual > 0 else 'neg' }}">{{ s.rsi_rule_minus_manual }}</b></div>
+<div class="card">Rule better / manual better<b>{{ s.rule_better_count }} / {{ s.manual_better_count }}</b></div></div>
+<div class="wrap"><table><tr><th>Symbol</th><th>Dir</th><th>Qty</th><th>Entry</th><th>Manual exit</th><th>Manual price</th><th>Manual P&amp;L</th>
+<th>Rule fired</th><th>Rule time</th><th>Rule RSI</th><th>Rule price</th><th>Rule P&amp;L</th><th>Rule - manual</th><th>Opt traded (min)</th><th>Basis / note</th><th>Final</th></tr>
+{% for r in rows %}<tr><td>{{ r.symbol }}</td><td>{{ r.direction }}</td><td>{{ r.quantity }}</td><td>{{ r.entry_price }}</td><td>{{ r.manual_exit_time }}</td><td>{{ r.manual_exit_price }}</td>
+<td class="{{ 'pos' if (r.manual_pnl or 0) > 0 else 'neg' if (r.manual_pnl or 0) < 0 else '' }}">{{ r.manual_pnl }}</td>
+<td>{{ 'yes' if r.rsi_fired == 1 else 'no' if r.rsi_fired == 0 else '-' }}</td><td>{{ r.rsi_fire_time or '-' }}</td><td>{{ '%.1f' % r.rsi_fire_value if r.rsi_fire_value is not none else '-' }}</td>
+<td>{{ r.rsi_price if r.rsi_price is not none else '-' }}</td><td>{{ r.rsi_pnl if r.rsi_pnl is not none else '-' }}</td>
+<td class="{{ 'pos' if (r.diff_pnl or 0) > 0 else 'neg' if (r.diff_pnl or 0) < 0 else '' }}">{{ r.diff_pnl if r.diff_pnl is not none else '-' }}</td>
+<td>{{ r.option_minutes_traded if r.option_minutes_traded is not none else '-' }} / {{ r.minutes_held if r.minutes_held is not none else '-' }}</td>
+<td class="mut" style="white-space:normal">{{ r.rsi_basis or '' }} {{ r.note }}</td><td>{{ 'yes' if r.final == 1 else 'no' }}</td></tr>
+{% else %}<tr><td colspan="16" class="mut">No manual-exit trades logged for this date yet. The log fills automatically after 15:40 IST, or use "recompute now" (today only).</td></tr>{% endfor %}
+</table></div></body></html>"""
+
+
+@app.route("/shadow")
+def shadow_page():
+    date_str = request.args.get("date") or (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    try:
+        if request.args.get("refresh") == "1":
+            token = get_setting("upstox_access_token")
+            if token:
+                compute_shadow_for_date(date_str, token)
+        rows, summary = _shadow_rows(date_str)
+    except (psycopg2.Error, RuntimeError):
+        return "Database unavailable", 503
+    return render_template_string(_SHADOW_PAGE, date=date_str, rows=rows, s=summary)
+
+
 @app.route("/settings")
 def settings_page():
     token_saved = bool(get_setting("upstox_access_token"))
@@ -8272,6 +8616,7 @@ except Exception as _init_err:
     print(f"[init_db] database unavailable at startup ({_init_err}); retrying in background")
     threading.Thread(target=_init_db_with_retry, daemon=True, name="init-db-retry").start()
 ensure_exit_check_loop_started()  # same: starts on import, tab-independent from here on
+ensure_shadow_loop_started()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=os.environ.get("FLASK_DEBUG") == "1")
