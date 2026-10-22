@@ -665,6 +665,7 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS paper_instrument_key TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS paper_option_label TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'EMA'",
+            "ALTER TABLE rsi_shadow ADD COLUMN IF NOT EXISTS strategy TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_reason TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS original_quantity INTEGER",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_hit_time TEXT",
@@ -7368,7 +7369,7 @@ _SHADOW_COLS = [
     "trade_id", "trade_date", "symbol", "direction", "quantity", "entry_price",
     "manual_exit_time", "manual_exit_price", "manual_pnl",
     "rsi_fired", "rsi_fire_time", "rsi_fire_value", "rsi_price", "rsi_pnl", "rsi_basis",
-    "diff_pnl", "option_minutes_traded", "minutes_held", "note", "final", "computed_at",
+    "diff_pnl", "option_minutes_traded", "minutes_held", "note", "final", "computed_at", "strategy",
 ]
 
 
@@ -7436,7 +7437,7 @@ def compute_rsi_shadow(trade: dict, access_token: str, now_ist: datetime | None 
     out = {
         "trade_id": trade["id"], "trade_date": trade_date, "symbol": trade["symbol"],
         "direction": trade["direction"], "quantity": qty, "entry_price": entry_price,
-        "manual_exit_time": exit_ist.strftime("%H:%M:%S"), "manual_exit_price": trade.get("exit_price"),
+        "strategy": trade.get("strategy") or "", "manual_exit_time": exit_ist.strftime("%H:%M:%S"), "manual_exit_price": trade.get("exit_price"),
         "manual_pnl": manual_pnl, "rsi_fired": None, "rsi_fire_time": None, "rsi_fire_value": None,
         "rsi_price": None, "rsi_pnl": None, "rsi_basis": None, "diff_pnl": None,
         "option_minutes_traded": None, "minutes_held": None, "note": "",
@@ -7475,6 +7476,20 @@ def compute_rsi_shadow(trade: dict, access_token: str, now_ist: datetime | None 
         warm = []
     rule = dict(rsi_period=get_rsi_period(), call_threshold=get_rsi_call_threshold(),
                 put_warning_threshold=get_rsi_put_warning_threshold(), confirm_candles=get_rsi_confirm_candles())
+    # Compare against the rule the trade was actually running under. Today's
+    # trades mixed RSI Simple and RSI Momentum (Settings was changed mid-day).
+    strat = trade.get("strategy") or ""
+    if strat == "RSI_MOMENTUM":
+        rule_name = "RSI Momentum"
+        notes.append("momentum rule uses base RSI/EMA settings (live may apply mid-day / Deep-ITM overrides)")
+        def rule_fn(series):
+            return check_rsi_momentum_exit(trade["direction"], series, ema_period=get_rsi_ema_period(), **rule)
+    else:
+        rule_name = "RSI Simple"
+        if strat not in ("RSI_SIMPLE", ""):
+            notes.append(f"trade ran {strat}; compared against RSI Simple")
+        def rule_fn(series):
+            return check_rsi_simple_exit(trade["direction"], series, **rule)
     today_ohlc = [ohlc for _, ohlc in buckets]
     ends = [k + timedelta(minutes=5) for k, _ in buckets]
 
@@ -7483,14 +7498,14 @@ def compute_rsi_shadow(trade: dict, access_token: str, now_ist: datetime | None 
     closed_at_entry = [i for i, e in enumerate(ends) if e <= entry_ist]
     if closed_at_entry:
         i = closed_at_entry[-1]
-        hit, info = check_rsi_simple_exit(trade["direction"], _engine_series(warm, today_ohlc[:i + 1]), **rule)
+        hit, info = rule_fn(_engine_series(warm, today_ohlc[:i + 1]))
         if hit:
             fire_time, fire_rsi = entry_ist, info.get("rsi")
     if fire_time is None:
         for i, e in enumerate(ends):
             if e <= entry_ist:
                 continue
-            hit, info = check_rsi_simple_exit(trade["direction"], _engine_series(warm, today_ohlc[:i + 1]), **rule)
+            hit, info = rule_fn(_engine_series(warm, today_ohlc[:i + 1]))
             if hit:
                 fire_time, fire_rsi = e, info.get("rsi")
                 break
@@ -7499,10 +7514,10 @@ def compute_rsi_shadow(trade: dict, access_token: str, now_ist: datetime | None 
         out["rsi_fired"] = 1
         out["rsi_fire_time"] = fire_time.strftime("%H:%M:%S")
         out["rsi_fire_value"] = fire_rsi
-        out["rsi_basis"] = "RSI rule fired"
+        out["rsi_basis"] = f"{rule_name} fired"
         when = fire_time
         if fire_time <= exit_ist:
-            notes.append("rule would have fired BEFORE the manual exit (exit loop may not have been running)")
+            notes.append("rule would have fired BEFORE the manual exit - check the strategy/threshold settings active at that time")
     else:
         out["rsi_fired"] = 0
         auto_exit = get_auto_exit_time()
@@ -7515,7 +7530,7 @@ def compute_rsi_shadow(trade: dict, access_token: str, now_ist: datetime | None 
                 end_dt = None
         end_dt = end_dt or entry_ist.replace(hour=15, minute=30, second=0, microsecond=0)
         when = min(now_ist, end_dt) if trade_date == now_ist.strftime("%Y-%m-%d") else end_dt
-        out["rsi_basis"] = f"rule never fired - held to {when.strftime('%H:%M')}"
+        out["rsi_basis"] = f"{rule_name} never fired - held to {when.strftime('%H:%M')}"
 
     price = _option_price_at(opt_rows, when)
     out["rsi_price"] = price
@@ -7547,7 +7562,8 @@ def compute_shadow_for_date(date_str: str, access_token: str) -> int:
         trades = [dict(r) for r in conn.execute(
             "SELECT * FROM paper_trades WHERE status = 'CLOSED' AND exit_reason = 'Manual exit' "
             "AND exit_time >= ? AND exit_time < ? ORDER BY id", (start, end)).fetchall()]
-        done = {r["trade_id"] for r in conn.execute("SELECT trade_id FROM rsi_shadow WHERE final = 1").fetchall()}
+        # rows saved before the strategy column existed (strategy IS NULL) are recomputed once
+        done = {r["trade_id"] for r in conn.execute("SELECT trade_id FROM rsi_shadow WHERE final = 1 AND strategy IS NOT NULL").fetchall()}
     n = 0
     for t in trades:
         if t["id"] in done:
