@@ -82,6 +82,7 @@
 
   <h3 style="margin:28px 0 4px">Volume filter test <span style="color:var(--muted);font-weight:400;font-size:13px">what each alert's option did afterwards</span></h3>
   <div class="sub">Every Buy/Sell alert the volume rule judged is logged - traded or skipped - and measured after the close from the option's own prices. Positive % = the alert's direction was right. Record-only; it never changes a trade. Needs ~100+ measured alerts before it means much.</div>
+  <div class="sub" style="margin-top:6px">Past alerts: <a href="/api/volume-test/backfill?from=2026-10-12">rebuild from stored alerts since 12 Oct</a> (runs in the background, takes a while) &middot; <a href="/api/volume-test/backfill-status">progress</a>. Rebuilt rows use today's contract choice, so treat them as a close approximation.</div>
   <div class="cards" style="margin-top:12px">
     <div class="card">Alerts logged<b>{{ vt.total_logged }}</b></div>
     <div class="card">Measured (option had a price)<b>{{ vt.measured }}</b></div>
