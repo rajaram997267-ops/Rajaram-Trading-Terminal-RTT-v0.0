@@ -549,6 +549,19 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS volume_alert_log (
+                id SERIAL PRIMARY KEY,
+                alert_time TEXT, ist_date TEXT, symbol TEXT, category TEXT,
+                decision TEXT, vol_label TEXT, vol_ratio DOUBLE PRECISION, vol_asof TEXT,
+                spot_price DOUBLE PRECISION, option_key TEXT, option_label TEXT,
+                p0 DOUBLE PRECISION, p15 DOUBLE PRECISION, p30 DOUBLE PRECISION,
+                p60 DOUBLE PRECISION, p_eod DOUBLE PRECISION,
+                opt_candles_30 INTEGER, final INTEGER DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS rsi_shadow (
                 trade_id INTEGER PRIMARY KEY,
                 trade_date TEXT, symbol TEXT, direction TEXT,
@@ -3469,6 +3482,36 @@ def _open_trade_if_free(symbol: str, category: str, price_val: float,
         return open_trade_for_symbol(symbol, category, price_val, alert_name=alert_name, scan_name=scan_name)
 
 
+def _log_volume_alert(sym: str, category: str, price_val: float, label, ratio, asof: str, decision: str) -> None:
+    """Persists one volume-judged alert (taken OR skipped) so that, after the
+    close, what its option did next can be measured for every group alike.
+    Record-only and best-effort: any failure is swallowed so it can never
+    touch the entry path. Skipped alerts repeating within 15 min are ignored."""
+    try:
+        option = get_atm_option(sym, "CE" if category == "Buy" else "PE", price_val)
+        if not option:
+            return
+        now_utc = datetime.utcnow()
+        with get_db() as conn:
+            if decision != "ENTERED":
+                dup = conn.execute(
+                    "SELECT 1 AS x FROM volume_alert_log WHERE symbol = ? AND category = ? AND alert_time >= ? LIMIT 1",
+                    (sym, category, (now_utc - timedelta(minutes=15)).isoformat()),
+                ).fetchone()
+                if dup:
+                    return
+            conn.execute(
+                "INSERT INTO volume_alert_log (alert_time, ist_date, symbol, category, decision, vol_label, vol_ratio, "
+                "vol_asof, spot_price, option_key, option_label) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (now_utc.isoformat(), (now_utc + IST_OFFSET).strftime("%Y-%m-%d"), sym, category, decision,
+                 label or "None", ratio, asof, price_val, option["instrument_key"],
+                 f"{sym} {option['strike']:g} {'CE' if category == 'Buy' else 'PE'} exp {option['expiry']}"),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
 def _volume_gated_entry(symbol: str, category: str, price_val: float,
                         alert_name: str = "", scan_name: str = "") -> None:
     """Runs on its own thread so the webhook returns immediately. Judges ONE
@@ -3495,8 +3538,11 @@ def _volume_gated_entry(symbol: str, category: str, price_val: float,
             return
         if label != "Strong":
             _log_volume_entry_decision(sym, category, "skipped", f"volume {label} ({ratio}x), not Strong")
+            _log_volume_alert(sym, category, price_val, label, ratio, reading["asof"], "SKIPPED")
             return
         created, reason = _open_trade_if_free(sym, category, price_val, alert_name=alert_name, scan_name=scan_name)
+        _log_volume_alert(sym, category, price_val, label, ratio, reading["asof"],
+                          "ENTERED" if created else "STRONG_NOT_TAKEN")
         if created:
             _log_volume_entry_decision(sym, category, "ENTERED", f"Strong {ratio}x as of {reading['asof']}")
         else:
@@ -7511,10 +7557,15 @@ def _to_naive_ist(ts: str) -> datetime:
     return dt
 
 
-def _fetch_1min_raw(instrument_key: str, access_token: str) -> list:
-    """Today's raw 1-minute candles [ts, o, h, l, c, vol, oi], oldest first.
-    Minutes in which nothing traded are absent for illiquid contracts."""
-    url = f"https://api.upstox.com/v3/historical-candle/intraday/{urllib.parse.quote(instrument_key, safe='|')}/minutes/1"
+def _fetch_1min_raw(instrument_key: str, access_token: str, day: str | None = None) -> list:
+    """Raw 1-minute candles [ts, o, h, l, c, vol, oi], oldest first - today's
+    session by default, or a past `day` (YYYY-MM-DD) from the historical
+    endpoint. Minutes in which nothing traded are absent for illiquid contracts."""
+    q = urllib.parse.quote(instrument_key, safe='|')
+    if day and day < _ist_today_str():
+        url = f"https://api.upstox.com/v3/historical-candle/{q}/minutes/1/{day}/{day}"
+    else:
+        url = f"https://api.upstox.com/v3/historical-candle/intraday/{q}/minutes/1"
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {access_token}", "Accept": "application/json",
         "User-Agent": BROWSER_USER_AGENT,
@@ -7719,7 +7770,11 @@ def _shadow_daily_loop() -> None:
             if now.weekday() < 5 and "15:40" <= now.strftime("%H:%M") <= "16:30" and done_date != today:
                 token = get_setting("upstox_access_token")
                 if token:
-                    compute_shadow_for_date(today, token)
+                    for job in (compute_shadow_for_date, fill_volume_alert_outcomes):
+                        try:
+                            job(today, token)
+                        except Exception as e:
+                            print(f"[shadow-loop] {job.__name__} error: {e}")
                     done_date = today
         except Exception as e:
             print(f"[shadow-loop] error: {e}")
@@ -7808,6 +7863,114 @@ def api_diag_equal_price_exits():
     return jsonify({"date": date_str, "count": len(out), "trades": out})
 
 
+def fill_volume_alert_outcomes(date_str: str, access_token: str, now_ist: datetime | None = None) -> dict:
+    """Measures what each logged alert's option did next: its price when the
+    alert fired and 15 / 30 / 60 minutes later and at the close, from the
+    option's own 1-minute candles. Same method for every group."""
+    now_ist = now_ist or (datetime.utcnow() + IST_OFFSET)
+    with get_db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM volume_alert_log WHERE ist_date = ? AND final = 0 ORDER BY id LIMIT 300", (date_str,)).fetchall()]
+    day_over = date_str < now_ist.strftime("%Y-%m-%d") or now_ist.strftime("%H:%M") >= "15:30"
+    auto_exit = get_auto_exit_time()
+    try:
+        hh, mm = (auto_exit or "15:20").split(":")
+        eod = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=int(hh), minute=int(mm))
+    except Exception:
+        eod = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=15, minute=20)
+    cache: dict = {}
+    out = {"date": date_str, "rows": len(rows), "measured": 0, "failed": 0}
+    for r in rows:
+        try:
+            if r["option_key"] not in cache:
+                cache[r["option_key"]] = _fetch_1min_raw(r["option_key"], access_token, day=date_str)
+            opt = cache[r["option_key"]]
+            t0 = datetime.fromisoformat(r["alert_time"]) + IST_OFFSET
+            def at(when):
+                return _option_price_at(opt, when) if when <= now_ist else None
+            vals = {"p0": at(t0), "p15": at(t0 + timedelta(minutes=15)), "p30": at(t0 + timedelta(minutes=30)),
+                    "p60": at(t0 + timedelta(minutes=60)), "p_eod": at(eod) if eod > t0 else None}
+            candles_30 = sum(1 for c in opt if t0 <= _to_naive_ist(c[0]) < t0 + timedelta(minutes=30))
+            with get_db() as conn:
+                conn.execute("UPDATE volume_alert_log SET p0 = ?, p15 = ?, p30 = ?, p60 = ?, p_eod = ?, "
+                             "opt_candles_30 = ?, final = ? WHERE id = ?",
+                             (vals["p0"], vals["p15"], vals["p30"], vals["p60"], vals["p_eod"],
+                              candles_30, 1 if day_over else 0, r["id"]))
+                conn.commit()
+            out["measured"] += 1
+        except Exception:
+            out["failed"] += 1
+    return out
+
+
+def _vt_group(r: dict) -> str:
+    if r["decision"] == "ENTERED":
+        return "Strong - traded"
+    if r["decision"] == "STRONG_NOT_TAKEN":
+        return "Strong - not taken (trade open etc.)"
+    lab = r["vol_label"] or "None"
+    return f"{lab} - skipped" if lab in ("Moderate", "Weak") else "No reading - skipped"
+
+
+_VT_ORDER = ["Strong - traded", "Strong - not taken (trade open etc.)", "Moderate - skipped", "Weak - skipped", "No reading - skipped"]
+
+
+def _volume_test_summary(rows: list[dict], liquid_only: bool = False) -> list[dict]:
+    """Per group: how the option moved after the alert (all long options, so a
+    positive % always means the alert's direction was right)."""
+    import statistics
+    groups: dict[str, list[dict]] = {g: [] for g in _VT_ORDER}
+    for r in rows:
+        if not r.get("p0"):
+            continue
+        if liquid_only and (r.get("opt_candles_30") or 0) < 5:
+            continue
+        groups[_vt_group(r)].append(r)
+    def pcts(rs, col):
+        return [(x[col] - x["p0"]) / x["p0"] * 100 for x in rs if x.get(col) is not None]
+    out = []
+    for g in _VT_ORDER:
+        rs = groups[g]
+        p30 = pcts(rs, "p30")
+        item = {"group": g, "n": len(rs), "n30": len(p30)}
+        for col, key in (("p15", "avg15"), ("p30", "avg30"), ("p60", "avg60"), ("p_eod", "avg_eod")):
+            v = pcts(rs, col)
+            item[key] = round(sum(v) / len(v), 2) if v else None
+        item["med30"] = round(statistics.median(p30), 2) if p30 else None
+        item["up30"] = round(100 * sum(1 for v in p30 if v > 0) / len(p30), 1) if p30 else None
+        out.append(item)
+    return out
+
+
+def _volume_test_view(limit_rows: int = 40) -> dict:
+    with get_db() as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM volume_alert_log ORDER BY id DESC LIMIT 3000").fetchall()]
+    return {
+        "total_logged": len(rows),
+        "measured": sum(1 for r in rows if r.get("p0")),
+        "all": _volume_test_summary(rows),
+        "liquid": _volume_test_summary(rows, liquid_only=True),
+        "recent": rows[:limit_rows],
+    }
+
+
+@app.route("/api/volume-test")
+def api_volume_test():
+    """?refresh=1&date=YYYY-MM-DD measures that day now (today or a past day)."""
+    date_str = request.args.get("date") or (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    try:
+        refreshed = None
+        if request.args.get("refresh") == "1":
+            token = get_setting("upstox_access_token")
+            if not token:
+                return jsonify({"error": "No Upstox token saved"}), 400
+            refreshed = fill_volume_alert_outcomes(date_str, token)
+        view = _volume_test_view()
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    return jsonify({"refreshed": refreshed, **view})
+
+
 @app.route("/shadow")
 def shadow_page():
     date_str = request.args.get("date") or (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
@@ -7816,10 +7979,12 @@ def shadow_page():
             token = get_setting("upstox_access_token")
             if token:
                 compute_shadow_for_date(date_str, token)
+                fill_volume_alert_outcomes(date_str, token)
         rows, summary = _shadow_rows(date_str)
+        vt = _volume_test_view()
     except (psycopg2.Error, RuntimeError):
         return "Database unavailable", 503
-    return render_template("shadow.html", active_tab="shadow", date=date_str, rows=rows, s=summary)
+    return render_template("shadow.html", active_tab="shadow", date=date_str, rows=rows, s=summary, vt=vt)
 
 
 @app.route("/settings")
