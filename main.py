@@ -3041,6 +3041,51 @@ def _directional_pressure(high, low, close, volume) -> tuple[float, float]:
     return buy, vol - buy
 
 
+def _volume_slots_from_raw(raw: list) -> dict:
+    """Per 5-min time slot, the average volume / buy / sell over the most
+    recent _VOL_HISTORY_SESSIONS sessions found in `raw`."""
+    slots: dict[str, dict] = {}
+    by_session: dict[str, dict[str, list]] = {}
+    for c in raw:
+        by_session.setdefault(c[0][:10], {})[c[0][11:16]] = c
+    acc: dict[str, dict[str, list[float]]] = {}
+    for day in sorted(by_session, reverse=True)[:_VOL_HISTORY_SESSIONS]:
+        for slot, c in by_session[day].items():
+            buy, sell = _directional_pressure(c[2], c[3], c[4], c[5])
+            a = acc.setdefault(slot, {"vol": [], "buy": [], "sell": []})
+            a["vol"].append(float(c[5] or 0))
+            a["buy"].append(buy)
+            a["sell"].append(sell)
+    for slot, a in acc.items():
+        n = len(a["vol"])
+        slots[slot] = {
+            "vol": sum(a["vol"]) / n, "buy": sum(a["buy"]) / n,
+            "sell": sum(a["sell"]) / n, "n": n,
+        }
+    return slots
+
+
+_vol_history_cache_past: dict = {}
+
+
+def _get_volume_history_before(instrument_key: str, access_token: str, as_of_date: str) -> dict:
+    """Baseline for reconstructing a PAST day's reading: only sessions before
+    that day count, exactly as the live reading on that day would have used."""
+    ck = (instrument_key, as_of_date)
+    if ck in _vol_history_cache_past:
+        return _vol_history_cache_past[ck]
+    day = datetime.strptime(as_of_date, "%Y-%m-%d")
+    url = (f"https://api.upstox.com/v3/historical-candle/{urllib.parse.quote(instrument_key, safe='|')}"
+           f"/minutes/5/{(day - timedelta(days=1)).strftime('%Y-%m-%d')}/{(day - timedelta(days=16)).strftime('%Y-%m-%d')}")
+    try:
+        slots = _volume_slots_from_raw(_vol_fetch_candles(url, access_token))
+    except Exception:
+        slots = {}
+    if slots:
+        _vol_history_cache_past[ck] = slots
+    return slots
+
+
 def _get_volume_history(instrument_key: str, access_token: str) -> dict:
     """Per 5-min time slot ('09:15', '09:20', ...), the average total volume
     and average buy/sell directional volume over the last
@@ -3064,23 +3109,7 @@ def _get_volume_history(instrument_key: str, access_token: str) -> dict:
             f"{urllib.parse.quote(instrument_key, safe='|')}/minutes/5/{to_date}/{from_date}"
         )
         raw = _vol_fetch_candles(url, access_token)
-        by_session: dict[str, dict[str, list]] = {}
-        for c in raw:
-            by_session.setdefault(c[0][:10], {})[c[0][11:16]] = c
-        acc: dict[str, dict[str, list[float]]] = {}
-        for day in sorted(by_session, reverse=True)[:_VOL_HISTORY_SESSIONS]:
-            for slot, c in by_session[day].items():
-                buy, sell = _directional_pressure(c[2], c[3], c[4], c[5])
-                a = acc.setdefault(slot, {"vol": [], "buy": [], "sell": []})
-                a["vol"].append(float(c[5] or 0))
-                a["buy"].append(buy)
-                a["sell"].append(sell)
-        for slot, a in acc.items():
-            n = len(a["vol"])
-            slots[slot] = {
-                "vol": sum(a["vol"]) / n, "buy": sum(a["buy"]) / n,
-                "sell": sum(a["sell"]) / n, "n": n,
-            }
+        slots = _volume_slots_from_raw(raw)
     except Exception:
         slots = {}
     _vol_history_cache[instrument_key] = {
@@ -3117,13 +3146,21 @@ def _build_volume_reading(symbol: str, access_token: str, as_of_ist: datetime | 
     key = get_instrument_key(symbol)
     if not key:
         return {**base, "status": "no_instrument"}
-    slots = _get_volume_history(key, access_token)
+    as_of_day = now_ist.strftime("%Y-%m-%d")
+    is_past = as_of_ist is not None and as_of_day < _ist_today_str()
+    slots = (_get_volume_history_before(key, access_token, as_of_day) if is_past
+             else _get_volume_history(key, access_token))
     if not slots:
         return {**base, "status": "no_history"}
-    url = (
-        f"https://api.upstox.com/v3/historical-candle/intraday/"
-        f"{urllib.parse.quote(key, safe='|')}/minutes/5"
-    )
+    if is_past:
+        # an earlier day: the intraday endpoint only serves the current session
+        url = (f"https://api.upstox.com/v3/historical-candle/{urllib.parse.quote(key, safe='|')}"
+               f"/minutes/5/{as_of_day}/{as_of_day}")
+    else:
+        url = (
+            f"https://api.upstox.com/v3/historical-candle/intraday/"
+            f"{urllib.parse.quote(key, safe='|')}/minutes/5"
+        )
     raw = _vol_fetch_candles(url, access_token)
     today = now_ist.strftime("%Y-%m-%d")
     closed = []
@@ -7394,6 +7431,60 @@ def api_command_center():
         })
     except (psycopg2.Error, RuntimeError):
         return jsonify({"error": "database unavailable"}), 503
+
+
+def backfill_volume_for_date(date_str: str, access_token: str, limit: int = 40) -> dict:
+    """Fills any MISSING entry/exit volume reading on that IST day's closed
+    trades, reconstructing 'as of' the trade's own entry/exit moment with the
+    same definition the live logger uses. Never overwrites an existing value."""
+    day = datetime.strptime(date_str, "%Y-%m-%d")
+    start = (day - IST_OFFSET).isoformat()
+    end = (day + timedelta(days=1) - IST_OFFSET).isoformat()
+    with get_db() as conn:
+        trades = [dict(r) for r in conn.execute(
+            "SELECT id, symbol, direction, entry_time, exit_time, entry_volume_label, exit_volume_label "
+            "FROM paper_trades WHERE status = 'CLOSED' AND exit_time >= ? AND exit_time < ? "
+            "AND (exit_volume_label IS NULL OR entry_volume_label IS NULL) ORDER BY id LIMIT ?",
+            (start, end, limit)).fetchall()]
+    result = {"date": date_str, "trades_checked": len(trades), "entry_filled": 0, "exit_filled": 0, "skipped": []}
+    for t in trades:
+        if t["direction"] not in ("Buy", "Sell"):
+            continue
+        for kind, ts_col in (("exit", "exit_time"), ("entry", "entry_time")):
+            if t[f"{kind}_volume_label"] is not None or not t[ts_col]:
+                continue
+            at_ist = datetime.fromisoformat(t[ts_col]) + IST_OFFSET
+            try:
+                reading = _build_volume_reading((t["symbol"] or "").strip().upper(), access_token, as_of_ist=at_ist)
+            except Exception as e:
+                result["skipped"].append(f"{t['symbol']} {kind}: {type(e).__name__}")
+                continue
+            side = reading.get("buy" if t["direction"] == "Buy" else "sell") if reading.get("status") == "ok" else None
+            if not side or side.get("label") is None:
+                result["skipped"].append(f"{t['symbol']} {kind}: {reading.get('status')}")
+                continue
+            with get_db() as conn:
+                conn.execute(f"UPDATE paper_trades SET {kind}_volume_label = ?, {kind}_volume_ratio = ? WHERE id = ?",
+                             (side["label"], side["ratio"], t["id"]))
+                conn.commit()
+            result[f"{kind}_filled"] += 1
+    return result
+
+
+@app.route("/api/volume/backfill")
+def api_volume_backfill():
+    """?date=YYYY-MM-DD (default today) &days=N (default 1) - fills missing
+    entry/exit volume on closed trades for that many IST days ending at date."""
+    token = get_setting("upstox_access_token")
+    if not token:
+        return jsonify({"error": "No Upstox token saved"}), 400
+    end_day = datetime.strptime(request.args.get("date") or (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d"), "%Y-%m-%d")
+    days = max(1, min(int(request.args.get("days", 1)), 7))
+    try:
+        results = [backfill_volume_for_date((end_day - timedelta(days=i)).strftime("%Y-%m-%d"), token) for i in range(days)]
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    return jsonify({"results": results})
 
 
 # =============================================================================
