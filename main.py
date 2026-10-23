@@ -7905,14 +7905,15 @@ def fill_volume_alert_outcomes(date_str: str, access_token: str, now_ist: dateti
 
 def _vt_group(r: dict) -> str:
     if r["decision"] == "ENTERED":
-        return "Strong - traded"
+        return "Strong - traded" if (r.get("vol_label") or "") == "Strong" else "Traded without Strong (rule was off)"
     if r["decision"] == "STRONG_NOT_TAKEN":
         return "Strong - not taken (trade open etc.)"
     lab = r["vol_label"] or "None"
     return f"{lab} - skipped" if lab in ("Moderate", "Weak") else "No reading - skipped"
 
 
-_VT_ORDER = ["Strong - traded", "Strong - not taken (trade open etc.)", "Moderate - skipped", "Weak - skipped", "No reading - skipped"]
+_VT_ORDER = ["Strong - traded", "Strong - not taken (trade open etc.)", "Moderate - skipped", "Weak - skipped", "No reading - skipped",
+             "Traded without Strong (rule was off)"]
 
 
 def _volume_test_summary(rows: list[dict], liquid_only: bool = False) -> list[dict]:
@@ -7952,6 +7953,110 @@ def _volume_test_view(limit_rows: int = 40) -> dict:
         "liquid": _volume_test_summary(rows, liquid_only=True),
         "recent": rows[:limit_rows],
     }
+
+
+_vt_backfill_state: dict = {"running": False}
+
+
+def _vt_backfill_job(dates: list[str], token: str) -> None:
+    """Rebuilds the volume-filter log from alerts already stored in the
+    database: for each past Buy/Sell alert, the volume reading AS OF that
+    moment, whether a trade was actually opened for it, and (afterwards) what
+    its option did. Runs in the background, gently, one alert at a time."""
+    st = _vt_backfill_state
+    st.update(running=True, started=(datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d %H:%M:%S"), dates=dates,
+              day=None, alerts_seen=0, logged=0, no_reading=0, no_option=0, measured=0, error=None, finished=None)
+    try:
+        for d in dates:
+            st["day"] = d
+            alerts = sorted(_alerts_for_ist_date(d), key=lambda a: a["created_at"])
+            last_seen: dict = {}
+            for a in alerts:
+                cat = categorize(a)
+                if cat not in ("Buy", "Sell"):
+                    continue
+                st["alerts_seen"] += 1
+                t_utc = datetime.fromisoformat(a["created_at"])
+                t_ist = t_utc + IST_OFFSET
+                if not ("09:20" <= t_ist.strftime("%H:%M") <= "15:15"):
+                    continue
+                sym = (a["symbol"] or "").strip().upper()
+                try:
+                    price = float(str(a["trigger_price"]).replace(",", ""))
+                except Exception:
+                    continue
+                prev = last_seen.get((sym, cat))
+                if prev and (t_utc - prev) < timedelta(minutes=15):
+                    continue
+                last_seen[(sym, cat)] = t_utc
+                with get_db() as conn:
+                    if conn.execute("SELECT 1 AS x FROM volume_alert_log WHERE symbol = ? AND category = ? AND alert_time = ?",
+                                    (sym, cat, a["created_at"])).fetchone():
+                        continue
+                option = get_atm_option(sym, "CE" if cat == "Buy" else "PE", price)
+                if not option:
+                    st["no_option"] += 1
+                    continue
+                reading = _build_volume_reading(sym, token, as_of_ist=t_ist)
+                side = reading.get("buy" if cat == "Buy" else "sell") if reading.get("status") == "ok" else None
+                if not side or side.get("label") is None:
+                    st["no_reading"] += 1
+                    time.sleep(0.2)
+                    continue
+                with get_db() as conn:
+                    entered = conn.execute(
+                        "SELECT 1 AS x FROM paper_trades WHERE symbol = ? AND entry_time >= ? AND entry_time < ? LIMIT 1",
+                        (sym, a["created_at"], (t_utc + timedelta(minutes=4)).isoformat())).fetchone()
+                    decision = "ENTERED" if entered else ("STRONG_NOT_TAKEN" if side["label"] == "Strong" else "SKIPPED")
+                    conn.execute(
+                        "INSERT INTO volume_alert_log (alert_time, ist_date, symbol, category, decision, vol_label, vol_ratio, "
+                        "vol_asof, spot_price, option_key, option_label) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                        (a["created_at"], d, sym, cat, decision, side["label"], side["ratio"], reading.get("asof"), price,
+                         option["instrument_key"], f"{sym} {option['strike']:g} {'CE' if cat == 'Buy' else 'PE'} exp {option['expiry']}"))
+                    conn.commit()
+                st["logged"] += 1
+                time.sleep(0.3)
+            while True:
+                r = fill_volume_alert_outcomes(d, token)
+                st["measured"] += r["measured"]
+                if r["rows"] < 300 or r["measured"] == 0:
+                    break
+    except Exception as e:
+        st["error"] = f"{type(e).__name__}: {e}"[:200]
+    finally:
+        st["running"] = False
+        st["finished"] = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d %H:%M:%S")
+
+
+@app.route("/api/volume-test/backfill")
+def api_volume_test_backfill():
+    """?from=YYYY-MM-DD&to=YYYY-MM-DD (to defaults to today, max 14 days).
+    Starts the background rebuild; watch /api/volume-test/backfill-status."""
+    if _vt_backfill_state.get("running"):
+        return jsonify({"error": "a backfill is already running", **_vt_backfill_state}), 409
+    try:
+        token = get_setting("upstox_access_token")
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    if not token:
+        return jsonify({"error": "No Upstox token saved"}), 400
+    today = (datetime.utcnow() + IST_OFFSET).date()
+    try:
+        to_d = datetime.strptime(request.args.get("to") or today.strftime("%Y-%m-%d"), "%Y-%m-%d").date()
+        from_d = datetime.strptime(request.args.get("from") or (to_d - timedelta(days=6)).strftime("%Y-%m-%d"), "%Y-%m-%d").date()
+    except ValueError:
+        return jsonify({"error": "dates must be YYYY-MM-DD"}), 400
+    if from_d > to_d or (to_d - from_d).days > 14:
+        return jsonify({"error": "range must be 1-15 days"}), 400
+    dates = [(from_d + timedelta(days=i)).strftime("%Y-%m-%d") for i in range((to_d - from_d).days + 1)
+             if (from_d + timedelta(days=i)).weekday() < 5]
+    threading.Thread(target=_vt_backfill_job, args=(dates, token), daemon=True, name="vt-backfill").start()
+    return jsonify({"started": True, "dates": dates, "status_url": "/api/volume-test/backfill-status"})
+
+
+@app.route("/api/volume-test/backfill-status")
+def api_volume_test_backfill_status():
+    return jsonify(_vt_backfill_state)
 
 
 @app.route("/api/volume-test")
