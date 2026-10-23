@@ -622,6 +622,8 @@ def init_db():
                 live_planned_risk_pct DOUBLE PRECISION,
                 entry_volume_label TEXT,
                 entry_volume_ratio DOUBLE PRECISION,
+                exit_volume_label TEXT,
+                exit_volume_ratio DOUBLE PRECISION,
                 shadow_tracked INTEGER,
                 shadow_weak_price DOUBLE PRECISION,
                 shadow_weak_time TEXT
@@ -699,6 +701,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_planned_risk_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_volume_label TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_volume_ratio DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_volume_label TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_volume_ratio DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS shadow_tracked INTEGER",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS shadow_weak_price DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS shadow_weak_time TEXT",
@@ -3339,6 +3343,41 @@ def _log_entry_volume(trade_id: int, symbol: str, category: str, entry_iso_utc: 
             conn.commit()
     except Exception:
         pass
+
+
+def _log_exit_volume(trade_id: int, symbol: str, direction: str, exit_iso_utc: str) -> None:
+    """Records the volume reading AS OF EXIT on the trade row (same definition
+    as the entry reading), so the trade history can show how volume strength
+    changed between entry and exit. Own thread, best-effort: a failure just
+    leaves the columns empty. Waits a moment so the close has been committed."""
+    try:
+        time.sleep(1.5)
+        if direction not in ("Buy", "Sell"):
+            return
+        access_token = get_setting("upstox_access_token")
+        if not access_token:
+            return
+        exit_ist = datetime.fromisoformat(exit_iso_utc) + IST_OFFSET
+        reading = _build_volume_reading((symbol or "").strip().upper(), access_token, as_of_ist=exit_ist)
+        if reading.get("status") != "ok":
+            return
+        side = reading["buy" if direction == "Buy" else "sell"]
+        if side.get("label") is None:
+            return
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE paper_trades SET exit_volume_label = ?, exit_volume_ratio = ? WHERE id = ?",
+                (side["label"], side["ratio"], trade_id),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _log_exit_volume_async(trade_id: int, symbol: str, direction: str, exit_iso_utc: str) -> None:
+    threading.Thread(
+        target=_log_exit_volume, args=(trade_id, symbol, direction, exit_iso_utc), daemon=True
+    ).start()
 
 
 def _log_entry_volume_async(trade_id: int, symbol: str, category: str, entry_iso_utc: str) -> None:
@@ -5998,6 +6037,7 @@ def _run_paper_trade_check_impl() -> dict:
                          exit_rsi_val, new_mae_pct, trade["id"]),
                     )
                     closed += 1
+                    _log_exit_volume_async(trade["id"], symbol, trade["direction"], now)
                 elif trade["status"] == "OPEN":
                     conn.execute(
                         "UPDATE paper_trades SET last_checked_price = ?, last_checked_time = ?, last_error = NULL WHERE id = ?",
@@ -8314,6 +8354,7 @@ def paper_trading_manual_exit(trade_id):
                 ),
             )
             conn.commit()
+        _log_exit_volume_async(trade_id, trade["symbol"], trade["direction"], now)
         return jsonify({"status": "ok", "exit_price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct})
     else:
         # Paper already closed via its own rule - this manual exit only
