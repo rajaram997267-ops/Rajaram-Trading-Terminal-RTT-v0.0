@@ -371,7 +371,7 @@
         <div class="date-trades">
           <table>
             <tr>
-              <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Entry RSI</th><th>Exit</th><th>Exit RSI</th>
+              <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Entry RSI</th><th>Entry Vol</th><th>Exit</th><th>Exit RSI</th><th>Exit Vol</th>
               <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time (IST)</th>
             </tr>
             {% for t in group.trades %}
@@ -381,8 +381,10 @@
               <td>{{ t.quantity }}</td>
               <td>{{ t.entry_price }}</td>
               <td>{{ t.entry_rsi if t.entry_rsi is not none else "-" }}</td>
+              <td>{% if t.entry_volume_label %}<span class="vol-pill {{ t.entry_volume_label|lower }}" title="Directional volume vs usual for this time of day">{{ t.entry_volume_label }} &middot; {{ t.entry_volume_ratio }}&times;</span>{% else %}-{% endif %}</td>
               <td>{{ t.exit_price }}</td>
               <td>{{ t.exit_rsi if t.exit_rsi is not none else "-" }}</td>
+              <td>{% if t.exit_volume_label %}<span class="vol-pill {{ t.exit_volume_label|lower }}" title="Directional volume vs usual for this time of day">{{ t.exit_volume_label }} &middot; {{ t.exit_volume_ratio }}&times;</span>{% else %}-{% endif %}</td>
               <td class="{% if t.pnl and t.pnl > 0 %}pnl-pos{% elif t.pnl and t.pnl < 0 %}pnl-neg{% endif %}">{{ t.pnl }}</td>
               <td class="{% if t.pnl_pct and t.pnl_pct > 0 %}pnl-pos{% elif t.pnl_pct and t.pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.pnl_pct if t.pnl_pct is not none else "-" }}{% if t.pnl_pct is not none %}%{% endif %}</td>
               <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{% if not t.rr_is_true %}≈{% endif %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
@@ -434,6 +436,12 @@
         alert("Manual exit failed - see console");
         console.error(err);
       }
+    }
+
+    function volCell(label, ratio) {
+      if (!label) return "-";
+      const r = (ratio === null || ratio === undefined) ? "" : " &middot; " + ratio + "&times;";
+      return `<span class="vol-pill ${String(label).toLowerCase()}" title="Directional volume vs usual for this time of day">${escapeHtml(label)}${r}</span>`;
     }
 
     function escapeHtml(str) {
@@ -548,8 +556,10 @@
               <td>${t.quantity}</td>
               <td>${t.entry_price}</td>
               <td>${entryRsiText}</td>
+              <td>${volCell(t.entry_volume_label, t.entry_volume_ratio)}</td>
               <td>${t.exit_price}</td>
               <td>${exitRsiText}</td>
+              <td>${volCell(t.exit_volume_label, t.exit_volume_ratio)}</td>
               <td class="${rowPnlClass}">${t.pnl}</td>
               <td class="${rowPnlClass}">${pctText}</td>
               <td class="${rrClass(t)}">${rrText(t)}</td>
@@ -573,7 +583,7 @@
             </div>
             <div class="date-trades">
               <table>
-                <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Entry RSI</th><th>Exit</th><th>Exit RSI</th>
+                <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Entry RSI</th><th>Entry Vol</th><th>Exit</th><th>Exit RSI</th><th>Exit Vol</th>
                     <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time (IST)</th></tr>
                 ${rows}
               </table>
