@@ -44,6 +44,7 @@
     <a href="/command-center">Command Center</a>
     <a href="/settings">Settings</a>
     <a href="/shadow" class="{% if active_tab == 'shadow' %}active{% endif %}">Manual vs RSI</a>
+    <a href="/exit-lab" class="{% if active_tab == 'exit_lab' %}active{% endif %}">Exit Lab</a>
   </div>
 
   <div class="cards">
@@ -88,7 +89,7 @@
     <div class="card">Measured (option had a price)<b>{{ vt.measured }}</b></div>
   </div>
   {% macro pct(v) %}{% if v is none %}<span class="mut">-</span>{% else %}<span class="{{ 'pos' if v > 0 else 'neg' if v < 0 else '' }}">{{ '%+.1f' % v }}%</span>{% endif %}{% endmacro %}
-  {% for title, grp in (("All measured alerts", vt.all), ("Liquid contracts only (option traded in 5+ minutes of the first 30)", vt.liquid)) %}
+  {% for title, grp in (("All measured alerts", vt.all), ("Liquid contracts only (option actually traded in 5+ of the first 30 minutes)", vt.liquid)) %}
   <div class="sub" style="margin:14px 0 6px"><b style="color:var(--text)">{{ title }}</b></div>
   <div class="wrap"><table>
     <tr><th>Group</th><th>Alerts</th><th>Avg +15m</th><th>Avg +30m</th><th>Median +30m</th><th>% up at 30m</th><th>Avg +60m</th><th>Avg to close</th></tr>
@@ -96,15 +97,52 @@
       <td>{{ '%.0f%%' % g.up30 if g.up30 is not none else '-' }}</td><td>{{ pct(g.avg60) }}</td><td>{{ pct(g.avg_eod) }}</td></tr>{% endfor %}
   </table></div>
   {% endfor %}
+
+  <h3 style="margin:28px 0 4px">Exit-strategy evidence <span style="color:var(--muted);font-weight:400;font-size:13px">by volume strength at the alert</span></h3>
+  <div class="sub">Built from the option's own 1-minute closes after each alert (intra-minute spikes are ignored, so peaks are conservative). Dip = the lowest price seen; "dip before peak" = how far it fell before reaching its high - the stop that would have survived the winners.
+    Showing: <b style="color:var(--text)">{{ 'liquid contracts only' if vt.liquid_only else 'all measured alerts' }}</b> &middot;
+    {% if vt.liquid_only %}<a href="/shadow?date={{ date }}">show all</a>{% else %}<a href="/shadow?date={{ date }}&liquid=1">show liquid only ({{ vt.liquid_count }} of {{ vt.measured }}: option traded in 5+ of the first 30 minutes)</a>{% endif %}
+    &middot; <a href="/api/volume-test/backfill?from=2026-10-21&measure_only=1">re-measure stored alerts</a> (needed once after this update)</div>
+
+  <div class="sub" style="margin:14px 0 6px"><b style="color:var(--text)">How far and how fast</b></div>
+  <div class="wrap"><table>
+    <tr><th>Volume</th><th>Alerts</th><th>Avg peak (60m)</th><th>Median peak (60m)</th><th>Median min to peak</th><th>Avg deepest dip (60m)</th><th>Median dip before peak</th><th>Avg day peak</th><th>Median min to day peak</th><th>Avg to close</th></tr>
+    {% for x in vt.analysis.speed %}<tr><td>{{ x.bucket }}</td><td>{{ x.n }}</td><td>{{ pct(x.avg_peak60) }}</td><td>{{ pct(x.med_peak60) }}</td>
+      <td>{{ x.med_min_peak60 if x.med_min_peak60 is not none else '-' }}</td><td>{{ pct(x.avg_dip60) }}</td><td>{{ pct(x.med_dip_pre) }}</td>
+      <td>{{ pct(x.avg_peak_day) }}</td><td>{{ x.med_min_peak_day if x.med_min_peak_day is not none else '-' }}</td><td>{{ pct(x.avg_close) }}</td></tr>{% endfor %}
+  </table></div>
+
+  <div class="sub" style="margin:14px 0 6px"><b style="color:var(--text)">Stop test</b> - share of alerts whose option fell to -X% within 60 minutes (touched), and of those, the share that still finished 60 minutes at or above the alert price (recovered = a stop would have cut a winner)</div>
+  <div class="wrap"><table>
+    <tr><th>Stop</th>{% for b in ['Strong','Moderate','Weak'] %}<th>{{ b }} touched</th><th>{{ b }} recovered</th>{% endfor %}</tr>
+    {% for x in vt.analysis.stops %}<tr><td>-{{ x.level }}%</td>{% for b in ['Strong','Moderate','Weak'] %}
+      <td>{{ '%.0f%%' % x[b].touched if x[b].touched is not none else '-' }}</td><td>{{ '%.0f%%' % x[b].recovered if x[b].recovered is not none else '-' }}</td>{% endfor %}</tr>{% endfor %}
+  </table></div>
+
+  <div class="sub" style="margin:14px 0 6px"><b style="color:var(--text)">Target test</b> - share of alerts whose option reached +X% at some point in the first 60 minutes</div>
+  <div class="wrap"><table>
+    <tr><th>Target</th><th>Strong</th><th>Moderate</th><th>Weak</th></tr>
+    {% for x in vt.analysis.targets %}<tr><td>+{{ x.level }}%</td>{% for b in ['Strong','Moderate','Weak'] %}<td>{{ '%.0f%%' % x[b] if x[b] is not none else '-' }}</td>{% endfor %}</tr>{% endfor %}
+  </table></div>
+
+  <div class="sub" style="margin:14px 0 6px"><b style="color:var(--text)">By time of day</b> (alert time, IST)</div>
+  <div class="wrap"><table>
+    <tr><th>Window</th><th>Volume</th><th>Alerts</th><th>Avg +30m</th><th>Avg +60m</th><th>Avg to close</th><th>% up at 30m</th><th>Median peak (60m)</th><th>Median min to day peak</th></tr>
+    {% for x in vt.analysis.tod %}<tr><td>{{ x.window }}</td><td>{{ x.bucket }}</td><td>{{ x.n }}</td><td>{{ pct(x.avg30) }}</td><td>{{ pct(x.avg60) }}</td><td>{{ pct(x.avg_close) }}</td>
+      <td>{{ '%.0f%%' % x.up30 if x.up30 is not none else '-' }}</td><td>{{ pct(x.med_peak60) }}</td><td>{{ x.med_min_peak_day if x.med_min_peak_day is not none else '-' }}</td></tr>{% endfor %}
+  </table></div>
+
   <div class="sub" style="margin:16px 0 6px"><b style="color:var(--text)">Latest logged alerts</b></div>
   <div class="wrap"><table>
-    <tr><th>Date</th><th>Alert time (UTC)</th><th>Symbol</th><th>Dir</th><th>Decision</th><th>Volume</th><th>Option</th><th>At alert</th><th>+15m</th><th>+30m</th><th>+60m</th><th>Close</th><th>Trades in 30m</th><th>Final</th></tr>
+    <tr><th>Date</th><th>Alert time (UTC)</th><th>Symbol</th><th>Dir</th><th>Decision</th><th>Volume</th><th>Option</th><th>At alert</th><th>+15m</th><th>+30m</th><th>+60m</th><th>Close</th><th>Peak 60m</th><th>Dip 60m</th><th>Traded min (30)</th><th>Final</th></tr>
     {% for r in vt.recent %}<tr><td>{{ r.ist_date }}</td><td>{{ r.alert_time[11:19] }}</td><td>{{ r.symbol }}</td><td>{{ r.category }}</td><td>{{ r.decision }}</td>
       <td>{{ r.vol_label }}{% if r.vol_ratio is not none %} &middot; {{ r.vol_ratio }}&times;{% endif %}</td><td class="note">{{ r.option_label }}</td>
       <td>{{ r.p0 if r.p0 is not none else '-' }}</td><td>{{ r.p15 if r.p15 is not none else '-' }}</td><td>{{ r.p30 if r.p30 is not none else '-' }}</td>
       <td>{{ r.p60 if r.p60 is not none else '-' }}</td><td>{{ r.p_eod if r.p_eod is not none else '-' }}</td>
-      <td>{{ r.opt_candles_30 if r.opt_candles_30 is not none else '-' }}</td><td>{{ 'yes' if r.final == 1 else 'no' }}</td></tr>
-    {% else %}<tr><td colspan="14" class="mut">Nothing logged yet. Alerts are logged from the first one after this update, while Volume Entry is ON in Settings.</td></tr>{% endfor %}
+      <td>{% if r.p0 and r.pk60 is not none %}{{ pct((r.pk60 - r.p0) / r.p0 * 100) }}{% else %}-{% endif %}</td>
+      <td>{% if r.p0 and r.dd60 is not none %}{{ pct([ (r.dd60 - r.p0) / r.p0 * 100, 0 ]|min) }}{% else %}-{% endif %}</td>
+      <td>{{ r.traded_min_30 if r.traded_min_30 is not none else '-' }}</td><td>{{ 'yes' if r.final == 1 else 'no' }}</td></tr>
+    {% else %}<tr><td colspan="16" class="mut">Nothing logged yet. Alerts are logged from the first one after this update, while Volume Entry is ON in Settings.</td></tr>{% endfor %}
   </table></div>
 
   <div class="foot">
