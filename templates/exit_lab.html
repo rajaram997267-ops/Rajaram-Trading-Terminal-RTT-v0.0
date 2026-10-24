@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - Exit Lab</title>
+  <style>
+    :root { --bg:#0b0e14; --panel:#131722; --border:#1e222d; --text:#e6e9f0; --muted:#6b7280; --green:#00c896; --gold:#ffb800; --red:#ff5370; }
+    :root[data-theme="light-gray"] { --red:#dc2626; --bg:#e9ebee; --panel:#ffffff; --border:#d0d4da; --text:#1a1d23; --muted:#6b7280; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="sky-blue"] { --red:#dc2626; --bg:#eaf4fb; --panel:#ffffff; --border:#bfe0f2; --text:#10222c; --muted:#4a6572; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="off-white"] { --red:#dc2626; --bg:#f7f5f0; --panel:#ffffff; --border:#e2ddd2; --text:#1f1c16; --muted:#6b6455; --green:#0e9f6e; --gold:#b45309; }
+    * { box-sizing: border-box; }
+    body { font-family:'Segoe UI',Arial,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px 32px 48px; }
+    a { color: var(--green); }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 2px; line-height: 1.5; }
+    .tabbar { display:flex; gap:4px; border-bottom:1px solid var(--border); margin:18px 0 20px; overflow-x:auto; }
+    .tabbar a { padding:10px 14px; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; white-space:nowrap; }
+    .tabbar a.active { color:var(--text); border-bottom-color:var(--green); }
+    .tabbar a:hover { color:var(--text); }
+    .cards { display:flex; gap:12px; flex-wrap:wrap; margin:0 0 18px; }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 14px; font-size:11px; color:var(--muted); text-transform:uppercase; min-width:130px; }
+    .card b { display:block; font-size:18px; margin-top:4px; color:var(--text); text-transform:none; }
+    .card small { display:block; text-transform:none; margin-top:4px; font-size:12px; color:var(--muted); max-width:260px; line-height:1.4; }
+    .wrap { overflow-x:auto; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
+    table { border-collapse:collapse; width:100%; font-size:12px; }
+    th, td { border-bottom:1px solid var(--border); padding:7px 9px; text-align:left; white-space:nowrap; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; }
+    tr:last-child td { border-bottom:none; }
+    .pos { color:var(--green); } .neg { color:var(--red); } .mut { color:var(--muted); }
+    .ctl { margin:10px 0; font-size:13px; color:var(--muted); }
+    .ctl a { margin-right:10px; } .ctl a.on { color:var(--text); font-weight:600; text-decoration:none; }
+    .warn { background:var(--panel); border:1px solid var(--gold); border-radius:8px; padding:10px 14px; font-size:12.5px; line-height:1.55; margin:14px 0; }
+    .fam { color:var(--muted); font-size:11px; }
+    h3 { margin:26px 0 6px; }
+  </style>
+</head>
+<body>
+  <h2 style="margin:0">Exit Lab <span style="color:var(--muted);font-weight:400;font-size:14px">RTT v0.0</span></h2>
+  <div class="sub">Replays {{ res.strategies_tested }} exit rules on every measured alert's real option path and ranks them. Record-only: it never changes a trade.</div>
+
+  <div class="tabbar">
+    <a href="/">Dashboard</a>
+    <a href="/paper-trading">Paper Trading</a>
+    <a href="/live-trading">Live Trading</a>
+    <a href="/stats">Stats</a>
+    <a href="/websocket-stats">WS Speed</a>
+    <a href="/command-center">Command Center</a>
+    <a href="/settings">Settings</a>
+    <a href="/shadow">Manual vs RSI</a>
+    <a href="/exit-lab" class="{% if active_tab == 'exit_lab' %}active{% endif %}">Exit Lab</a>
+  </div>
+
+  <div class="ctl">Alerts by volume at entry:
+    {% for b in ['Strong','Moderate','Weak','All'] %}<a class="{{ 'on' if b == bucket else '' }}" href="/exit-lab?bucket={{ b }}&liquid={{ 1 if liquid else 0 }}&cost={{ cost }}&sort={{ sort }}">{{ b }}</a>{% endfor %}
+    &nbsp;|&nbsp; Contracts: <a class="{{ '' if liquid else 'on' }}" href="/exit-lab?bucket={{ bucket }}&liquid=0&cost={{ cost }}&sort={{ sort }}">all</a><a class="{{ 'on' if liquid else '' }}" href="/exit-lab?bucket={{ bucket }}&liquid=1&cost={{ cost }}&sort={{ sort }}">liquid only</a>
+    &nbsp;|&nbsp; Round-trip cost:
+    {% for c in [0, 1, 2, 3] %}<a class="{{ 'on' if c == cost else '' }}" href="/exit-lab?bucket={{ bucket }}&liquid={{ 1 if liquid else 0 }}&cost={{ c }}&sort={{ sort }}">{{ c }}%</a>{% endfor %}
+  </div>
+
+  <div class="cards">
+    <div class="card">Alerts replayed<b>{{ res.alerts }}</b></div>
+    <div class="card">Trading days<b>{{ res.days|length }}</b></div>
+    <div class="card">Cost per trade<b>{{ cost }}%</b></div>
+    <div class="card">Rules tested<b>{{ res.strategies_tested }}</b></div>
+  </div>
+
+  {% if res.alerts < 10 %}
+  <div class="warn">Not enough measured alerts yet ({{ res.alerts }}). Open <a href="/api/volume-test/backfill?from=2026-10-21&measure_only=1">re-measure stored alerts</a> once (it stores the minute-by-minute paths this page replays), wait for it to finish at <a href="/api/volume-test/backfill-status">progress</a>, then refresh.</div>
+  {% else %}
+
+  <div class="warn"><b>Read this before trusting any row.</b> {{ res.strategies_tested }} rules tried on {{ res.alerts }} alerts from {{ res.days|length }} day(s): some will rank high purely by luck.
+    Prefer rules that (1) are positive on <b>every</b> day column, (2) stay good when you raise the cost to 2-3%, (3) do not depend on one huge winner (look at Median and Worst), and (4) make sense for how the market behaves.
+    Use this page to pick two or three <b>candidates</b>, then let them run in record-only mode on new days before any real money follows them. Exits use 1-minute closes; you can't always exit at the exact close.</div>
+
+  <h3>Top picks</h3>
+  <div class="cards">
+    {% for title, x in res.picks.items() %}
+    <div class="card">{{ title }}<b>{{ x.name }}</b>
+      <small>avg {{ '%+.1f' % x.avg }}% &middot; win {{ '%.0f' % x.win }}% &middot; median {{ '%+.1f' % x.med }}% &middot; worst {{ '%+.1f' % x.worst }}% &middot; avg hold {{ x.hold }} min &middot; positive on {{ x.pos_days }}/{{ res.days|length }} days</small></div>
+    {% endfor %}
+  </div>
+
+  <h3>All rules <span style="color:var(--muted);font-weight:400;font-size:13px">sorted by
+    {% for k, lab in [('avg','average'),('pf','profit factor'),('win','win rate'),('risk','return per risk'),('worst','worst trade'),('hold','shortest hold')] %}<a class="{{ 'on' if k == sort else '' }}" style="margin-left:8px" href="/exit-lab?bucket={{ bucket }}&liquid={{ 1 if liquid else 0 }}&cost={{ cost }}&sort={{ k }}">{{ lab }}</a>{% endfor %}</span></h3>
+  <div class="wrap"><table>
+    <tr><th>#</th><th>Exit rule</th><th>Family</th><th>Avg %</th><th>Median %</th><th>Win %</th><th>Avg win</th><th>Avg loss</th><th>Profit factor</th><th>Worst</th><th>Best</th><th>Avg hold (min)</th>
+      {% for d in res.days %}<th>{{ d[5:] }}</th>{% endfor %}<th>Days +</th></tr>
+    {% for x in rows %}
+    <tr><td class="mut">{{ loop.index }}</td><td>{{ x.name }}</td><td class="fam">{{ x.family }}</td>
+      <td class="{{ 'pos' if x.avg > 0 else 'neg' }}"><b>{{ '%+.2f' % x.avg }}</b></td>
+      <td class="{{ 'pos' if x.med > 0 else 'neg' }}">{{ '%+.2f' % x.med }}</td><td>{{ '%.0f' % x.win }}%</td>
+      <td class="pos">{{ '%+.1f' % x.avg_win if x.avg_win is not none else '-' }}</td><td class="neg">{{ '%+.1f' % x.avg_loss if x.avg_loss is not none else '-' }}</td>
+      <td>{{ x.pf if x.pf is not none else 'no losses' }}</td><td class="neg">{{ '%+.1f' % x.worst }}</td><td class="pos">{{ '%+.1f' % x.best }}</td><td>{{ x.hold }}</td>
+      {% for d in res.days %}{% set v = x.per_day.get(d) %}<td class="{{ 'pos' if v is not none and v > 0 else 'neg' if v is not none else 'mut' }}">{{ '%+.1f' % v if v is not none else '-' }}</td>{% endfor %}
+      <td>{{ x.pos_days }}/{{ res.days|length }}</td></tr>
+    {% endfor %}
+  </table></div>
+
+  <h3>What the families mean</h3>
+  <div class="sub">
+    <b style="color:var(--text)">Time hold</b> - sell after a fixed number of minutes (or hold to the close).<br>
+    <b style="color:var(--text)">Stop only / Stop + target</b> - fixed protection (and profit-taking) measured from the alert price.<br>
+    <b style="color:var(--text)">Trailing stop</b> - sell when the option falls X% from its highest price since the alert (optionally only after it is up +5%).<br>
+    <b style="color:var(--text)">Breakeven + trail</b> - once up +5/+8%, the stop can never drop below the entry price; then it trails.<br>
+    <b style="color:var(--text)">Volume exit</b> - your own idea: sell when the stock's directional volume fades (turns Weak, drops below Strong, drops below Strong twice running, or halves vs entry), checked at each 5-minute close.<br>
+    <b style="color:var(--text)">Volume + trail</b> - whichever comes first: volume fades or the price trail is hit.<br>
+    <b style="color:var(--text)">RSI</b> - your current RSI Simple and RSI Momentum rules (today's Settings), as the benchmark to beat.<br>
+    <b style="color:var(--text)">Scale-out</b> - book half at a target, let the rest ride a trail or a volume exit.
+  </div>
+  {% endif %}
+  <div class="sub" style="margin-top:14px">Computed in {{ res.seconds }}s (cached 5 minutes). Data comes from the Volume filter test on the Manual vs RSI tab.</div>
+</body>
+</html>
