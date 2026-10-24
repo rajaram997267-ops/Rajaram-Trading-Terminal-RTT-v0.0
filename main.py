@@ -556,7 +556,11 @@ def init_db():
                 spot_price DOUBLE PRECISION, option_key TEXT, option_label TEXT,
                 p0 DOUBLE PRECISION, p15 DOUBLE PRECISION, p30 DOUBLE PRECISION,
                 p60 DOUBLE PRECISION, p_eod DOUBLE PRECISION,
-                opt_candles_30 INTEGER, final INTEGER DEFAULT 0
+                opt_candles_30 INTEGER, final INTEGER DEFAULT 0,
+                traded_min_30 INTEGER, vol30 DOUBLE PRECISION,
+                pk60 DOUBLE PRECISION, pk60_min INTEGER, dd60 DOUBLE PRECISION, dd_pre60 DOUBLE PRECISION,
+                pk_day DOUBLE PRECISION, pk_day_min INTEGER,
+                opt_path TEXT, vol_path TEXT, rsi_simple_min INTEGER, rsi_mom_min INTEGER
             )
             """
         )
@@ -681,6 +685,18 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS paper_option_label TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS strategy TEXT DEFAULT 'EMA'",
             "ALTER TABLE rsi_shadow ADD COLUMN IF NOT EXISTS strategy TEXT",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS traded_min_30 INTEGER",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS vol30 DOUBLE PRECISION",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS pk60 DOUBLE PRECISION",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS pk60_min INTEGER",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS dd60 DOUBLE PRECISION",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS dd_pre60 DOUBLE PRECISION",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS pk_day DOUBLE PRECISION",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS pk_day_min INTEGER",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS opt_path TEXT",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS vol_path TEXT",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS rsi_simple_min INTEGER",
+            "ALTER TABLE volume_alert_log ADD COLUMN IF NOT EXISTS rsi_mom_min INTEGER",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_reason TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS original_quantity INTEGER",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS target1_hit_time TEXT",
@@ -7863,14 +7879,100 @@ def api_diag_equal_price_exits():
     return jsonify({"date": date_str, "count": len(out), "trades": out})
 
 
+def _vt_underlying_day(key: str, access_token: str, day: str) -> list:
+    """The underlying's 5-minute candles for one IST day (today via the intraday
+    endpoint, an earlier day via the historical one), oldest first."""
+    q = urllib.parse.quote(key, safe='|')
+    if day < _ist_today_str():
+        url = f"https://api.upstox.com/v3/historical-candle/{q}/minutes/5/{day}/{day}"
+    else:
+        url = f"https://api.upstox.com/v3/historical-candle/intraday/{q}/minutes/5"
+    return [c for c in _vol_fetch_candles(url, access_token) if c[0][:10] == day]
+
+
+def _vt_warmup_before(key: str, access_token: str, day: str) -> list:
+    """(o, h, l, c) 5-minute candles from the sessions BEFORE `day`, for RSI warm-up."""
+    d = datetime.strptime(day, "%Y-%m-%d")
+    url = (f"https://api.upstox.com/v3/historical-candle/{urllib.parse.quote(key, safe='|')}/minutes/5/"
+           f"{(d - timedelta(days=1)).strftime('%Y-%m-%d')}/{(d - timedelta(days=8)).strftime('%Y-%m-%d')}")
+    try:
+        raw = _vol_fetch_candles(url, access_token)
+    except Exception:
+        return []
+    return [(c[1], c[2], c[3], c[4]) for c in raw][-60:]
+
+
+def _vt_volume_series(raw_day: list, slots: dict) -> list:
+    """The directional-volume reading at EVERY 5-minute close of the day, using
+    exactly the same maths as _build_volume_reading: [(end_ist, {'buy': (label,
+    ratio), 'sell': (label, ratio)})]."""
+    closed = []
+    for c in sorted(raw_day, key=lambda c: c[0]):
+        start = datetime.strptime(c[0][:19], "%Y-%m-%dT%H:%M:%S")
+        if start.hour * 60 + start.minute >= _VOL_CONTINUOUS_END_MINUTES:
+            continue
+        closed.append((start, c))
+
+    def side_ratio(c, side):
+        base = slots.get(c[0][11:16])
+        if not base or base["n"] < _VOL_MIN_HISTORY_SESSIONS or base[side] <= 0:
+            return None
+        buy, sell = _directional_pressure(c[2], c[3], c[4], c[5])
+        return (buy if side == "buy" else sell) / base[side]
+
+    out = []
+    for i, (start, c) in enumerate(closed):
+        prev = closed[i - 1][1] if i > 0 else None
+        rd = {}
+        for side in ("buy", "sell"):
+            r = side_ratio(c, side)
+            pr = side_ratio(prev, side) if prev else None
+            rd[side] = (_volume_strength_label(r, pr), None if r is None else round(r, 2))
+        out.append((start + timedelta(minutes=5), rd))
+    return out
+
+
+def _vt_rsi_marks(direction: str, warm: list, raw_day: list, t0: datetime, eod: datetime):
+    """Minutes after the alert at which the RSI Simple / RSI Momentum exit rule
+    (current settings) would first fire - evaluated on the candles already
+    closed at the alert and then at every later 5-minute close."""
+    candles = []
+    for c in sorted(raw_day, key=lambda c: c[0]):
+        st = datetime.strptime(c[0][:19], "%Y-%m-%dT%H:%M:%S")
+        candles.append((st + timedelta(minutes=5), (c[1], c[2], c[3], c[4])))
+    rule = dict(rsi_period=get_rsi_period(), call_threshold=get_rsi_call_threshold(),
+                put_warning_threshold=get_rsi_put_warning_threshold(), confirm_candles=get_rsi_confirm_candles())
+    ema = get_rsi_ema_period()
+    simple = mom = None
+    for T in [t0] + [e for e, _ in candles if t0 < e <= eod]:
+        prefix = [ohlc for e, ohlc in candles if e <= T]
+        if not prefix:
+            continue
+        series = _engine_series(warm, prefix)
+        minute = max(1, int(-(-(T - t0).total_seconds() // 60)))
+        if simple is None and check_rsi_simple_exit(direction, series, **rule)[0]:
+            simple = minute
+        if mom is None and check_rsi_momentum_exit(direction, series, ema_period=ema, **rule)[0]:
+            mom = minute
+        if simple is not None and mom is not None:
+            break
+    return simple, mom
+
+
 def fill_volume_alert_outcomes(date_str: str, access_token: str, now_ist: datetime | None = None) -> dict:
-    """Measures what each logged alert's option did next: its price when the
-    alert fired and 15 / 30 / 60 minutes later and at the close, from the
-    option's own 1-minute candles. Same method for every group."""
+    """Measures what each logged alert's option did next, from the option's own
+    1-minute candles (closes): its price at the alert and +15/+30/+60 minutes
+    and at the close, plus the peak and the deepest dip inside the first 60
+    minutes (and the peak of the whole day) with how many minutes after the
+    alert each happened, and how many of the first 30 minutes actually traded.
+    Same method for every group. Re-measures rows still lacking the newer
+    columns, so older rows are upgraded in place."""
     now_ist = now_ist or (datetime.utcnow() + IST_OFFSET)
     with get_db() as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM volume_alert_log WHERE ist_date = ? AND final = 0 ORDER BY id LIMIT 300", (date_str,)).fetchall()]
+            "SELECT * FROM volume_alert_log WHERE ist_date = ? AND (final = 0 OR traded_min_30 IS NULL "
+            "OR opt_path IS NULL OR vol_path IS NULL) ORDER BY id LIMIT 300",
+            (date_str,)).fetchall()]
     day_over = date_str < now_ist.strftime("%Y-%m-%d") or now_ist.strftime("%H:%M") >= "15:30"
     auto_exit = get_auto_exit_time()
     try:
@@ -7879,6 +7981,8 @@ def fill_volume_alert_outcomes(date_str: str, access_token: str, now_ist: dateti
     except Exception:
         eod = datetime.strptime(date_str, "%Y-%m-%d").replace(hour=15, minute=20)
     cache: dict = {}
+    ucache: dict = {}
+    is_past_day = date_str < _ist_today_str()
     out = {"date": date_str, "rows": len(rows), "measured": 0, "failed": 0}
     for r in rows:
         try:
@@ -7890,16 +7994,79 @@ def fill_volume_alert_outcomes(date_str: str, access_token: str, now_ist: dateti
                 return _option_price_at(opt, when) if when <= now_ist else None
             vals = {"p0": at(t0), "p15": at(t0 + timedelta(minutes=15)), "p30": at(t0 + timedelta(minutes=30)),
                     "p60": at(t0 + timedelta(minutes=60)), "p_eod": at(eod) if eod > t0 else None}
-            candles_30 = sum(1 for c in opt if t0 <= _to_naive_ist(c[0]) < t0 + timedelta(minutes=30))
+            cs = []
+            for c in opt:
+                st = _to_naive_ist(c[0])
+                cs.append((st, st + timedelta(minutes=1), c[4], c[5] or 0))
+            def series(limit):
+                return [(max(1, int(-(-(en - t0).total_seconds() // 60))), cl)
+                        for st, en, cl, v in cs if st >= t0 and st < limit and en <= now_ist]
+            s60, sday = series(t0 + timedelta(minutes=60)), series(eod)
+            def peak(sr):
+                if not sr:
+                    return None, None, None
+                i = 0
+                for k, (m, cl) in enumerate(sr):
+                    if cl > sr[i][1]:
+                        i = k
+                return sr[i][1], sr[i][0], i
+            pk60, pk60_min, pk_i = peak(s60)
+            dd60 = min((cl for _, cl in s60), default=None)
+            dd_pre60 = min((cl for _, cl in s60[:pk_i + 1]), default=None) if pk_i is not None else None
+            pk_day, pk_day_min, _ = peak(sday)
+            w30 = [x for x in cs if x[0] >= t0 and x[0] < t0 + timedelta(minutes=30) and x[1] <= now_ist]
+            traded_min_30 = sum(1 for x in w30 if x[3] > 0)
+            vol30 = float(sum(x[3] for x in w30))
+
+            # --- the per-minute option path and the volume / RSI signals the Exit Lab replays ---
+            path_json, vol_json, rsi_s, rsi_m = "[]", None, None, None
+            if vals["p0"] is not None:
+                ends_closes = [(en, cl) for st, en, cl, v in cs]
+                path, j, last = [], 0, vals["p0"]
+                for i in range(1, max(0, int((eod - t0).total_seconds() // 60)) + 1):
+                    when = t0 + timedelta(minutes=i)
+                    if when > now_ist:
+                        break
+                    while j < len(ends_closes) and ends_closes[j][0] <= when:
+                        last = ends_closes[j][1]
+                        j += 1
+                    path.append(round(last, 2))
+                path_json = json.dumps(path, separators=(",", ":"))
+                try:
+                    ukey = get_instrument_key(r["symbol"])
+                    if ukey:
+                        if (ukey, date_str) not in ucache:
+                            raw_day = _vt_underlying_day(ukey, access_token, date_str)
+                            slots = (_get_volume_history_before(ukey, access_token, date_str) if is_past_day
+                                     else _get_volume_history(ukey, access_token))
+                            warm = _vt_warmup_before(ukey, access_token, date_str)
+                            ucache[(ukey, date_str)] = (raw_day, slots, warm)
+                            time.sleep(0.15)
+                        raw_day, slots, warm = ucache[(ukey, date_str)]
+                        side = "buy" if r["category"] == "Buy" else "sell"
+                        vp = []
+                        for end, rd in _vt_volume_series(raw_day, slots):
+                            if t0 < end <= eod:
+                                lab, ratio = rd[side]
+                                vp.append([max(1, int(-(-(end - t0).total_seconds() // 60))),
+                                           {"Strong": "S", "Moderate": "M", "Weak": "W"}.get(lab, "N"), ratio])
+                        vol_json = json.dumps(vp, separators=(",", ":"))
+                        rsi_s, rsi_m = _vt_rsi_marks(r["category"], warm, raw_day, t0, eod)
+                except Exception:
+                    vol_json = None      # stays NULL so the next measurement run retries it
             with get_db() as conn:
-                conn.execute("UPDATE volume_alert_log SET p0 = ?, p15 = ?, p30 = ?, p60 = ?, p_eod = ?, "
-                             "opt_candles_30 = ?, final = ? WHERE id = ?",
-                             (vals["p0"], vals["p15"], vals["p30"], vals["p60"], vals["p_eod"],
-                              candles_30, 1 if day_over else 0, r["id"]))
+                conn.execute(
+                    "UPDATE volume_alert_log SET p0 = ?, p15 = ?, p30 = ?, p60 = ?, p_eod = ?, opt_candles_30 = ?, "
+                    "traded_min_30 = ?, vol30 = ?, pk60 = ?, pk60_min = ?, dd60 = ?, dd_pre60 = ?, pk_day = ?, "
+                    "pk_day_min = ?, opt_path = ?, vol_path = ?, rsi_simple_min = ?, rsi_mom_min = ?, final = ? WHERE id = ?",
+                    (vals["p0"], vals["p15"], vals["p30"], vals["p60"], vals["p_eod"], len(w30), traded_min_30, vol30,
+                     pk60, pk60_min, dd60, dd_pre60, pk_day, pk_day_min, path_json, vol_json, rsi_s, rsi_m,
+                     1 if day_over else 0, r["id"]))
                 conn.commit()
             out["measured"] += 1
         except Exception:
             out["failed"] += 1
+    _exit_lab_cache.clear()
     return out
 
 
@@ -7914,43 +8081,121 @@ def _vt_group(r: dict) -> str:
 
 _VT_ORDER = ["Strong - traded", "Strong - not taken (trade open etc.)", "Moderate - skipped", "Weak - skipped", "No reading - skipped",
              "Traded without Strong (rule was off)"]
+_VT_BUCKETS = ("Strong", "Moderate", "Weak")
+_VT_STOPS = (3, 5, 8, 10, 15)
+_VT_TARGETS = (3, 5, 8, 10, 15)
+_VT_LIQUID_MIN_TRADED_MINUTES = 5
+
+
+def _vt_liquid(r: dict) -> bool:
+    """Liquid = the option really traded (volume > 0) in 5+ of the first 30 minutes."""
+    return (r.get("traded_min_30") or 0) >= _VT_LIQUID_MIN_TRADED_MINUTES
+
+
+def _vt_pc(r: dict, col: str):
+    v, p0 = r.get(col), r.get("p0")
+    return None if v is None or not p0 else (v - p0) / p0 * 100
+
+
+def _vt_avg(xs):
+    xs = [x for x in xs if x is not None]
+    return round(sum(xs) / len(xs), 2) if xs else None
+
+
+def _vt_med(xs):
+    import statistics
+    xs = [x for x in xs if x is not None]
+    return round(statistics.median(xs), 2) if xs else None
 
 
 def _volume_test_summary(rows: list[dict], liquid_only: bool = False) -> list[dict]:
-    """Per group: how the option moved after the alert (all long options, so a
-    positive % always means the alert's direction was right)."""
-    import statistics
+    """Per decision group: how the option moved after the alert (all long
+    options, so a positive % always means the alert's direction was right)."""
     groups: dict[str, list[dict]] = {g: [] for g in _VT_ORDER}
     for r in rows:
-        if not r.get("p0"):
-            continue
-        if liquid_only and (r.get("opt_candles_30") or 0) < 5:
+        if not r.get("p0") or (liquid_only and not _vt_liquid(r)):
             continue
         groups[_vt_group(r)].append(r)
-    def pcts(rs, col):
-        return [(x[col] - x["p0"]) / x["p0"] * 100 for x in rs if x.get(col) is not None]
     out = []
     for g in _VT_ORDER:
         rs = groups[g]
-        p30 = pcts(rs, "p30")
+        p30 = [x for x in (_vt_pc(r, "p30") for r in rs) if x is not None]
         item = {"group": g, "n": len(rs), "n30": len(p30)}
         for col, key in (("p15", "avg15"), ("p30", "avg30"), ("p60", "avg60"), ("p_eod", "avg_eod")):
-            v = pcts(rs, col)
-            item[key] = round(sum(v) / len(v), 2) if v else None
-        item["med30"] = round(statistics.median(p30), 2) if p30 else None
+            item[key] = _vt_avg([_vt_pc(r, col) for r in rs])
+        item["med30"] = _vt_med(p30)
         item["up30"] = round(100 * sum(1 for v in p30 if v > 0) / len(p30), 1) if p30 else None
         out.append(item)
     return out
 
 
-def _volume_test_view(limit_rows: int = 40) -> dict:
+def _volume_test_analysis(rows: list[dict]) -> dict:
+    """Exit-strategy evidence, by volume strength at the alert: how far and how
+    fast the option moves, how deep it dips first, and how often a stop or a
+    target would have been touched in the first 60 minutes."""
+    by = {b: [r for r in rows if r.get("p0") and r.get("vol_label") == b] for b in _VT_BUCKETS}
+    speed = []
+    for b in _VT_BUCKETS:
+        rs = by[b]
+        pk = [None if _vt_pc(r, "pk60") is None else max(0.0, _vt_pc(r, "pk60")) for r in rs]
+        dd = [None if _vt_pc(r, "dd60") is None else min(0.0, _vt_pc(r, "dd60")) for r in rs]
+        dpre = [None if _vt_pc(r, "dd_pre60") is None else min(0.0, _vt_pc(r, "dd_pre60")) for r in rs]
+        pkd = [None if _vt_pc(r, "pk_day") is None else max(0.0, _vt_pc(r, "pk_day")) for r in rs]
+        speed.append({
+            "bucket": b, "n": len(rs), "avg_peak60": _vt_avg(pk), "med_peak60": _vt_med(pk),
+            "med_min_peak60": _vt_med([r.get("pk60_min") for r in rs]), "avg_dip60": _vt_avg(dd),
+            "med_dip_pre": _vt_med(dpre), "avg_peak_day": _vt_avg(pkd),
+            "med_min_peak_day": _vt_med([r.get("pk_day_min") for r in rs]), "avg_close": _vt_avg([_vt_pc(r, "p_eod") for r in rs]),
+        })
+    stops = []
+    for lv in _VT_STOPS:
+        row = {"level": lv}
+        for b in _VT_BUCKETS:
+            have = [r for r in by[b] if _vt_pc(r, "dd60") is not None]
+            touched = [r for r in have if _vt_pc(r, "dd60") <= -lv]
+            rec = [r for r in touched if _vt_pc(r, "p60") is not None]
+            row[b] = {
+                "touched": round(100 * len(touched) / len(have), 0) if have else None,
+                "recovered": round(100 * sum(1 for r in rec if _vt_pc(r, "p60") >= 0) / len(rec), 0) if rec else None,
+            }
+        stops.append(row)
+    targets = []
+    for lv in _VT_TARGETS:
+        row = {"level": lv}
+        for b in _VT_BUCKETS:
+            have = [r for r in by[b] if _vt_pc(r, "pk60") is not None]
+            row[b] = round(100 * sum(1 for r in have if _vt_pc(r, "pk60") >= lv) / len(have), 0) if have else None
+        targets.append(row)
+    windows = [("09:20-10:30", "09:20", "10:30"), ("10:30-12:30", "10:30", "12:30"), ("12:30-15:15", "12:30", "15:15")]
+    tod = []
+    for name, lo, hi in windows:
+        for label, pick in (("Strong", lambda r: r.get("vol_label") == "Strong"),
+                            ("Moderate/Weak", lambda r: r.get("vol_label") in ("Moderate", "Weak"))):
+            rs = [r for r in rows if r.get("p0") and pick(r)
+                  and lo <= (datetime.fromisoformat(r["alert_time"]) + IST_OFFSET).strftime("%H:%M") < hi]
+            p30 = [x for x in (_vt_pc(r, "p30") for r in rs) if x is not None]
+            tod.append({
+                "window": name, "bucket": label, "n": len(rs), "avg30": _vt_avg(p30),
+                "avg60": _vt_avg([_vt_pc(r, "p60") for r in rs]), "avg_close": _vt_avg([_vt_pc(r, "p_eod") for r in rs]),
+                "up30": round(100 * sum(1 for v in p30 if v > 0) / len(p30), 0) if p30 else None,
+                "med_peak60": _vt_med([None if _vt_pc(r, "pk60") is None else max(0.0, _vt_pc(r, "pk60")) for r in rs]),
+                "med_min_peak_day": _vt_med([r.get("pk_day_min") for r in rs]),
+            })
+    return {"speed": speed, "stops": stops, "targets": targets, "tod": tod}
+
+
+def _volume_test_view(limit_rows: int = 40, liquid_only: bool = False) -> dict:
     with get_db() as conn:
         rows = [dict(r) for r in conn.execute("SELECT * FROM volume_alert_log ORDER BY id DESC LIMIT 3000").fetchall()]
+    use = [r for r in rows if (not liquid_only or _vt_liquid(r))]
     return {
         "total_logged": len(rows),
         "measured": sum(1 for r in rows if r.get("p0")),
+        "liquid_only": liquid_only,
+        "liquid_count": sum(1 for r in rows if r.get("p0") and _vt_liquid(r)),
         "all": _volume_test_summary(rows),
         "liquid": _volume_test_summary(rows, liquid_only=True),
+        "analysis": _volume_test_analysis(use),
         "recent": rows[:limit_rows],
     }
 
@@ -7958,7 +8203,7 @@ def _volume_test_view(limit_rows: int = 40) -> dict:
 _vt_backfill_state: dict = {"running": False}
 
 
-def _vt_backfill_job(dates: list[str], token: str) -> None:
+def _vt_backfill_job(dates: list[str], token: str, log_alerts: bool = True) -> None:
     """Rebuilds the volume-filter log from alerts already stored in the
     database: for each past Buy/Sell alert, the volume reading AS OF that
     moment, whether a trade was actually opened for it, and (afterwards) what
@@ -7969,7 +8214,7 @@ def _vt_backfill_job(dates: list[str], token: str) -> None:
     try:
         for d in dates:
             st["day"] = d
-            alerts = sorted(_alerts_for_ist_date(d), key=lambda a: a["created_at"])
+            alerts = sorted(_alerts_for_ist_date(d), key=lambda a: a["created_at"]) if log_alerts else []
             last_seen: dict = {}
             for a in alerts:
                 cat = categorize(a)
@@ -8050,13 +8295,245 @@ def api_volume_test_backfill():
         return jsonify({"error": "range must be 1-15 days"}), 400
     dates = [(from_d + timedelta(days=i)).strftime("%Y-%m-%d") for i in range((to_d - from_d).days + 1)
              if (from_d + timedelta(days=i)).weekday() < 5]
-    threading.Thread(target=_vt_backfill_job, args=(dates, token), daemon=True, name="vt-backfill").start()
+    measure_only = request.args.get("measure_only") == "1"   # re-measure existing rows only, log nothing new
+    threading.Thread(target=_vt_backfill_job, args=(dates, token, not measure_only), daemon=True, name="vt-backfill").start()
     return jsonify({"started": True, "dates": dates, "status_url": "/api/volume-test/backfill-status"})
 
 
 @app.route("/api/volume-test/backfill-status")
 def api_volume_test_backfill_status():
     return jsonify(_vt_backfill_state)
+
+
+# =============================================================================
+# EXIT LAB - replays a library of exit rules on every logged alert's real
+# option path and ranks them. Record-only: it never touches a trade.
+# Each alert is "bought" at its alert-time price and followed minute by minute
+# (1-minute option closes) with the volume readings and RSI exit signals the
+# measurement step stored. Exits happen at the close of the minute the rule
+# fires; a round-trip cost % (spread/slippage) is deducted from every trade.
+# =============================================================================
+_exit_lab_cache: dict = {}
+_EXIT_LAB_TTL = 300
+
+
+def _sim_exit(spec: dict, path: list, p0: float, vmap: dict, r0, rsi_s, rsi_m):
+    """One exit rule on one alert. path[i] = option price i+1 minutes after the
+    alert. Returns (exit_minute, exit_price), or None if there is no path."""
+    n = len(path)
+    if n == 0 or not p0:
+        return None
+    kind = spec["kind"]
+    if kind == "scale":
+        base = _sim_exit(spec["then"], path, p0, vmap, r0, rsi_s, rsi_m)
+        if base is None:
+            return None
+        tgt = p0 * (1 + spec["t1"] / 100)
+        hit = next((i + 1 for i in range(base[0]) if path[i] >= tgt), None)
+        if hit is not None:
+            frac = spec.get("frac", 0.5)
+            return base[0], frac * path[hit - 1] + (1 - frac) * base[1]
+        return base
+    cap = min(spec.get("max_min") or n, n)
+    stop, target, trail = spec.get("stop"), spec.get("target"), spec.get("trail")
+    stop_px = p0 * (1 - stop / 100) if stop else None
+    tgt_px = p0 * (1 + target / 100) if target else None
+    arm_px = p0 * (1 + (spec.get("arm") or 0) / 100)
+    be = spec.get("be", False)
+    peak, armed = p0, trail is not None and not spec.get("arm")
+    mode, streak = spec.get("mode"), 0
+    rsi_min = rsi_s if spec.get("which") == "simple" else rsi_m
+    for i in range(cap):
+        px, m = path[i], i + 1
+        if stop_px is not None and px <= stop_px:
+            return m, px
+        if tgt_px is not None and px >= tgt_px:
+            return m, px
+        if px > peak:
+            peak = px
+        if trail is not None:
+            if not armed and peak >= arm_px:
+                armed = True
+            if armed:
+                lvl = peak * (1 - trail / 100)
+                if be and lvl < p0:
+                    lvl = p0
+                if px <= lvl:
+                    return m, px
+        if kind == "vol" and m in vmap:
+            code, ratio = vmap[m]
+            if mode == "weak":
+                hit = code == "W"
+            elif mode == "not_strong":
+                hit = code in ("M", "W")
+            elif mode == "two_not_strong":
+                streak = streak + 1 if code in ("M", "W") else 0
+                hit = streak >= 2
+            elif mode == "half_ratio":
+                hit = ratio is not None and bool(r0) and ratio < 0.5 * r0
+            else:
+                hit = False
+            if hit:
+                return m, px
+        if kind == "rsi" and rsi_min is not None and m >= rsi_min:
+            return m, px
+    return cap, path[cap - 1]
+
+
+def _exit_lab_strategies() -> list[dict]:
+    out = []
+    def add(family, name, **spec):
+        out.append({"family": family, "name": name, "spec": spec})
+    for mins in (15, 30, 45, 60, 90, 120):
+        add("Time hold", f"Sell after {mins} min", kind="hold", max_min=mins)
+    add("Time hold", "Hold to the end of the day", kind="hold")
+    for st in (8, 10, 15, 20):
+        add("Stop only", f"Stop -{st}%, otherwise hold to close", kind="bracket", stop=st)
+    for st in (8, 10, 15):
+        for tg in (10, 15, 20, 30):
+            add("Stop + target", f"Stop -{st}% / target +{tg}%", kind="bracket", stop=st, target=tg)
+    for st in (10, 15):
+        for tr in (5, 8, 10, 15):
+            add("Trailing stop", f"Trail {tr}% from the peak (hard stop -{st}%)", kind="trail", trail=tr, stop=st)
+    for tr in (5, 8, 10):
+        add("Trailing stop", f"Trail {tr}% once up +5% (hard stop -10%)", kind="trail", trail=tr, arm=5, stop=10)
+    for arm, tr in ((5, 6), (5, 10), (8, 6), (8, 10)):
+        add("Breakeven + trail", f"After +{arm}% lock breakeven, trail {tr}% (stop -10%)", kind="trail", trail=tr, arm=arm, be=True, stop=10)
+    for mm in (60, 90):
+        for tr in (8, 10):
+            add("Trail + time cap", f"Trail {tr}% (stop -10%), sell by {mm} min", kind="trail", trail=tr, stop=10, max_min=mm)
+    names = {"weak": "volume turns Weak", "not_strong": "volume drops below Strong", "two_not_strong": "volume below Strong twice in a row",
+             "half_ratio": "volume ratio halves vs entry"}
+    for mode, label in names.items():
+        for st in (None, 10, 15):
+            add("Volume exit", f"Exit when {label}" + (f" (stop -{st}%)" if st else ""), kind="vol", mode=mode, stop=st)
+    for mode in ("weak", "two_not_strong"):
+        add("Volume + trail", f"Exit when {names[mode]} OR trail 10% (stop -10%)", kind="vol", mode=mode, trail=10, stop=10)
+    for which, label in (("simple", "RSI Simple"), ("mom", "RSI Momentum")):
+        for st in (None, 10, 15):
+            add("RSI (your current rules)", f"{label} exit" + (f" (stop -{st}%)" if st else ""), kind="rsi", which=which, stop=st)
+    for t1 in (8, 10, 15):
+        add("Scale-out", f"Half at +{t1}%, rest trails 10% (stop -10%)", kind="scale", t1=t1, frac=0.5,
+            then={"kind": "trail", "trail": 10, "stop": 10})
+        add("Scale-out", f"Half at +{t1}%, rest exits when volume turns Weak (stop -10%)", kind="scale", t1=t1, frac=0.5,
+            then={"kind": "vol", "mode": "weak", "stop": 10})
+    return out
+
+
+def _lab_metrics(pnls: list[float]) -> dict:
+    import statistics
+    n = len(pnls)
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x <= 0]
+    avg = sum(pnls) / n
+    sd = statistics.pstdev(pnls) if n > 1 else 0.0
+    return {
+        "avg": round(avg, 2), "med": round(statistics.median(pnls), 2), "win": round(100 * len(wins) / n, 0),
+        "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
+        "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
+        "pf": round(sum(wins) / abs(sum(losses)), 2) if losses and sum(losses) < 0 else None,
+        "worst": round(min(pnls), 2), "best": round(max(pnls), 2),
+        "per_risk": round(avg / sd, 2) if sd > 0 else None,
+    }
+
+
+def _exit_lab_run(bucket: str = "Strong", liquid: bool = False, cost: float = 1.0) -> dict:
+    key = (bucket, liquid, round(cost, 2))
+    hit = _exit_lab_cache.get(key)
+    if hit and time.time() - hit[0] < _EXIT_LAB_TTL:
+        return hit[1]
+    t_start = time.time()
+    with get_db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT ist_date, category, vol_label, vol_ratio, p0, traded_min_30, opt_path, vol_path, rsi_simple_min, rsi_mom_min "
+            "FROM volume_alert_log WHERE p0 IS NOT NULL AND opt_path IS NOT NULL ORDER BY id DESC LIMIT 3000").fetchall()]
+    sample = []
+    for r in rows:
+        if bucket != "All" and r["vol_label"] != bucket:
+            continue
+        if liquid and not _vt_liquid(r):
+            continue
+        try:
+            path = json.loads(r["opt_path"])
+            vmap = {int(m): (c, ratio) for m, c, ratio in json.loads(r["vol_path"] or "[]")}
+        except Exception:
+            continue
+        if len(path) < 5:
+            continue
+        sample.append({"day": r["ist_date"], "p0": r["p0"], "path": path, "vmap": vmap, "r0": r["vol_ratio"],
+                       "rs": r["rsi_simple_min"], "rm": r["rsi_mom_min"]})
+    days = sorted({a["day"] for a in sample})
+    results = []
+    for st in _exit_lab_strategies():
+        pnls, holds, by_day = [], [], {}
+        for a in sample:
+            res = _sim_exit(st["spec"], a["path"], a["p0"], a["vmap"], a["r0"], a["rs"], a["rm"])
+            if res is None:
+                continue
+            m, px = res
+            pnl = (px / a["p0"] - 1) * 100 - cost
+            pnls.append(pnl)
+            holds.append(m)
+            by_day.setdefault(a["day"], []).append(pnl)
+        if not pnls:
+            continue
+        item = {"name": st["name"], "family": st["family"], "n": len(pnls),
+                "hold": round(sum(holds) / len(holds)), **_lab_metrics(pnls)}
+        item["per_day"] = {d: round(sum(v) / len(v), 2) for d, v in by_day.items()}
+        item["pos_days"] = sum(1 for v in item["per_day"].values() if v > 0)
+        results.append(item)
+    results.sort(key=lambda x: x["avg"], reverse=True)
+    picks = {}
+    if results:
+        picks["Highest average"] = results[0]
+        with_pf = [x for x in results if x["pf"] is not None]
+        if with_pf:
+            picks["Best profit factor"] = max(with_pf, key=lambda x: x["pf"])
+        with_risk = [x for x in results if x["per_risk"] is not None]
+        if with_risk:
+            picks["Best return per unit of risk"] = max(with_risk, key=lambda x: x["per_risk"])
+        steady = [x for x in results if len(days) >= 2 and x["pos_days"] == len(days)]
+        if steady:
+            picks["Positive on every day (highest avg)"] = steady[0]
+    out = {"bucket": bucket, "liquid": liquid, "cost": cost, "alerts": len(sample), "days": days,
+           "strategies_tested": len(results), "results": results, "picks": picks,
+           "seconds": round(time.time() - t_start, 1)}
+    _exit_lab_cache[key] = (time.time(), out)
+    return out
+
+
+@app.route("/exit-lab")
+def exit_lab_page():
+    bucket = request.args.get("bucket", "Strong")
+    if bucket not in ("Strong", "Moderate", "Weak", "All"):
+        bucket = "Strong"
+    liquid = request.args.get("liquid") == "1"
+    try:
+        cost = max(0.0, min(float(request.args.get("cost", 1.0)), 10.0))
+    except ValueError:
+        cost = 1.0
+    sort = request.args.get("sort", "avg")
+    try:
+        res = _exit_lab_run(bucket, liquid, cost)
+    except (psycopg2.Error, RuntimeError):
+        return "Database unavailable", 503
+    key = {"avg": ("avg", True), "pf": ("pf", True), "win": ("win", True), "worst": ("worst", True),
+           "risk": ("per_risk", True), "hold": ("hold", False)}.get(sort, ("avg", True))
+    rows = sorted(res["results"], key=lambda x: (x[key[0]] is None, -(x[key[0]] or 0) if key[1] else (x[key[0]] or 0)))
+    return render_template("exit_lab.html", active_tab="exit_lab", res=res, rows=rows, bucket=bucket, liquid=liquid,
+                           cost=cost, sort=sort)
+
+
+@app.route("/api/exit-lab")
+def api_exit_lab():
+    bucket = request.args.get("bucket", "Strong")
+    try:
+        cost = max(0.0, min(float(request.args.get("cost", 1.0)), 10.0))
+        res = _exit_lab_run(bucket if bucket in ("Strong", "Moderate", "Weak", "All") else "Strong",
+                            request.args.get("liquid") == "1", cost)
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    return jsonify(res)
 
 
 @app.route("/api/volume-test")
@@ -8070,7 +8547,7 @@ def api_volume_test():
             if not token:
                 return jsonify({"error": "No Upstox token saved"}), 400
             refreshed = fill_volume_alert_outcomes(date_str, token)
-        view = _volume_test_view()
+        view = _volume_test_view(liquid_only=request.args.get("liquid") == "1")
     except (psycopg2.Error, RuntimeError):
         return jsonify({"error": "database unavailable"}), 503
     return jsonify({"refreshed": refreshed, **view})
@@ -8086,7 +8563,7 @@ def shadow_page():
                 compute_shadow_for_date(date_str, token)
                 fill_volume_alert_outcomes(date_str, token)
         rows, summary = _shadow_rows(date_str)
-        vt = _volume_test_view()
+        vt = _volume_test_view(liquid_only=request.args.get("liquid") == "1")
     except (psycopg2.Error, RuntimeError):
         return "Database unavailable", 503
     return render_template("shadow.html", active_tab="shadow", date=date_str, rows=rows, s=summary, vt=vt)
