@@ -641,6 +641,7 @@ def init_db():
                 entry_volume_ratio DOUBLE PRECISION,
                 exit_volume_label TEXT,
                 exit_volume_ratio DOUBLE PRECISION,
+                lab_state TEXT,
                 shadow_tracked INTEGER,
                 shadow_weak_price DOUBLE PRECISION,
                 shadow_weak_time TEXT
@@ -732,6 +733,7 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_volume_ratio DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_volume_label TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_volume_ratio DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS lab_state TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS shadow_tracked INTEGER",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS shadow_weak_price DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS shadow_weak_time TEXT",
@@ -1733,6 +1735,22 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                             "once T1 is reached, exit fires purely in software the instant T2 "
                                             "hits or price reverses back through T1. No safety net ever, by design."
                                         )
+                                    elif isinstance(entry_strategy, str) and entry_strategy.startswith("LAB:"):
+                                        _lab = _lab_rule_by_id(entry_strategy)
+                                        _lab_stop = _lab["spec"].get("stop") if _lab else None
+                                        if live_entry_price and _lab_stop:
+                                            live_sl_trigger_price = round(live_entry_price * (1 - _lab_stop / 100), 1)
+                                            live_sl_limit_price = round(live_sl_trigger_price * 0.98, 1)
+                                            sl_result = place_live_order(
+                                                option["instrument_key"], "SELL", live_quantity, access_token,
+                                                order_type="SL", trigger_price=live_sl_trigger_price, price=live_sl_limit_price,
+                                            )
+                                            if sl_result["ok"]:
+                                                live_sl_order_id = sl_result["order_id"]
+                                            else:
+                                                sl_note = f"Entry filled but broker SL stop failed to place: {sl_result['error']}"
+                                        else:
+                                            sl_note = "Lab rule: no fill price yet - broker SL stop skipped, app-side monitoring only"
                                     elif live_entry_price:
                                         live_sl_trigger_price = round(live_entry_price * 0.98, 1)
                                         live_sl_limit_price = round(live_entry_price * 0.96, 1)
@@ -5209,6 +5227,7 @@ def _run_paper_trade_check_impl() -> dict:
             exit_reason = None
             partial = None  # set if a half-booking target books this pass, without fully closing
             trail_update = None  # set if the trailing stop advances this pass, without closing
+            lab_live_reason = None  # a Lab rule's exit verdict this pass; the live leg follows it
 
             pct_change = None
             if last_price is not None and entry_price:
@@ -5646,6 +5665,17 @@ def _run_paper_trade_check_impl() -> dict:
                     rsi_disp = f"{fib_rsi_info['rsi']:.1f}" if fib_rsi_info.get("rsi") is not None else "?"
                     exit_reason = f"1st 5 Min FIB: RSI stoploss before T1 (RSI {rsi_disp} on last closed 5m candle)"
 
+            elif isinstance(strategy, str) and strategy.startswith("LAB:") and last_price is not None and trade["status"] == "OPEN":
+                # An Exit Lab rule chosen for this trade (see /exit-lab). Its
+                # verdict also drives the live leg below, exactly like the
+                # RSI Momentum trigger does.
+                lab_reason, lab_state_new = _lab_decide(trade, access_token, symbol, last_price, now)
+                if lab_reason:
+                    exited, exit_price, exit_reason = True, last_price, lab_reason
+                    lab_live_reason = lab_reason
+                elif lab_state_new is not None:
+                    trail_update = {"lab_state": lab_state_new}
+
             elif strategy == "TARGETS" and pct_change is not None:
                 # Legacy hybrid (half at 2%, breakeven, trail from 4%) -
                 # kept only so trades that opened under the old single
@@ -5930,6 +5960,13 @@ def _run_paper_trade_check_impl() -> dict:
                     live_exited = True
                     rsi_disp = f"{fib_rsi_info['rsi']:.1f}" if fib_rsi_info.get("rsi") is not None else "?"
                     live_exit_reason_val = f"1st 5 Min FIB: RSI stoploss before T1 (RSI {rsi_disp}) - no broker floor, by design"
+            elif isinstance(strategy, str) and strategy.startswith("LAB:"):
+                # Live follows the Lab rule's verdict (paper and live agree).
+                # The broker-side SL placed at entry sits at the rule's own
+                # hard stop; no default +2% / 0.5% trail is applied on top.
+                if lab_live_reason and not live_exited and trade["live_status"] == "OPEN":
+                    live_exited = True
+                    live_exit_reason_val = f"{lab_live_reason} (live)"
             elif not live_exited and trade["live_status"] == "OPEN" and live_last_price is not None and live_entry_ref:
                 live_pct_change = (live_last_price - live_entry_ref) / live_entry_ref * 100
                 if trade["live_trail_high_pct"] is None:
@@ -6063,6 +6100,16 @@ def _run_paper_trade_check_impl() -> dict:
                         WHERE id = ?
                         """,
                         (trail_update["trail_high_pct"], last_price, now, trade["id"]),
+                    )
+                elif trail_update and "lab_state" in trail_update:
+                    conn.execute(
+                        """
+                        UPDATE paper_trades
+                        SET lab_state = ?, last_checked_price = ?,
+                            last_checked_time = ?, last_error = NULL
+                        WHERE id = ?
+                        """,
+                        (trail_update["lab_state"], last_price, now, trade["id"]),
                     )
                 elif trail_update and "atr_trail_peak_price" in trail_update:
                     conn.execute(
@@ -6570,6 +6617,11 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
         entry = t.get("entry_price")
         if not entry:
             t["stop_info"] = None
+            t["atr_value"] = None
+            continue
+
+        if isinstance(strategy, str) and strategy.startswith("LAB:"):
+            t["stop_info"] = _lab_stop_info(t)
             t["atr_value"] = None
             continue
 
@@ -8383,7 +8435,16 @@ def _sim_exit(spec: dict, path: list, p0: float, vmap: dict, r0, rsi_s, rsi_m):
 def _exit_lab_strategies() -> list[dict]:
     out = []
     def add(family, name, **spec):
-        out.append({"family": family, "name": name, "spec": spec})
+        live_ok = spec["kind"] in ("bracket", "trail", "vol") and bool(spec.get("stop"))
+        note = ""
+        if not live_ok:
+            note = {"hold": "no stop-loss - not selectable for real trades",
+                    "rsi": "already in Settings (RSI Momentum #10 / RSI Simple #12)",
+                    "scale": "needs partial exits - not supported yet",
+                    "vol": "volume-only, no stop-loss - use the Volume exit switch in Settings"}.get(spec["kind"], "not selectable")
+        slug = "".join(ch if ch.isalnum() else "-" for ch in name.lower())
+        slug = "-".join(x for x in slug.split("-") if x)[:70]
+        out.append({"family": family, "name": name, "spec": spec, "id": "LAB:" + slug, "live_ok": live_ok, "live_note": note})
     for mins in (15, 30, 45, 60, 90, 120):
         add("Time hold", f"Sell after {mins} min", kind="hold", max_min=mins)
     add("Time hold", "Hold to the end of the day", kind="hold")
@@ -8418,6 +8479,148 @@ def _exit_lab_strategies() -> list[dict]:
         add("Scale-out", f"Half at +{t1}%, rest exits when volume turns Weak (stop -10%)", kind="scale", t1=t1, frac=0.5,
             then={"kind": "vol", "mode": "weak", "stop": 10})
     return out
+
+
+_LAB_RULES: dict | None = None
+_lab_vol_cache: dict = {}
+_LAB_VOL_MODE_TEXT = {"weak": "volume turned Weak", "not_strong": "volume dropped below Strong",
+                      "two_not_strong": "volume stayed below Strong for 2 readings",
+                      "half_ratio": "volume ratio fell below half of its entry level"}
+
+
+def _lab_rule_by_id(rule_id) -> dict | None:
+    """A Lab rule that may drive real trades (needs a hard stop), by its id."""
+    global _LAB_RULES
+    if not isinstance(rule_id, str) or not rule_id.startswith("LAB:"):
+        return None
+    if _LAB_RULES is None:
+        _LAB_RULES = {x["id"]: x for x in _exit_lab_strategies() if x["live_ok"]}
+    return _LAB_RULES.get(rule_id)
+
+
+def _lab_description(rule_id) -> str:
+    r = _lab_rule_by_id(rule_id)
+    return (f"Lab rule - {r['name']} ({r['family']}): picked from the Exit Lab; replayed on past alerts there, "
+            f"now running as the real exit rule. Its hard stop is placed as the broker-side SL for live trades.") if r else ""
+
+
+def _lab_live_step(spec: dict, state: dict, entry: float, price: float, elapsed_min: int, vol):
+    """ONE live evaluation of a Lab rule - the same logic as the replay in
+    _sim_exit, but incremental: `state` (peak, armed, volume streak, last
+    volume reading seen) is carried between passes. vol = (asof, code, ratio,
+    entry_ratio) for the latest volume reading after entry, or None.
+    Returns (exit_reason or None, new_state)."""
+    st = dict(state)
+    peak = max(st.get("peak") or entry, price)
+    st["peak"] = peak
+    pct = (price / entry - 1) * 100
+    stop, target, trail = spec.get("stop"), spec.get("target"), spec.get("trail")
+    if stop and price <= entry * (1 - stop / 100):
+        return f"hard stop -{stop:g}% hit ({pct:+.1f}%)", st
+    if target and price >= entry * (1 + target / 100):
+        return f"target +{target:g}% hit ({pct:+.1f}%)", st
+    if trail is not None:
+        arm = spec.get("arm") or 0
+        armed = bool(st.get("armed")) or not arm or peak >= entry * (1 + arm / 100)
+        st["armed"] = armed
+        if armed:
+            lvl = peak * (1 - trail / 100)
+            if spec.get("be") and lvl < entry:
+                lvl = entry
+            if price <= lvl:
+                return f"trailing stop hit (peak {peak:.2f}, trail {trail:g}% -> {lvl:.2f}, now {pct:+.1f}%)", st
+    if spec["kind"] == "vol" and vol:
+        asof, code, ratio, r0 = vol
+        if asof != st.get("vol_asof"):                      # a new 5-minute reading
+            st["vol_asof"] = asof
+            mode = spec.get("mode")
+            if mode == "weak":
+                hit = code == "W"
+            elif mode == "not_strong":
+                hit = code in ("M", "W")
+            elif mode == "two_not_strong":
+                st["streak"] = st.get("streak", 0) + 1 if code in ("M", "W") else 0
+                hit = st["streak"] >= 2
+            elif mode == "half_ratio":
+                hit = ratio is not None and bool(r0) and ratio < 0.5 * r0
+            else:
+                hit = False
+            if hit:
+                return f"{_LAB_VOL_MODE_TEXT.get(mode, 'volume faded')} at {asof} ({pct:+.1f}%)", st
+    cap = spec.get("max_min")
+    if cap and elapsed_min >= cap:
+        return f"time cap of {cap} min reached ({pct:+.1f}%)", st
+    return None, st
+
+
+def _lab_current_volume(symbol: str, access_token: str, direction: str, after_hhmm: str, r0):
+    """Latest 5-minute volume reading for the trade's side, only if it closed
+    AFTER the trade began. Cached 45s per stock (one reading per 5-min candle)."""
+    hit = _lab_vol_cache.get(symbol)
+    if hit and time.time() - hit[0] < 45:
+        reading = hit[1]
+    else:
+        reading = _build_volume_reading(symbol, access_token)
+        _lab_vol_cache[symbol] = (time.time(), reading)
+    if not reading or reading.get("status") != "ok" or reading.get("asof", "") <= after_hhmm:
+        return None
+    side = reading["buy" if direction == "Buy" else "sell"]
+    return (reading["asof"], {"Strong": "S", "Moderate": "M", "Weak": "W"}.get(side.get("label"), "N"), side.get("ratio"), r0)
+
+
+def _lab_decide(trade: dict, access_token: str, symbol: str, last_price: float, now_iso: str):
+    """The Lab rule on one open trade. Returns (exit_reason or None,
+    new_state_json or None when nothing changed)."""
+    rule = _lab_rule_by_id(trade.get("strategy"))
+    entry = trade.get("entry_price")
+    if not rule or not entry or last_price is None:
+        return None, None
+    try:
+        state = json.loads(trade["lab_state"]) if trade.get("lab_state") else {}
+    except Exception:
+        state = {}
+    t0 = datetime.fromisoformat(state.get("t0") or trade["entry_time"])
+    elapsed = int((datetime.fromisoformat(now_iso) - t0).total_seconds() // 60)
+    vol = None
+    if rule["spec"]["kind"] == "vol":
+        vol = _lab_current_volume(symbol, access_token, trade["direction"],
+                                  (t0 + IST_OFFSET).strftime("%H:%M"), trade.get("entry_volume_ratio"))
+    reason, new_state = _lab_live_step(rule["spec"], state, entry, last_price, elapsed, vol)
+    if reason:
+        return f"Lab rule '{rule['name']}': {reason}", None
+    return None, (json.dumps(new_state, separators=(",", ":")) if new_state != state else None)
+
+
+def _lab_stop_info(t: dict) -> str:
+    """Human text for the Stop column: where this Lab rule's exit sits right now."""
+    rule = _lab_rule_by_id(t.get("strategy"))
+    entry = t.get("entry_price")
+    if not rule or not entry:
+        return "Lab rule (unknown id)"
+    spec = rule["spec"]
+    try:
+        state = json.loads(t["lab_state"]) if t.get("lab_state") else {}
+    except Exception:
+        state = {}
+    peak = max(state.get("peak") or entry, entry)
+    parts = []
+    if spec.get("stop"):
+        parts.append(f"Stop -{spec['stop']:g}% ({entry * (1 - spec['stop'] / 100):.2f})")
+    if spec.get("trail") is not None:
+        if spec.get("arm") and not state.get("armed") and peak < entry * (1 + spec["arm"] / 100):
+            parts.append(f"Trail {spec['trail']:g}% arms at +{spec['arm']:g}%")
+        else:
+            lvl = peak * (1 - spec["trail"] / 100)
+            if spec.get("be"):
+                lvl = max(lvl, entry)
+            parts.append(f"Trail stop {lvl:.2f} (peak {peak:.2f})")
+    if spec.get("target"):
+        parts.append(f"Target +{spec['target']:g}% ({entry * (1 + spec['target'] / 100):.2f})")
+    if spec["kind"] == "vol":
+        parts.append("exit when " + _LAB_VOL_MODE_TEXT.get(spec.get("mode"), "volume fades"))
+    if spec.get("max_min"):
+        parts.append(f"sell by {spec['max_min']} min")
+    return "Lab: " + " | ".join(parts)
 
 
 def _lab_metrics(pnls: list[float]) -> dict:
@@ -8477,8 +8680,8 @@ def _exit_lab_run(bucket: str = "Strong", liquid: bool = False, cost: float = 1.
             by_day.setdefault(a["day"], []).append(pnl)
         if not pnls:
             continue
-        item = {"name": st["name"], "family": st["family"], "n": len(pnls),
-                "hold": round(sum(holds) / len(holds)), **_lab_metrics(pnls)}
+        item = {"name": st["name"], "family": st["family"], "n": len(pnls), "id": st["id"], "live_ok": st["live_ok"],
+                "live_note": st["live_note"], "hold": round(sum(holds) / len(holds)), **_lab_metrics(pnls)}
         item["per_day"] = {d: round(sum(v) / len(v), 2) for d, v in by_day.items()}
         item["pos_days"] = sum(1 for v in item["per_day"].values() if v > 0)
         results.append(item)
@@ -8520,8 +8723,18 @@ def exit_lab_page():
     key = {"avg": ("avg", True), "pf": ("pf", True), "win": ("win", True), "worst": ("worst", True),
            "risk": ("per_risk", True), "hold": ("hold", False)}.get(sort, ("avg", True))
     rows = sorted(res["results"], key=lambda x: (x[key[0]] is None, -(x[key[0]] or 0) if key[1] else (x[key[0]] or 0)))
+    try:
+        with get_db() as conn:
+            open_trades = [dict(r) for r in conn.execute(
+                "SELECT id, symbol, strategy, live_status, entry_price FROM paper_trades WHERE status = 'OPEN'").fetchall()]
+    except (psycopg2.Error, RuntimeError):
+        open_trades = []
+    active = get_exit_strategy()
+    active_rule = _lab_rule_by_id(active)
     return render_template("exit_lab.html", active_tab="exit_lab", res=res, rows=rows, bucket=bucket, liquid=liquid,
-                           cost=cost, sort=sort)
+                           cost=cost, sort=sort, open_trades=open_trades, active=active,
+                           active_label=(active_rule["name"] if active_rule else active),
+                           active_is_lab=bool(active_rule))
 
 
 @app.route("/api/exit-lab")
@@ -8586,7 +8799,8 @@ def settings_page():
         capital=capital,
         live_trading_enabled=get_live_trading_enabled(),
         exit_strategy=get_exit_strategy(),
-        strategy_descriptions=STRATEGY_DESCRIPTIONS,
+        strategy_descriptions={**STRATEGY_DESCRIPTIONS, get_exit_strategy(): STRATEGY_DESCRIPTIONS.get(get_exit_strategy()) or _lab_description(get_exit_strategy())},
+        lab_label=(_lab_rule_by_id(get_exit_strategy()) or {}).get("name", ""),
         sector_filter_enabled=get_sector_filter_enabled(),
         sector_filter_top_n=get_sector_filter_top_n(),
         atr_period=get_atr_period(),
@@ -8865,10 +9079,47 @@ def paper_trading_strategy_toggle():
     already in flight."""
     data = request.get_json(silent=True) or {}
     strategy = data.get("strategy")
-    if strategy not in VALID_STRATEGIES:
-        return jsonify({"status": "error", "message": f"strategy must be one of {VALID_STRATEGIES}"}), 400
+    if strategy not in VALID_STRATEGIES and not _lab_rule_by_id(strategy):
+        return jsonify({"status": "error", "message": f"strategy must be one of {VALID_STRATEGIES} or a Lab rule from /exit-lab"}), 400
     set_setting("exit_strategy", strategy)
-    return jsonify({"status": "ok", "exit_strategy": strategy, "description": STRATEGY_DESCRIPTIONS.get(strategy, "")})
+    return jsonify({"status": "ok", "exit_strategy": strategy,
+                    "description": STRATEGY_DESCRIPTIONS.get(strategy) or _lab_description(strategy)})
+
+
+@app.route("/api/paper-trading/apply-lab-rule", methods=["POST"])
+def paper_trading_apply_lab_rule():
+    """Hands the currently OPEN trade to a Lab rule from now on. The peak and
+    clock start at this moment (peak = the better of entry and the last price
+    seen), so the rule judges the trade from here, not from before."""
+    rule_id = (request.get_json(silent=True) or {}).get("rule_id")
+    rule = _lab_rule_by_id(rule_id)
+    if not rule:
+        return jsonify({"status": "error", "message": "unknown or non-selectable rule"}), 400
+    now = datetime.utcnow().isoformat()
+    with get_db() as conn:
+        trades = [dict(r) for r in conn.execute("SELECT * FROM paper_trades WHERE status = 'OPEN'").fetchall()]
+        if not trades:
+            return jsonify({"status": "error", "message": "There is no open trade to apply it to."}), 404
+        for t in trades:
+            peak = max(t["entry_price"] or 0, t["last_checked_price"] or 0)
+            conn.execute("UPDATE paper_trades SET strategy = ?, lab_state = ? WHERE id = ?",
+                         (rule_id, json.dumps({"peak": peak, "t0": now}, separators=(",", ":")), t["id"]))
+        conn.commit()
+    live = [t for t in trades if t.get("live_status") == "OPEN"]
+    live_note = ""
+    if live:
+        if all(t.get("live_sl_order_id") or t.get("live_gtt_order_id") for t in live):
+            live_note = ("A live position is open. The broker-side stop placed at its entry stays where it is and can still "
+                         "fire before this rule; the rule's own stop / trail / volume / time exits now run in software and "
+                         "close the real position.")
+        else:
+            live_note = ("WARNING: a live position is open and it has NO broker-side stop (the rule it opened under placed none). "
+                         "This rule's stop runs in software only, so nothing protects the position at the broker if the app "
+                         "is down.")
+    return jsonify({
+        "status": "ok", "applied_to": [f"{t['symbol']} (#{t['id']})" for t in trades], "rule": rule["name"],
+        "live_note": live_note,
+    })
 
 
 @app.route("/api/paper-trading/atr-settings", methods=["POST"])
