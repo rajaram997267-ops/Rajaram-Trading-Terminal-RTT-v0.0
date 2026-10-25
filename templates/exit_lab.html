@@ -33,6 +33,9 @@
     .warn { background:var(--panel); border:1px solid var(--gold); border-radius:8px; padding:10px 14px; font-size:12.5px; line-height:1.55; margin:14px 0; }
     .fam { color:var(--muted); font-size:11px; }
     h3 { margin:26px 0 6px; }
+    button.pick { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:3px 8px; font-size:11px; cursor:pointer; margin-right:4px; }
+    button.pick:hover:not(:disabled) { border-color:var(--green); color:var(--green); }
+    button.pick:disabled { opacity:.4; cursor:not-allowed; }
   </style>
 </head>
 <body>
@@ -51,6 +54,16 @@
     <a href="/exit-lab" class="{% if active_tab == 'exit_lab' %}active{% endif %}">Exit Lab</a>
   </div>
 
+
+  <div class="warn" style="margin-top:12px">
+    <b>New trades currently use:</b> {{ active_label }}{% if active_is_lab %} <span class="mut">(Lab rule)</span>{% endif %} &nbsp;&middot;&nbsp;
+    <b>Open trade:</b>
+    {% if open_trades %}{% for o in open_trades %}{{ o.symbol }} (#{{ o.id }}, running <i>{{ o.strategy }}</i>{% if o.live_status == 'OPEN' %}, <b>live position open</b>{% endif %}){% endfor %}
+    {% else %}none right now{% endif %}
+    <div class="mut" style="margin-top:6px">Pick a rule below: <b>Use for new trades</b> makes it the exit rule for every trade that opens from now on (paper and live). <b>Apply to open trade</b> hands the trade that is open right now to that rule, starting from this moment.
+      Both are real: with live trading on, the rule closes the real position and its hard stop becomes the broker-side stop. Rules that are only a list entry (no stop-loss, RSI, scale-out) have no button.
+      Switch back any time in Settings. <span id="labMsg" style="color:var(--green);font-weight:600"></span></div>
+  </div>
   <div class="ctl">Alerts by volume at entry:
     {% for b in ['Strong','Moderate','Weak','All'] %}<a class="{{ 'on' if b == bucket else '' }}" href="/exit-lab?bucket={{ b }}&liquid={{ 1 if liquid else 0 }}&cost={{ cost }}&sort={{ sort }}">{{ b }}</a>{% endfor %}
     &nbsp;|&nbsp; Contracts: <a class="{{ '' if liquid else 'on' }}" href="/exit-lab?bucket={{ bucket }}&liquid=0&cost={{ cost }}&sort={{ sort }}">all</a><a class="{{ 'on' if liquid else '' }}" href="/exit-lab?bucket={{ bucket }}&liquid=1&cost={{ cost }}&sort={{ sort }}">liquid only</a>
@@ -85,7 +98,7 @@
     {% for k, lab in [('avg','average'),('pf','profit factor'),('win','win rate'),('risk','return per risk'),('worst','worst trade'),('hold','shortest hold')] %}<a class="{{ 'on' if k == sort else '' }}" style="margin-left:8px" href="/exit-lab?bucket={{ bucket }}&liquid={{ 1 if liquid else 0 }}&cost={{ cost }}&sort={{ k }}">{{ lab }}</a>{% endfor %}</span></h3>
   <div class="wrap"><table>
     <tr><th>#</th><th>Exit rule</th><th>Family</th><th>Avg %</th><th>Median %</th><th>Win %</th><th>Avg win</th><th>Avg loss</th><th>Profit factor</th><th>Worst</th><th>Best</th><th>Avg hold (min)</th>
-      {% for d in res.days %}<th>{{ d[5:] }}</th>{% endfor %}<th>Days +</th></tr>
+      {% for d in res.days %}<th>{{ d[5:] }}</th>{% endfor %}<th>Days +</th><th>Select</th></tr>
     {% for x in rows %}
     <tr><td class="mut">{{ loop.index }}</td><td>{{ x.name }}</td><td class="fam">{{ x.family }}</td>
       <td class="{{ 'pos' if x.avg > 0 else 'neg' }}"><b>{{ '%+.2f' % x.avg }}</b></td>
@@ -93,7 +106,11 @@
       <td class="pos">{{ '%+.1f' % x.avg_win if x.avg_win is not none else '-' }}</td><td class="neg">{{ '%+.1f' % x.avg_loss if x.avg_loss is not none else '-' }}</td>
       <td>{{ x.pf if x.pf is not none else 'no losses' }}</td><td class="neg">{{ '%+.1f' % x.worst }}</td><td class="pos">{{ '%+.1f' % x.best }}</td><td>{{ x.hold }}</td>
       {% for d in res.days %}{% set v = x.per_day.get(d) %}<td class="{{ 'pos' if v is not none and v > 0 else 'neg' if v is not none else 'mut' }}">{{ '%+.1f' % v if v is not none else '-' }}</td>{% endfor %}
-      <td>{{ x.pos_days }}/{{ res.days|length }}</td></tr>
+      <td>{{ x.pos_days }}/{{ res.days|length }}</td>
+      <td style="white-space:nowrap">{% if x.live_ok %}
+        <button class="pick" onclick='pickRule({{ x.id|tojson }}, {{ x.name|tojson }}, "new")'>Use for new trades</button>
+        <button class="pick" onclick='pickRule({{ x.id|tojson }}, {{ x.name|tojson }}, "open")' {% if not open_trades %}disabled title="no open trade"{% endif %}>Apply to open trade</button>
+        {% else %}<span class="mut" style="font-size:11px">{{ x.live_note }}</span>{% endif %}</td></tr>
     {% endfor %}
   </table></div>
 
@@ -110,5 +127,25 @@
   </div>
   {% endif %}
   <div class="sub" style="margin-top:14px">Computed in {{ res.seconds }}s (cached 5 minutes). Data comes from the Volume filter test on the Manual vs RSI tab.</div>
+  <script>
+    async function pickRule(id, name, where) {
+      const msg = where === "new"
+        ? "Use '" + name + "' as the exit rule for ALL new trades from now on (paper and live)?\n\nWith live trading on this closes real positions, and its hard stop becomes the broker-side stop."
+        : "Hand the OPEN trade to '" + name + "' starting now?\n\nIf a live position is open, this rule will close the real position.";
+      if (!confirm(msg)) return;
+      const url = where === "new" ? "/api/paper-trading/strategy-toggle" : "/api/paper-trading/apply-lab-rule";
+      const body = where === "new" ? { strategy: id } : { rule_id: id };
+      const el = document.getElementById("labMsg");
+      try {
+        const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const data = await res.json();
+        if (!res.ok) { el.style.color = "var(--red)"; el.textContent = " " + (data.message || "failed"); return; }
+        el.style.color = "var(--green)";
+        el.textContent = where === "new" ? " Done - new trades will use: " + name
+          : " Applied to " + (data.applied_to || []).join(", ") + ". " + (data.live_note || "");
+        if (where === "new") setTimeout(() => location.reload(), 1200);
+      } catch (e) { el.style.color = "var(--red)"; el.textContent = " request failed"; }
+    }
+  </script>
 </body>
 </html>
