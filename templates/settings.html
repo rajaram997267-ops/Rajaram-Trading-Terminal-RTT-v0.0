@@ -74,6 +74,12 @@
     }
     .tabbar a.active { color: var(--text); border-bottom-color: var(--green); }
     .tabbar a:hover { color: var(--text); }
+    .sw { position:relative; display:inline-block; width:46px; height:24px; vertical-align:middle; }
+    .sw input { opacity:0; width:0; height:0; }
+    .sw .slider { position:absolute; inset:0; background:var(--border); border-radius:24px; cursor:pointer; transition:.2s; }
+    .sw .slider:before { content:""; position:absolute; height:18px; width:18px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; }
+    .sw input:checked + .slider { background:var(--green); }
+    .sw input:checked + .slider:before { transform:translateX(22px); }
     .settings-box {
       background: var(--panel);
       border: 1px solid var(--border);
@@ -250,6 +256,7 @@
     <span>Exit strategy for new trades:</span>
     <select id="strategySelect" onchange="setStrategy(this.value)">
       {% if exit_strategy.startswith("LAB:") %}<option value="{{ exit_strategy }}" selected>Lab rule: {{ lab_label or exit_strategy }}</option>{% endif %}
+      <option value="AUTO_VOL" {% if exit_strategy == "AUTO_VOL" %}selected{% endif %}>Auto (volume-driven: picks the exit rule per trade)</option>
       <option value="HALF_HALF_HARD4" {% if exit_strategy == "HALF_HALF_HARD4" %}selected{% endif %}>2) -2% SL, 2% half book, 4% full exit</option>
       <option value="TRAIL_FROM_2" {% if exit_strategy == "TRAIL_FROM_2" %}selected{% endif %}>3) -2% SL, trail 100% qty from 2% (0.2% steps)</option>
       <option value="FULL_AT_2" {% if exit_strategy == "FULL_AT_2" %}selected{% endif %}>4) -2% SL, full exit at 2%</option>
@@ -266,6 +273,12 @@
       <option value="FIRST5MIN_FIB" {% if exit_strategy == "FIRST5MIN_FIB" %}selected{% endif %}>13) 1st 5 Min FIB levels strategy</option>
     </select>
     <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
+    <div style="margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <label class="sw"><input type="checkbox" id="autoSwitchS" {% if exit_strategy == "AUTO_VOL" %}checked{% endif %} onchange="autoToggle(this)"><span class="slider"></span></label>
+      <b>Auto exit picker (volume-driven): <span id="autoStateS">{{ "ON" if exit_strategy == "AUTO_VOL" else "OFF" }}</span></b>
+      <span class="token-status">Switch ON to let the Exit Lab choose each new trade's exit rule (paper-only until allowed for live). OFF returns new trades to your previous strategy. <a href="/exit-lab">See the picks and details</a></span>
+      <span id="autoMsgS" style="font-weight:600"></span>
+    </div>
   </div>
 
   <div class="settings-box">
@@ -462,6 +475,20 @@
         checkbox.checked = !enabled;
         console.error(err);
       }
+    }
+
+    async function autoToggle(cb) {
+      const on = cb.checked, el = document.getElementById("autoMsgS");
+      const ok = confirm(on ? "Switch the Auto exit picker ON?\n\nEvery new trade gets its exit rule chosen automatically from the Exit Lab (paper-only unless allowed for live). Open trades keep their rule."
+                            : "Switch the Auto exit picker OFF?\n\nNew trades return to your previous strategy. Open trades keep their rule.");
+      if (!ok) { cb.checked = !on; return; }
+      try {
+        const res = await fetch("/api/auto-vol/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: on ? "on" : "off" }) });
+        const data = await res.json();
+        if (!res.ok) { cb.checked = !on; el.style.color = "var(--red)"; el.textContent = data.message || "failed"; return; }
+        el.style.color = "var(--green)"; el.textContent = "Done";
+        setTimeout(() => location.reload(), 700);
+      } catch (e) { cb.checked = !on; el.style.color = "var(--red)"; el.textContent = "request failed"; }
     }
 
     async function setStrategy(strategy) {

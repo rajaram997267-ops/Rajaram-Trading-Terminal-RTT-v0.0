@@ -27,6 +27,12 @@
     th, td { border-bottom:1px solid var(--border); padding:7px 9px; text-align:left; white-space:nowrap; }
     th { color:var(--muted); font-size:11px; text-transform:uppercase; }
     tr:last-child td { border-bottom:none; }
+    .sw { position:relative; display:inline-block; width:46px; height:24px; vertical-align:middle; }
+    .sw input { opacity:0; width:0; height:0; }
+    .sw .slider { position:absolute; inset:0; background:var(--border); border-radius:24px; cursor:pointer; transition:.2s; }
+    .sw .slider:before { content:""; position:absolute; height:18px; width:18px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; }
+    .sw input:checked + .slider { background:var(--green); }
+    .sw input:checked + .slider:before { transform:translateX(22px); }
     .pos { color:var(--green); } .neg { color:var(--red); } .mut { color:var(--muted); }
     .ctl { margin:10px 0; font-size:13px; color:var(--muted); }
     .ctl a { margin-right:10px; } .ctl a.on { color:var(--text); font-weight:600; text-decoration:none; }
@@ -54,6 +60,31 @@
     <a href="/exit-lab" class="{% if active_tab == 'exit_lab' %}active{% endif %}">Exit Lab</a>
   </div>
 
+
+  <div class="warn" id="autoBox" style="margin-top:12px">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <b style="font-size:15px">Auto exit picker (volume-driven)</b>
+      <label class="sw"><input type="checkbox" id="autoSwitch" {% if auto.active %}checked{% endif %} onchange="autoAct(this.checked ? 'on' : 'off')"><span class="slider"></span></label>
+      <b class="{{ 'pos' if auto.active else 'mut' }}">{{ 'ON' if auto.active else 'OFF' }}</b>
+      <span id="autoMsg" style="font-weight:600"></span>
+    </div>
+    <div class="mut" style="margin-top:6px;line-height:1.55">
+      {% if auto.active %}<b style="color:var(--text)">ON:</b> every new trade gets its exit rule chosen automatically (by volume strength at entry and time of day), but only where the Exit Lab has proven a rule clearly better than <b>{{ auto.fallback }}</b>; anywhere else the trade uses {{ auto.fallback }}. Trades already open keep the rule they started with.
+      {% else %}<b style="color:var(--text)">OFF:</b> new trades use <b>{{ active_label }}</b>. Switch ON to let the Exit Lab choose per trade - turning it OFF later returns new trades to the strategy you have now. Open trades are never changed by the switch.{% endif %}
+      <br><b style="color:var(--text)">Live trades:</b> {% if auto.live_ok %}<span class="neg"><b>allowed</b></span> - Auto-chosen rules close real positions. <a href="#" onclick="autoAct('live_off');return false">Make paper-only</a>
+      {% else %}<b>paper-only</b> - with Auto ON, live orders are skipped (the trade stays paper) until you allow it. <a href="#" onclick="autoAct('live_on');return false">Allow on live trades</a>{% endif %}
+      <br>{% if auto.table %}Table rebuilt {{ auto.table.built_at }} from {{ auto.table.alerts }} Strong alerts over {{ auto.table.days|length }} day(s){% if auto.table.liquid_only %} (liquid contracts only){% endif %}, cost {{ auto.table.cost }}% per trade; rebuilt automatically each day after the close (so a day's picks never use that day's own results). <a href="#" onclick="autoAct('refresh');return false">Rebuild now</a>
+      {% else %}No table yet - it needs at least 12 measured Strong alerts. <a href="#" onclick="autoAct('refresh');return false">Try building it now</a>{% endif %}
+    </div>
+    <div class="wrap" style="margin-top:10px"><table>
+      <tr><th>Volume at entry</th>{% for w in windows %}<th>{{ w[0] }} {{ w[1] }}-{{ w[2] }}</th>{% endfor %}</tr>
+      {% for row in grid %}<tr><td><b>{{ row.bucket }}</b> normal volume</td>
+        {% for c in row.cells %}<td style="white-space:normal;min-width:190px">
+          {% if c.choice %}<b>{{ c.choice.name }}</b><br><span class="mut">avg {{ '%+.1f' % c.choice.avg }}% vs your RSI Momentum exit {{ '%+.1f' % c.choice.base_avg }}% &middot; {{ c.choice.n }} alerts &middot; + on {{ c.choice.pos_days }} days &middot; basis: {{ c.level }}</span>
+          {% else %}<span class="mut">uses {{ auto.fallback }}<br>({{ c.why }})</span>{% endif %}</td>{% endfor %}</tr>{% endfor %}
+    </table></div>
+    <div class="mut" style="margin-top:6px;font-size:12px">A rule appears only if it had at least {{ auto.table.min_n if auto.table else 12 }} alerts, was profitable on most days, and beat the RSI Momentum replay by a clear margin on a cautious score (average minus one standard error). With only a few days of data most boxes will say "uses {{ auto.fallback }}" - that is the safety net working, not a fault.</div>
+  </div>
 
   <div class="warn" style="margin-top:12px">
     <b>New trades currently use:</b> {{ active_label }}{% if active_is_lab %} <span class="mut">(Lab rule)</span>{% endif %} &nbsp;&middot;&nbsp;
@@ -122,6 +153,7 @@
     <b style="color:var(--text)">Breakeven + trail</b> - once up +5/+8%, the stop can never drop below the entry price; then it trails.<br>
     <b style="color:var(--text)">Volume exit</b> - your own idea: sell when the stock's directional volume fades (turns Weak, drops below Strong, drops below Strong twice running, or halves vs entry), checked at each 5-minute close.<br>
     <b style="color:var(--text)">Volume + trail</b> - whichever comes first: volume fades or the price trail is hit.<br>
+    <b style="color:var(--text)">Volume-adaptive</b> - one trailing stop whose width follows the live volume: wide while volume is Strong, tighter as it turns Moderate, and out (or very tight) when it turns Weak; or the width steps down a ratio ladder (e.g. 15% at 3x+, 10% at 1.5x+, 6% at 1x+, exit below 1x). The hard stop stays throughout.<br>
     <b style="color:var(--text)">RSI</b> - your current RSI Simple and RSI Momentum rules (today's Settings), as the benchmark to beat.<br>
     <b style="color:var(--text)">Scale-out</b> - book half at a target, let the rest ride a trail or a volume exit.
   </div>
@@ -145,6 +177,24 @@
           : " Applied to " + (data.applied_to || []).join(", ") + ". " + (data.live_note || "");
         if (where === "new") setTimeout(() => location.reload(), 1200);
       } catch (e) { el.style.color = "var(--red)"; el.textContent = " request failed"; }
+    }
+    async function autoAct(action) {
+      const el = document.getElementById("autoMsg");
+      const text = {
+        on: "Switch the Auto exit picker ON?\n\nEvery new trade will get its exit rule chosen automatically from the Exit Lab (paper-only unless you also allow it for live). Trades already open keep their rule.",
+        off: "Switch the Auto exit picker OFF?\n\nNew trades return to your previous strategy. Trades already open keep their rule.",
+        live_on: "Allow Auto-chosen rules on LIVE trades?\n\nThese rules will close real positions and their hard stop becomes the broker-side stop. Only do this after the Auto picks have proven themselves on paper.",
+        live_off: "Make Auto paper-only again? Live orders will be skipped while Auto is ON.",
+        refresh: ""
+      }[action];
+      if (text && !confirm(text)) { document.getElementById("autoSwitch").checked = (action === "off"); return; }
+      try {
+        const res = await fetch("/api/auto-vol/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action }) });
+        const data = await res.json();
+        if (!res.ok) { el.style.color = "var(--red)"; el.textContent = data.message || "failed"; document.getElementById("autoSwitch").checked = {{ 'true' if auto.active else 'false' }}; return; }
+        el.style.color = "var(--green)"; el.textContent = "Done";
+        setTimeout(() => location.reload(), 700);
+      } catch (e) { el.style.color = "var(--red)"; el.textContent = "request failed"; }
     }
   </script>
 </body>
