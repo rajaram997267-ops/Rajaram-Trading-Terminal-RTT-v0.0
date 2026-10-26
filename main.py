@@ -1419,6 +1419,10 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
 
     now = datetime.utcnow().isoformat()
     entry_strategy = get_exit_strategy()
+    auto_info, auto_paper_only = None, False
+    if entry_strategy == "AUTO_VOL":
+        entry_strategy, auto_info = _auto_resolve_entry(symbol, category)
+        auto_paper_only = get_setting("auto_vol_live_ok", "false") != "true"
 
     # spot_entry_price is ONLY ever read by the JOAT-inspired spot-based
     # strategies (#9, Test-B, Test-C) - every read of it elsewhere in the
@@ -1510,6 +1514,11 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
              planned_risk_pct_val, live_planned_risk_pct_val),
         ).fetchone()
         conn.commit()
+    if auto_info:
+        with get_db() as conn:
+            conn.execute("UPDATE paper_trades SET lab_state = ? WHERE id = ?",
+                         (json.dumps({"auto": auto_info}, separators=(",", ":")), row["id"]))
+            conn.commit()
 
     if access_token:
         ensure_websocket_started(access_token)
@@ -1521,7 +1530,9 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # always a BUY transaction (never writes/shorts an option), only the
     # option TYPE differs by alert direction. Any failure here is recorded
     # on the trade and never blocks the paper trade itself.
-    if get_live_trading_enabled():
+    if get_live_trading_enabled() and auto_paper_only:
+        _mark_live_failed(row["id"], "Auto (volume-driven) is paper-only until you allow it for live trades on the Exit Lab page")
+    elif get_live_trading_enabled():
         opt_type = "CE" if category == "Buy" else "PE"
         trade_id = row["id"]
         access_token = get_setting("upstox_access_token")
@@ -3574,6 +3585,7 @@ def _volume_gated_entry(symbol: str, category: str, price_val: float,
             _log_volume_entry_decision(sym, category, "skipped", f"volume {label} ({ratio}x), not Strong")
             _log_volume_alert(sym, category, price_val, label, ratio, reading["asof"], "SKIPPED")
             return
+        _auto_pick_context[(sym.upper(), category)] = (time.time(), label, ratio)   # read by the Auto picker at entry
         created, reason = _open_trade_if_free(sym, category, price_val, alert_name=alert_name, scan_name=scan_name)
         _log_volume_alert(sym, category, price_val, label, ratio, reading["asof"],
                           "ENTERED" if created else "STRONG_NOT_TAKEN")
@@ -7838,7 +7850,7 @@ def _shadow_daily_loop() -> None:
             if now.weekday() < 5 and "15:40" <= now.strftime("%H:%M") <= "16:30" and done_date != today:
                 token = get_setting("upstox_access_token")
                 if token:
-                    for job in (compute_shadow_for_date, fill_volume_alert_outcomes):
+                    for job in (compute_shadow_for_date, fill_volume_alert_outcomes, auto_refresh_table):
                         try:
                             job(today, token)
                         except Exception as e:
@@ -8369,6 +8381,38 @@ _exit_lab_cache: dict = {}
 _EXIT_LAB_TTL = 300
 
 
+def _avol_width(spec: dict, code, ratio, prev):
+    """The trailing width (%) the latest volume reading calls for. 0 = volume
+    has faded -> exit. `prev` when the reading says nothing (no reading)."""
+    if spec["by"] == "label":
+        return spec["table"].get(code, prev) if code in ("S", "M", "W") else prev
+    if ratio is None:
+        return prev
+    for min_r, w in spec["table"]:
+        if ratio >= min_r:
+            return w
+    return 0
+
+
+def _avol_initial_width(spec: dict, r0):
+    """Width at entry: the trade opened on a Strong reading of ratio r0."""
+    w = _avol_width(spec, "S", r0, None)
+    if not w:
+        w = max(v for v in (spec["table"].values() if spec["by"] == "label" else [x[1] for x in spec["table"]]))
+    return w
+
+
+_AVOL_STATE_TEXT = {"S": "Strong", "M": "Moderate", "W": "Weak", "N": "no reading"}
+
+
+def _avol_table_text(spec: dict) -> str:
+    if spec["by"] == "label":
+        t = spec["table"]
+        f = lambda v: "exit" if v == 0 else f"{v:g}%"
+        return f"trail by volume: Strong {f(t['S'])} / Moderate {f(t['M'])} / Weak {f(t['W'])}"
+    return "trail by volume ratio: " + " / ".join(f">={r:g}x {w:g}%" for r, w in spec["table"]) + " / below: exit"
+
+
 def _sim_exit(spec: dict, path: list, p0: float, vmap: dict, r0, rsi_s, rsi_m):
     """One exit rule on one alert. path[i] = option price i+1 minutes after the
     alert. Returns (exit_minute, exit_price), or None if there is no path."""
@@ -8386,6 +8430,31 @@ def _sim_exit(spec: dict, path: list, p0: float, vmap: dict, r0, rsi_s, rsi_m):
             frac = spec.get("frac", 0.5)
             return base[0], frac * path[hit - 1] + (1 - frac) * base[1]
         return base
+    if kind == "avol":
+        cap = min(spec.get("max_min") or n, n)
+        stop_px = p0 * (1 - spec["stop"] / 100) if spec.get("stop") else None
+        arm_px = p0 * (1 + (spec.get("arm") or 0) / 100)
+        peak, armed = p0, not spec.get("arm")
+        width = _avol_initial_width(spec, r0)
+        for i in range(cap):
+            px, m = path[i], i + 1
+            if stop_px is not None and px <= stop_px:
+                return m, px
+            if px > peak:
+                peak = px
+            if m in vmap:
+                width = _avol_width(spec, vmap[m][0], vmap[m][1], width)
+                if width == 0:
+                    return m, px
+            if not armed and peak >= arm_px:
+                armed = True
+            if armed:
+                lvl = peak * (1 - width / 100)
+                if spec.get("be") and lvl < p0:
+                    lvl = p0
+                if px <= lvl:
+                    return m, px
+        return cap, path[cap - 1]
     cap = min(spec.get("max_min") or n, n)
     stop, target, trail = spec.get("stop"), spec.get("target"), spec.get("trail")
     stop_px = p0 * (1 - stop / 100) if stop else None
@@ -8435,7 +8504,7 @@ def _sim_exit(spec: dict, path: list, p0: float, vmap: dict, r0, rsi_s, rsi_m):
 def _exit_lab_strategies() -> list[dict]:
     out = []
     def add(family, name, **spec):
-        live_ok = spec["kind"] in ("bracket", "trail", "vol") and bool(spec.get("stop"))
+        live_ok = spec["kind"] in ("bracket", "trail", "vol", "avol") and bool(spec.get("stop"))
         note = ""
         if not live_ok:
             note = {"hold": "no stop-loss - not selectable for real trades",
@@ -8478,6 +8547,20 @@ def _exit_lab_strategies() -> list[dict]:
             then={"kind": "trail", "trail": 10, "stop": 10})
         add("Scale-out", f"Half at +{t1}%, rest exits when volume turns Weak (stop -10%)", kind="scale", t1=t1, frac=0.5,
             then={"kind": "vol", "mode": "weak", "stop": 10})
+    # Volume-adaptive: ONE trailing stop whose width follows the stock's live
+    # volume - wide while volume is Strong (let it run), tighter as it fades,
+    # and (width 0) out the moment it turns Weak. The hard stop stays throughout.
+    label_tables = (("S12 / M6 / exit on Weak", {"S": 12, "M": 6, "W": 0}), ("S15 / M8 / exit on Weak", {"S": 15, "M": 8, "W": 0}),
+                    ("S10 / M5 / exit on Weak", {"S": 10, "M": 5, "W": 0}), ("S20 / M10 / exit on Weak", {"S": 20, "M": 10, "W": 0}),
+                    ("S12 / M6 / W3", {"S": 12, "M": 6, "W": 3}), ("S15 / M8 / W4", {"S": 15, "M": 8, "W": 4}))
+    for label, tab in label_tables:
+        for st in (10, 15):
+            add("Volume-adaptive", f"Adaptive trail {label} (stop -{st}%)", kind="avol", stop=st, by="label", table=tab)
+    for label, tab in (("ratio ladder 15/10/6", [[3.0, 15], [1.5, 10], [1.0, 6]]), ("ratio ladder 12/8/5", [[3.0, 12], [1.5, 8], [1.0, 5]])):
+        for st in (10, 15):
+            add("Volume-adaptive", f"Adaptive trail {label}, exit below 1x (stop -{st}%)", kind="avol", stop=st, by="ratio", table=tab)
+    add("Volume-adaptive", "Adaptive trail S12 / M6 / exit on Weak, breakeven after +8% (stop -10%)", kind="avol", stop=10, by="label",
+        table={"S": 12, "M": 6, "W": 0}, arm=8, be=True)
     return out
 
 
@@ -8504,7 +8587,7 @@ def _lab_description(rule_id) -> str:
             f"now running as the real exit rule. Its hard stop is placed as the broker-side SL for live trades.") if r else ""
 
 
-def _lab_live_step(spec: dict, state: dict, entry: float, price: float, elapsed_min: int, vol):
+def _lab_live_step(spec: dict, state: dict, entry: float, price: float, elapsed_min: int, vol, r0=None):
     """ONE live evaluation of a Lab rule - the same logic as the replay in
     _sim_exit, but incremental: `state` (peak, armed, volume streak, last
     volume reading seen) is carried between passes. vol = (asof, code, ratio,
@@ -8519,6 +8602,29 @@ def _lab_live_step(spec: dict, state: dict, entry: float, price: float, elapsed_
         return f"hard stop -{stop:g}% hit ({pct:+.1f}%)", st
     if target and price >= entry * (1 + target / 100):
         return f"target +{target:g}% hit ({pct:+.1f}%)", st
+    if spec["kind"] == "avol":
+        width = st.get("width")
+        if width is None:
+            width = _avol_initial_width(spec, r0)
+            if r0 is not None or spec["by"] == "label":
+                st["width"] = width
+        if vol:
+            asof, code, ratio, _r0 = vol
+            if asof != st.get("vol_asof"):                  # a new 5-minute reading
+                st["vol_asof"] = asof
+                width = _avol_width(spec, code, ratio, width)
+                st["width"] = width
+                if width == 0:
+                    return f"volume faded ({_AVOL_STATE_TEXT.get(code, 'weak')}) at {asof} ({pct:+.1f}%)", st
+        arm = spec.get("arm") or 0
+        armed = bool(st.get("armed")) or not arm or peak >= entry * (1 + arm / 100)
+        st["armed"] = armed
+        if armed and width:
+            lvl = peak * (1 - width / 100)
+            if spec.get("be") and lvl < entry:
+                lvl = entry
+            if price <= lvl:
+                return f"adaptive trail hit (peak {peak:.2f}, trail {width:g}% -> {lvl:.2f}, now {pct:+.1f}%)", st
     if trail is not None:
         arm = spec.get("arm") or 0
         armed = bool(st.get("armed")) or not arm or peak >= entry * (1 + arm / 100)
@@ -8582,10 +8688,10 @@ def _lab_decide(trade: dict, access_token: str, symbol: str, last_price: float, 
     t0 = datetime.fromisoformat(state.get("t0") or trade["entry_time"])
     elapsed = int((datetime.fromisoformat(now_iso) - t0).total_seconds() // 60)
     vol = None
-    if rule["spec"]["kind"] == "vol":
+    if rule["spec"]["kind"] in ("vol", "avol"):
         vol = _lab_current_volume(symbol, access_token, trade["direction"],
                                   (t0 + IST_OFFSET).strftime("%H:%M"), trade.get("entry_volume_ratio"))
-    reason, new_state = _lab_live_step(rule["spec"], state, entry, last_price, elapsed, vol)
+    reason, new_state = _lab_live_step(rule["spec"], state, entry, last_price, elapsed, vol, trade.get("entry_volume_ratio"))
     if reason:
         return f"Lab rule '{rule['name']}': {reason}", None
     return None, (json.dumps(new_state, separators=(",", ":")) if new_state != state else None)
@@ -8616,6 +8722,18 @@ def _lab_stop_info(t: dict) -> str:
             parts.append(f"Trail stop {lvl:.2f} (peak {peak:.2f})")
     if spec.get("target"):
         parts.append(f"Target +{spec['target']:g}% ({entry * (1 + spec['target'] / 100):.2f})")
+    if spec["kind"] == "avol":
+        w = state.get("width")
+        if w is None:
+            w = _avol_initial_width(spec, t.get("entry_volume_ratio"))
+        if spec.get("arm") and not state.get("armed") and peak < entry * (1 + spec["arm"] / 100):
+            parts.append(f"Adaptive trail arms at +{spec['arm']:g}%")
+        else:
+            lvl = peak * (1 - w / 100)
+            if spec.get("be"):
+                lvl = max(lvl, entry)
+            parts.append(f"Adaptive trail {w:g}% now -> stop {lvl:.2f} (peak {peak:.2f})")
+        parts.append(_avol_table_text(spec))
     if spec["kind"] == "vol":
         parts.append("exit when " + _LAB_VOL_MODE_TEXT.get(spec.get("mode"), "volume fades"))
     if spec.get("max_min"):
@@ -8640,31 +8758,40 @@ def _lab_metrics(pnls: list[float]) -> dict:
     }
 
 
+def _lab_sample(bucket: str, liquid: bool) -> list[dict]:
+    """The alerts the Exit Lab and the Auto picker replay: price path, volume
+    readings and RSI marks parsed, filtered by entry-volume bucket / liquidity."""
+    with get_db() as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT ist_date, alert_time, category, vol_label, vol_ratio, p0, traded_min_30, opt_path, vol_path, rsi_simple_min, rsi_mom_min "
+            "FROM volume_alert_log WHERE p0 IS NOT NULL AND opt_path IS NOT NULL ORDER BY id DESC LIMIT 3000").fetchall()]
+    sample = []
+    for r in rows:
+        if bucket != "All" and r["vol_label"] != bucket:
+            continue
+        is_liquid = _vt_liquid(r)
+        if liquid and not is_liquid:
+            continue
+        try:
+            path = json.loads(r["opt_path"])
+            vmap = {int(m): (c, ratio) for m, c, ratio in json.loads(r["vol_path"] or "[]")}
+            hhmm = (datetime.fromisoformat(r["alert_time"]) + IST_OFFSET).strftime("%H:%M")
+        except Exception:
+            continue
+        if len(path) < 5:
+            continue
+        sample.append({"day": r["ist_date"], "p0": r["p0"], "path": path, "vmap": vmap, "r0": r["vol_ratio"],
+                       "rs": r["rsi_simple_min"], "rm": r["rsi_mom_min"], "hhmm": hhmm, "liquid": is_liquid})
+    return sample
+
+
 def _exit_lab_run(bucket: str = "Strong", liquid: bool = False, cost: float = 1.0) -> dict:
     key = (bucket, liquid, round(cost, 2))
     hit = _exit_lab_cache.get(key)
     if hit and time.time() - hit[0] < _EXIT_LAB_TTL:
         return hit[1]
     t_start = time.time()
-    with get_db() as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT ist_date, category, vol_label, vol_ratio, p0, traded_min_30, opt_path, vol_path, rsi_simple_min, rsi_mom_min "
-            "FROM volume_alert_log WHERE p0 IS NOT NULL AND opt_path IS NOT NULL ORDER BY id DESC LIMIT 3000").fetchall()]
-    sample = []
-    for r in rows:
-        if bucket != "All" and r["vol_label"] != bucket:
-            continue
-        if liquid and not _vt_liquid(r):
-            continue
-        try:
-            path = json.loads(r["opt_path"])
-            vmap = {int(m): (c, ratio) for m, c, ratio in json.loads(r["vol_path"] or "[]")}
-        except Exception:
-            continue
-        if len(path) < 5:
-            continue
-        sample.append({"day": r["ist_date"], "p0": r["p0"], "path": path, "vmap": vmap, "r0": r["vol_ratio"],
-                       "rs": r["rsi_simple_min"], "rm": r["rsi_mom_min"]})
+    sample = _lab_sample(bucket, liquid)
     days = sorted({a["day"] for a in sample})
     results = []
     for st in _exit_lab_strategies():
@@ -8705,6 +8832,211 @@ def _exit_lab_run(bucket: str = "Strong", liquid: bool = False, cost: float = 1.
     return out
 
 
+# =============================================================================
+# AUTO (volume-driven) exit picker. When switched ON, every new trade gets its
+# exit rule chosen automatically from the Exit Lab's replays: by how strong the
+# volume was at entry (1-2x / 2-4x / 4x+) and the time of day. A rule is only
+# chosen where it (1) has enough alerts, (2) is profitable on most days,
+# (3) beats your current exit (RSI Momentum replay) by a clear margin on a
+# cautious score (average minus one standard error). Otherwise the trade keeps
+# the strategy you had before switching Auto on. The table is rebuilt once a
+# day after the close, so a day's picks never use that day's own results.
+# =============================================================================
+_AUTO_MIN_N = 12
+_AUTO_MARGIN = 1.0
+_AUTO_COST = 1.5
+_AUTO_BUCKETS = ("1-2x", "2-4x", "4x+")
+_AUTO_WINDOWS = (("morning", "09:20", "11:00"), ("midday", "11:00", "13:00"), ("afternoon", "13:00", "15:15"))
+_auto_pick_context: dict = {}
+_auto_table_cache: list = [0.0, None]
+
+
+def _auto_ratio_bucket(ratio):
+    if ratio is None:
+        return None
+    return "4x+" if ratio >= 4 else ("2-4x" if ratio >= 2 else "1-2x")
+
+
+def _auto_window(hhmm: str):
+    for name, lo, hi in _AUTO_WINDOWS:
+        if lo <= hhmm < hi:
+            return name
+    return None
+
+
+def _auto_stats(pairs: list) -> dict:
+    import statistics, math
+    pn = [p for _, p in pairs]
+    n = len(pn)
+    avg = sum(pn) / n
+    se = (statistics.pstdev(pn) / math.sqrt(n)) if n > 1 else abs(avg)
+    by_day: dict = {}
+    for d, p in pairs:
+        by_day.setdefault(d, []).append(p)
+    return {"n": n, "avg": round(avg, 2), "score": round(avg - se, 2), "days": len(by_day),
+            "pos_days": sum(1 for v in by_day.values() if sum(v) / len(v) > 0)}
+
+
+def _auto_best(sub: list, rules: list, cost: float):
+    """(choice dict or None, why-not text) for one group of alerts."""
+    if len(sub) < _AUTO_MIN_N:
+        return None, f"only {len(sub)} alerts (need {_AUTO_MIN_N})"
+    def run(spec):
+        out = []
+        for a in sub:
+            res = _sim_exit(spec, a["path"], a["p0"], a["vmap"], a["r0"], a["rs"], a["rm"])
+            if res:
+                out.append((a["day"], (res[1] / a["p0"] - 1) * 100 - cost))
+        return out
+    base = _auto_stats(run({"kind": "rsi", "which": "mom"}))
+    best = None
+    for r in rules:
+        st = _auto_stats(run(r["spec"]))
+        if st["avg"] <= 0 or (st["days"] >= 2 and st["pos_days"] / st["days"] < 0.6):
+            continue
+        if best is None or st["score"] > best[1]["score"]:
+            best = (r, st)
+    if best is None:
+        return None, "no rule was profitable on enough days"
+    r, st = best
+    if st["score"] <= base["score"] + _AUTO_MARGIN:
+        return None, f"best rule ({r['name']}) did not clearly beat your current exit"
+    return {"rule_id": r["id"], "name": r["name"], "family": r["family"], "n": st["n"], "avg": st["avg"],
+            "score": st["score"], "pos_days": f"{st['pos_days']}/{st['days']}", "base_avg": base["avg"]}, ""
+
+
+def _auto_build_table(cost: float = _AUTO_COST) -> dict:
+    sample = _lab_sample("Strong", False)
+    liquid_sample = [a for a in sample if a["liquid"]]
+    liquid_only = len(liquid_sample) >= 40
+    if liquid_only:
+        sample = liquid_sample
+    rules = [x for x in _exit_lab_strategies() if x["live_ok"]]
+    out = {"built_at": (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d %H:%M"), "alerts": len(sample),
+           "days": sorted({a["day"] for a in sample}), "liquid_only": liquid_only, "cost": cost,
+           "min_n": _AUTO_MIN_N, "margin": _AUTO_MARGIN, "buckets": {}, "cells": {}}
+    out["global"], out["global_why"] = _auto_best(sample, rules, cost)
+    for b in _AUTO_BUCKETS:
+        sub = [a for a in sample if _auto_ratio_bucket(a["r0"]) == b]
+        ch, why = _auto_best(sub, rules, cost)
+        out["buckets"][b] = {"choice": ch, "why": why, "n": len(sub)}
+        for w, lo, hi in _AUTO_WINDOWS:
+            sub2 = [a for a in sub if lo <= a["hhmm"] < hi]
+            ch2, why2 = _auto_best(sub2, rules, cost)
+            out["cells"][f"{b}|{w}"] = {"choice": ch2, "why": why2, "n": len(sub2)}
+    return out
+
+
+def _auto_table_load():
+    if time.time() - _auto_table_cache[0] < 30:
+        return _auto_table_cache[1]
+    raw = get_setting("auto_vol_table")
+    try:
+        table = json.loads(raw) if raw else None
+    except Exception:
+        table = None
+    _auto_table_cache[0], _auto_table_cache[1] = time.time(), table
+    return table
+
+
+def _auto_table_save(table: dict) -> None:
+    set_setting("auto_vol_table", json.dumps(table, separators=(",", ":")))
+    _auto_table_cache[0], _auto_table_cache[1] = time.time(), table
+
+
+def auto_refresh_table(_date=None, _token=None) -> None:
+    """Daily job (after the close): rebuild the table from everything measured so far."""
+    table = _auto_build_table()
+    if table["alerts"] >= _AUTO_MIN_N:
+        _auto_table_save(table)
+
+
+def _auto_resolve(table, bucket, window):
+    """(level used, choice or None, why-not): the most specific group that has a proven rule."""
+    if not table:
+        return None, None, "no table built yet"
+    if bucket and window:
+        c = table["cells"].get(f"{bucket}|{window}")
+        if c and c["choice"]:
+            return "this volume level + time of day", c["choice"], ""
+    if bucket:
+        c = table["buckets"].get(bucket)
+        if c and c["choice"]:
+            return "this volume level", c["choice"], ""
+    if table.get("global"):
+        return "all Strong alerts", table["global"], ""
+    return None, None, table.get("global_why") or "no rule beat your current exit"
+
+
+def _auto_fallback() -> str:
+    fb = get_setting("auto_vol_fallback", "RSI_MOMENTUM")
+    return "RSI_MOMENTUM" if (not fb or fb == "AUTO_VOL") else fb
+
+
+def _auto_resolve_entry(symbol: str, category: str):
+    """At a new entry with Auto ON: (strategy id for the trade, info dict saved on it)."""
+    fallback = _auto_fallback()
+    ctx = _auto_pick_context.pop((symbol.upper(), category), None)
+    label = ratio = None
+    if ctx and time.time() - ctx[0] < 180:
+        label, ratio = ctx[1], ctx[2]
+    bucket = _auto_ratio_bucket(ratio) if label == "Strong" else None
+    window = _auto_window((datetime.utcnow() + IST_OFFSET).strftime("%H:%M"))
+    try:
+        table = _auto_table_load()
+    except Exception:
+        table = None
+    level, choice, why = _auto_resolve(table, bucket, window)
+    base = {"auto": True, "bucket": bucket, "window": window, "ratio": ratio}
+    if not choice or not _lab_rule_by_id(choice["rule_id"]):
+        return fallback, {**base, "picked": None, "fallback": fallback, "why": why or "rule no longer available"}
+    return choice["rule_id"], {**base, "picked": choice["name"], "level": level, "n": choice["n"],
+                               "avg": choice["avg"], "base_avg": choice.get("base_avg")}
+
+
+def _auto_turn_on() -> None:
+    cur = get_exit_strategy()
+    if cur != "AUTO_VOL":
+        set_setting("auto_vol_fallback", cur)
+    set_setting("exit_strategy", "AUTO_VOL")
+
+
+def _auto_state() -> dict:
+    return {"active": get_exit_strategy() == "AUTO_VOL", "live_ok": get_setting("auto_vol_live_ok", "false") == "true",
+            "fallback": _auto_fallback(), "table": _auto_table_load()}
+
+
+@app.route("/api/auto-vol/action", methods=["POST"])
+def api_auto_vol_action():
+    """The Auto picker's switches: on / off / live_on / live_off / refresh."""
+    action = (request.get_json(silent=True) or {}).get("action")
+    try:
+        if action == "on":
+            _auto_turn_on()
+            if _auto_table_load() is None:
+                t = _auto_build_table()
+                if t["alerts"] >= _AUTO_MIN_N:
+                    _auto_table_save(t)
+        elif action == "off":
+            set_setting("exit_strategy", _auto_fallback())
+        elif action == "live_on":
+            set_setting("auto_vol_live_ok", "true")
+        elif action == "live_off":
+            set_setting("auto_vol_live_ok", "false")
+        elif action == "refresh":
+            t = _auto_build_table()
+            if t["alerts"] < _AUTO_MIN_N:
+                return jsonify({"status": "error", "message": f"only {t['alerts']} measured Strong alerts - need {_AUTO_MIN_N}"}), 400
+            _auto_table_save(t)
+        else:
+            return jsonify({"status": "error", "message": "action must be on, off, live_on, live_off or refresh"}), 400
+        st = _auto_state()
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"status": "error", "message": "database unavailable"}), 503
+    return jsonify({"status": "ok", "active": st["active"], "live_ok": st["live_ok"], "fallback": st["fallback"],
+                    "built_at": (st["table"] or {}).get("built_at")})
+
+
 @app.route("/exit-lab")
 def exit_lab_page():
     bucket = request.args.get("bucket", "Strong")
@@ -8731,10 +9063,22 @@ def exit_lab_page():
         open_trades = []
     active = get_exit_strategy()
     active_rule = _lab_rule_by_id(active)
+    try:
+        auto = _auto_state()
+    except (psycopg2.Error, RuntimeError):
+        auto = {"active": False, "live_ok": False, "fallback": "RSI_MOMENTUM", "table": None}
+    grid = []
+    for b in _AUTO_BUCKETS:
+        cells = []
+        for w, lo, hi in _AUTO_WINDOWS:
+            level, choice, why = _auto_resolve(auto["table"], b, w)
+            raw = (auto["table"] or {}).get("cells", {}).get(f"{b}|{w}") or {}
+            cells.append({"window": w, "level": level, "choice": choice, "why": why, "n": raw.get("n")})
+        grid.append({"bucket": b, "cells": cells})
     return render_template("exit_lab.html", active_tab="exit_lab", res=res, rows=rows, bucket=bucket, liquid=liquid,
                            cost=cost, sort=sort, open_trades=open_trades, active=active,
-                           active_label=(active_rule["name"] if active_rule else active),
-                           active_is_lab=bool(active_rule))
+                           active_label=("Auto (volume-driven)" if auto["active"] else (active_rule["name"] if active_rule else active)),
+                           active_is_lab=bool(active_rule), auto=auto, grid=grid, windows=_AUTO_WINDOWS)
 
 
 @app.route("/api/exit-lab")
@@ -9052,6 +9396,7 @@ def paper_trading_live_toggle():
 VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE", "FIRST5MIN_FIB")
 
 STRATEGY_DESCRIPTIONS = {
+    "AUTO_VOL": "Auto (volume-driven): each new trade's exit rule is chosen automatically from the Exit Lab - by volume strength at entry and time of day - but only where a rule has proven clearly better than your previous strategy; otherwise the trade uses that previous strategy. Paper-only until you allow it for live trades on the Exit Lab page. Switch off any time.",
     "EMA": "1) 5-EMA only, let it run - retired from selection (let losses run too deep waiting for a pattern reversal to confirm). Kept only for trades that already opened under it.",
     "HALF_HALF_HARD4": "2) Hard -2% stop-loss protects until +2% (immediate, not pattern-based). At +2%, half the qty books (Target-1) and the rest is protected at breakeven. At +4%, the remaining half exits in full - a hard target, no trailing beyond it.",
     "TRAIL_FROM_2": "3) Hard -2% stop-loss protects until +2%. No half-booking - the full quantity starts trailing from +2%, in 0.2% steps, always one step behind the peak.",
@@ -9079,6 +9424,9 @@ def paper_trading_strategy_toggle():
     already in flight."""
     data = request.get_json(silent=True) or {}
     strategy = data.get("strategy")
+    if strategy == "AUTO_VOL":
+        _auto_turn_on()
+        return jsonify({"status": "ok", "exit_strategy": strategy, "description": STRATEGY_DESCRIPTIONS["AUTO_VOL"]})
     if strategy not in VALID_STRATEGIES and not _lab_rule_by_id(strategy):
         return jsonify({"status": "error", "message": f"strategy must be one of {VALID_STRATEGIES} or a Lab rule from /exit-lab"}), 400
     set_setting("exit_strategy", strategy)
