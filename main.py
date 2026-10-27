@@ -7203,7 +7203,9 @@ def paper_trading():
         ).fetchall()
 
     open_trades = [dict(t) for t in open_trades]
+    _attach_rule_notes(open_trades)
     closed_trades = [dict(t) for t in closed_trades]
+    _attach_rule_notes(closed_trades)
     attach_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct", "planned_risk_pct")
     attach_ist_times(open_trades)
@@ -8968,9 +8970,48 @@ def _auto_resolve(table, bucket, window):
     return None, None, table.get("global_why") or "no rule beat your current exit"
 
 
-def _auto_fallback() -> str:
+def _auto_previous() -> str:
+    """The strategy new trades return to when Auto is switched OFF."""
     fb = get_setting("auto_vol_fallback", "RSI_MOMENTUM")
     return "RSI_MOMENTUM" if (not fb or fb == "AUTO_VOL") else fb
+
+
+def _auto_fallback() -> str:
+    """What a trade uses when Auto has no proven rule for its situation: the
+    default rule you chose (any selectable Exit Lab rule), else your previous strategy."""
+    d = get_setting("auto_vol_default", "")
+    if d and _lab_rule_by_id(d):
+        return d
+    return _auto_previous()
+
+
+def _strategy_name(strategy_id: str) -> str:
+    rule = _lab_rule_by_id(strategy_id) if isinstance(strategy_id, str) and strategy_id.startswith("LAB:") else None
+    return rule["name"] if rule else (strategy_id or "")
+
+
+def _rule_note(t: dict) -> str:
+    """One line for a trade row: which exit rule it runs and, for Auto trades, why."""
+    strat = t.get("strategy") or ""
+    try:
+        st = json.loads(t.get("lab_state") or "{}")
+    except Exception:
+        st = {}
+    auto = st.get("auto") if isinstance(st, dict) else None
+    name = _strategy_name(strat)
+    if auto:
+        if auto.get("picked"):
+            return f"Auto picked: {name} ({auto.get('level')}, {auto.get('n')} alerts)"
+        return f"Auto: no proven rule ({auto.get('why') or 'n/a'}) - used default: {name}"
+    return f"Exit rule: {name}" if name else ""
+
+
+def _attach_rule_notes(trades: list) -> None:
+    for t in trades:
+        try:
+            t["rule_note"] = _rule_note(t)
+        except Exception:
+            t["rule_note"] = ""
 
 
 def _auto_resolve_entry(symbol: str, category: str):
@@ -9002,13 +9043,15 @@ def _auto_turn_on() -> None:
 
 
 def _auto_state() -> dict:
+    fb = _auto_fallback()
     return {"active": get_exit_strategy() == "AUTO_VOL", "live_ok": get_setting("auto_vol_live_ok", "false") == "true",
-            "fallback": _auto_fallback(), "table": _auto_table_load()}
+            "fallback": fb, "fallback_name": _strategy_name(fb), "previous": _auto_previous(),
+            "default": get_setting("auto_vol_default", "") or "", "table": _auto_table_load()}
 
 
 @app.route("/api/auto-vol/action", methods=["POST"])
 def api_auto_vol_action():
-    """The Auto picker's switches: on / off / live_on / live_off / refresh."""
+    """The Auto picker's switches: on / off / live_on / live_off / refresh / set_default."""
     action = (request.get_json(silent=True) or {}).get("action")
     try:
         if action == "on":
@@ -9018,7 +9061,12 @@ def api_auto_vol_action():
                 if t["alerts"] >= _AUTO_MIN_N:
                     _auto_table_save(t)
         elif action == "off":
-            set_setting("exit_strategy", _auto_fallback())
+            set_setting("exit_strategy", _auto_previous())
+        elif action == "set_default":
+            rid = (request.get_json(silent=True) or {}).get("rule_id") or ""
+            if rid and not _lab_rule_by_id(rid):
+                return jsonify({"status": "error", "message": "that rule can't be used as a default"}), 400
+            set_setting("auto_vol_default", rid)
         elif action == "live_on":
             set_setting("auto_vol_live_ok", "true")
         elif action == "live_off":
@@ -9029,7 +9077,7 @@ def api_auto_vol_action():
                 return jsonify({"status": "error", "message": f"only {t['alerts']} measured Strong alerts - need {_AUTO_MIN_N}"}), 400
             _auto_table_save(t)
         else:
-            return jsonify({"status": "error", "message": "action must be on, off, live_on, live_off or refresh"}), 400
+            return jsonify({"status": "error", "message": "action must be on, off, live_on, live_off, refresh or set_default"}), 400
         st = _auto_state()
     except (psycopg2.Error, RuntimeError):
         return jsonify({"status": "error", "message": "database unavailable"}), 503
@@ -9066,7 +9114,22 @@ def exit_lab_page():
     try:
         auto = _auto_state()
     except (psycopg2.Error, RuntimeError):
-        auto = {"active": False, "live_ok": False, "fallback": "RSI_MOMENTUM", "table": None}
+        auto = {"active": False, "live_ok": False, "fallback": "RSI_MOMENTUM", "fallback_name": "RSI_MOMENTUM",
+                "previous": "RSI_MOMENTUM", "default": "", "table": None}
+    try:
+        with get_db() as conn:
+            rt = [dict(r) for r in conn.execute(
+                "SELECT id, symbol, direction, pnl, exit_time FROM paper_trades WHERE status = 'CLOSED' ORDER BY id DESC LIMIT 40").fetchall()]
+        for r in rt:
+            ex = (datetime.fromisoformat(r["exit_time"]) + IST_OFFSET).strftime("%d %b %H:%M") if r.get("exit_time") else ""
+            r["label"] = f"#{r['id']} {r.get('symbol')} {r.get('direction')} - {ex} - P&L {round(r.get('pnl') or 0):+d}"
+        replay_trades = rt
+    except (psycopg2.Error, RuntimeError):
+        replay_trades = []
+    default_groups: dict = {}
+    for x in _exit_lab_strategies():
+        if x["live_ok"]:
+            default_groups.setdefault(x["family"], []).append({"id": x["id"], "name": x["name"]})
     grid = []
     for b in _AUTO_BUCKETS:
         cells = []
@@ -9078,7 +9141,72 @@ def exit_lab_page():
     return render_template("exit_lab.html", active_tab="exit_lab", res=res, rows=rows, bucket=bucket, liquid=liquid,
                            cost=cost, sort=sort, open_trades=open_trades, active=active,
                            active_label=("Auto (volume-driven)" if auto["active"] else (active_rule["name"] if active_rule else active)),
-                           active_is_lab=bool(active_rule), auto=auto, grid=grid, windows=_AUTO_WINDOWS)
+                           active_is_lab=bool(active_rule), auto=auto, grid=grid, windows=_AUTO_WINDOWS,
+                           replay_trades=replay_trades, default_groups=default_groups)
+
+
+@app.route("/api/exit-lab/replay")
+def api_exit_lab_replay():
+    """What every exit rule would have done on ONE real trade: its volume
+    readings over time, and each rule's exit time, price and P&L on that
+    trade's own option-price path (gross, no cost)."""
+    try:
+        trade_id = int(request.args.get("trade_id", ""))
+    except ValueError:
+        return jsonify({"error": "trade_id is required"}), 400
+    try:
+        with get_db() as conn:
+            t = conn.execute("SELECT * FROM paper_trades WHERE id = ?", (trade_id,)).fetchone()
+            if not t:
+                return jsonify({"error": "no such trade"}), 404
+            t = dict(t)
+            et = datetime.fromisoformat(t["entry_time"])
+            row = conn.execute(
+                "SELECT * FROM volume_alert_log WHERE UPPER(symbol) = ? AND category = ? AND alert_time >= ? AND alert_time <= ? "
+                "ORDER BY alert_time DESC LIMIT 1",
+                ((t["symbol"] or "").upper(), t["direction"], (et - timedelta(minutes=4)).isoformat(),
+                 (et + timedelta(minutes=2)).isoformat())).fetchone()
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    if not row:
+        return jsonify({"error": "This trade's alert was not logged by the Volume filter test, so it can't be replayed "
+                                 "(only trades that came from a logged, volume-judged alert can)."}), 404
+    row = dict(row)
+    if not row.get("opt_path") or row.get("p0") is None:
+        return jsonify({"error": "This alert has not been measured yet. Run the re-measure step (Manual vs RSI tab) and try again."}), 409
+    path = json.loads(row["opt_path"])
+    vmap = {int(m): (c, ratio) for m, c, ratio in json.loads(row["vol_path"] or "[]")}
+    p0 = row["p0"]
+    qty = t.get("original_quantity") or t.get("quantity") or 1
+    t0 = datetime.fromisoformat(row["alert_time"]) + IST_OFFSET
+    clock = lambda m: (t0 + timedelta(minutes=m)).strftime("%H:%M")
+    results = []
+    for st in _exit_lab_strategies():
+        res = _sim_exit(st["spec"], path, p0, vmap, row["vol_ratio"], row["rsi_simple_min"], row["rsi_mom_min"])
+        if not res:
+            continue
+        m, px = res
+        results.append({"name": st["name"], "family": st["family"], "selectable": bool(st["live_ok"]), "minute": m,
+                        "clock": clock(m), "price": round(px, 2), "pct": round((px / p0 - 1) * 100, 2),
+                        "pnl": round(qty * (px - p0), 0)})
+    results.sort(key=lambda x: -x["pnl"])
+    actual_min = None
+    if t.get("exit_time"):
+        actual_min = max(1, int((datetime.fromisoformat(t["exit_time"]) - datetime.fromisoformat(row["alert_time"])).total_seconds() // 60))
+    horizon = min(len(path), (actual_min or len(path)) + 20)
+    timeline = [{"clock": clock(m), "minute": m, "state": _AVOL_STATE_TEXT.get(c, c), "ratio": ratio,
+                 "price": path[m - 1], "pct": round((path[m - 1] / p0 - 1) * 100, 1)}
+                for m, (c, ratio) in sorted(vmap.items()) if m <= horizon and m - 1 < len(path)]
+    peak = max(path[:horizon]) if path else None
+    return jsonify({
+        "trade": {"id": t["id"], "symbol": t["symbol"], "direction": t["direction"], "qty": qty, "entry_price": t.get("entry_price"),
+                  "exit_price": t.get("exit_price"), "pnl": t.get("pnl"), "exit_reason": t.get("exit_reason"),
+                  "rule": _rule_note(t), "alert_clock": t0.strftime("%H:%M"), "exit_minute": actual_min,
+                  "exit_clock": clock(actual_min) if actual_min else None},
+        "entry_volume": {"label": row["vol_label"], "ratio": row["vol_ratio"]},
+        "p0": p0, "peak": peak, "peak_minute": (path[:horizon].index(peak) + 1) if peak else None,
+        "timeline": timeline, "results": results,
+    })
 
 
 @app.route("/api/exit-lab")
@@ -9194,7 +9322,9 @@ def live_trading_page():
         ).fetchall()
 
     open_trades = [dict(t) for t in open_trades]
+    _attach_rule_notes(open_trades)
     closed_trades = [dict(t) for t in closed_trades]
+    _attach_rule_notes(closed_trades)
     failed_trades = [dict(t) for t in failed_trades]
     attach_ist_times(failed_trades)
     attach_live_unrealized_pnl(open_trades)
@@ -9258,7 +9388,9 @@ def live_trading_data():
             "SELECT * FROM paper_trades WHERE live_status = 'FAILED' ORDER BY id DESC LIMIT 50"
         ).fetchall()
     open_trades = [dict(t) for t in open_trades]
+    _attach_rule_notes(open_trades)
     closed_trades = [dict(t) for t in closed_trades]
+    _attach_rule_notes(closed_trades)
     attach_live_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "live_mae_pct", "live_planned_risk_pct")
     attach_ist_times(open_trades)
@@ -9300,7 +9432,9 @@ def paper_trading_data():
             "SELECT * FROM paper_trades WHERE status = 'CLOSED' ORDER BY id DESC LIMIT 200"
         ).fetchall()
     open_trades = [dict(t) for t in open_trades]
+    _attach_rule_notes(open_trades)
     closed_trades = [dict(t) for t in closed_trades]
+    _attach_rule_notes(closed_trades)
     attach_unrealized_pnl(open_trades)
     attach_rr(open_trades, "unrealized_pnl_pct", "mae_pct", "planned_risk_pct")
     attach_ist_times(open_trades)
