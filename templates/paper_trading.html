@@ -330,7 +330,7 @@
       </tr>
       {% for t in open_trades %}
       <tr>
-        <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}{% if t.volume %}<div class="vol-line"><span class="vol-pill {{ t.volume.label|lower }}" title="{{ 'Buy' if t.direction == 'Buy' else 'Sell' }}-side directional volume is {{ t.volume.ratio }}x its usual level for this time of day{% if t.entry_volume_label %}. At entry: {{ t.entry_volume_label }} ({{ t.entry_volume_ratio }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ t.volume.asof }}.">Vol {{ t.volume.label }} &middot; {{ t.volume.ratio }}&times;</span><span>as of {{ t.volume.asof }}</span></div>{% endif %}</td>
+        <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}{% if t.rule_note %}<div class="sub" style="font-size:10px;opacity:.85" title="{{ t.rule_note }}">{{ t.rule_note }}</div>{% endif %}{% if t.volume %}<div class="vol-line"><span class="vol-pill {{ t.volume.label|lower }}" title="{{ 'Buy' if t.direction == 'Buy' else 'Sell' }}-side directional volume is {{ t.volume.ratio }}x its usual level for this time of day{% if t.entry_volume_label %}. At entry: {{ t.entry_volume_label }} ({{ t.entry_volume_ratio }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ t.volume.asof }}.">Vol {{ t.volume.label }} &middot; {{ t.volume.ratio }}&times;</span><span>as of {{ t.volume.asof }}</span></div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
         <td>{{ t.quantity }}{% if t.target1_hit_time %}<div class="sub" style="font-size:11px; color: var(--gold);">T1: {{ t.target1_qty }} @ {{ t.target1_exit_price }}</div>{% endif %}</td>
         <td>{{ t.entry_price }}</td>
@@ -377,7 +377,7 @@
             </tr>
             {% for t in group.trades %}
             <tr>
-              <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}</td>
+              <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}{% if t.rule_note %}<div class="sub" style="font-size:10px;opacity:.85" title="{{ t.rule_note }}">{{ t.rule_note }}</div>{% endif %}</td>
               <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
               <td>{{ t.quantity }}</td>
               <td>{{ t.entry_price }}</td>
@@ -480,7 +480,7 @@
         const entryRsiText = (t.entry_rsi === null || t.entry_rsi === undefined) ? "-" : t.entry_rsi;
         return `
         <tr>
-          <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}${volPillHTML(t)}</td>
+          <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}${t.rule_note ? `<div class="sub" style="font-size:10px;opacity:.85" title="${escapeHtml(t.rule_note)}">${escapeHtml(t.rule_note)}</div>` : ""}${volPillHTML(t)}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
           <td>${t.quantity}${t.target1_hit_time ? `<div class="sub" style="font-size:11px; color: var(--gold);">T1: ${t.target1_qty} @ ${t.target1_exit_price}</div>` : ""}</td>
           <td>${t.entry_price}</td>
@@ -552,7 +552,7 @@
           const exitRsiText = (t.exit_rsi === null || t.exit_rsi === undefined) ? "-" : t.exit_rsi;
           return `
             <tr>
-              <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}</td>
+              <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}${t.rule_note ? `<div class="sub" style="font-size:10px;opacity:.85" title="${escapeHtml(t.rule_note)}">${escapeHtml(t.rule_note)}</div>` : ""}</td>
               <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
               <td>${t.quantity}</td>
               <td>${t.entry_price}</td>

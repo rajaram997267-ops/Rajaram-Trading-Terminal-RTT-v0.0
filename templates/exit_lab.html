@@ -69,21 +69,38 @@
       <span id="autoMsg" style="font-weight:600"></span>
     </div>
     <div class="mut" style="margin-top:6px;line-height:1.55">
-      {% if auto.active %}<b style="color:var(--text)">ON:</b> every new trade gets its exit rule chosen automatically (by volume strength at entry and time of day), but only where the Exit Lab has proven a rule clearly better than <b>{{ auto.fallback }}</b>; anywhere else the trade uses {{ auto.fallback }}. Trades already open keep the rule they started with.
-      {% else %}<b style="color:var(--text)">OFF:</b> new trades use <b>{{ active_label }}</b>. Switch ON to let the Exit Lab choose per trade - turning it OFF later returns new trades to the strategy you have now. Open trades are never changed by the switch.{% endif %}
+      {% if auto.active %}<b style="color:var(--text)">ON:</b> every new trade gets its exit rule chosen automatically (by volume strength at entry and time of day), but only where the Exit Lab has proven a rule clearly better than <b>RSI Momentum</b>; anywhere else the trade uses <b>{{ auto.fallback_name }}</b>. Trades already open keep the rule they started with.
+      {% else %}<b style="color:var(--text)">OFF:</b> new trades use <b>{{ active_label }}</b>. Switch ON to let the Exit Lab choose per trade - turning it OFF later returns new trades to <b>{{ auto.previous }}</b>. Open trades are never changed by the switch.{% endif %}
       <br><b style="color:var(--text)">Live trades:</b> {% if auto.live_ok %}<span class="neg"><b>allowed</b></span> - Auto-chosen rules close real positions. <a href="#" onclick="autoAct('live_off');return false">Make paper-only</a>
       {% else %}<b>paper-only</b> - with Auto ON, live orders are skipped (the trade stays paper) until you allow it. <a href="#" onclick="autoAct('live_on');return false">Allow on live trades</a>{% endif %}
       <br>{% if auto.table %}Table rebuilt {{ auto.table.built_at }} from {{ auto.table.alerts }} Strong alerts over {{ auto.table.days|length }} day(s){% if auto.table.liquid_only %} (liquid contracts only){% endif %}, cost {{ auto.table.cost }}% per trade; rebuilt automatically each day after the close (so a day's picks never use that day's own results). <a href="#" onclick="autoAct('refresh');return false">Rebuild now</a>
       {% else %}No table yet - it needs at least 12 measured Strong alerts. <a href="#" onclick="autoAct('refresh');return false">Try building it now</a>{% endif %}
+    </div>
+    <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+      <b style="color:var(--text)">When no rule is proven yet, use:</b>
+      <select id="autoDefault" onchange="autoSetDefault(this.value)" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;max-width:100%">
+        <option value="" {{ 'selected' if not auto.default else '' }}>Your previous strategy ({{ auto.previous }})</option>
+        {% for fam, items in default_groups.items() %}<optgroup label="{{ fam }}">{% for x in items %}<option value="{{ x.id }}" {{ 'selected' if auto.default == x.id else '' }}>{{ x.name }}</option>{% endfor %}</optgroup>{% endfor %}
+      </select>
+      <div class="mut" style="margin-top:6px;font-size:12px;line-height:1.5">Until the Exit Lab has enough data to prove a rule for a situation, Auto keeps trades on this. If it stays on {{ auto.previous }}, a trade whose volume fades early is held until RSI/EMA finally turn - which can be late. Pick a volume-based rule if you want fading volume to act as the exit (e.g. <i>Exit when volume drops below Strong (stop -10%)</i> is your manual habit written as a rule). Check that rule's row in the ranking below first: its average, win % and days positive.</div>
     </div>
     <div class="wrap" style="margin-top:10px"><table>
       <tr><th>Volume at entry</th>{% for w in windows %}<th>{{ w[0] }} {{ w[1] }}-{{ w[2] }}</th>{% endfor %}</tr>
       {% for row in grid %}<tr><td><b>{{ row.bucket }}</b> normal volume</td>
         {% for c in row.cells %}<td style="white-space:normal;min-width:190px">
           {% if c.choice %}<b>{{ c.choice.name }}</b><br><span class="mut">avg {{ '%+.1f' % c.choice.avg }}% vs your RSI Momentum exit {{ '%+.1f' % c.choice.base_avg }}% &middot; {{ c.choice.n }} alerts &middot; + on {{ c.choice.pos_days }} days &middot; basis: {{ c.level }}</span>
-          {% else %}<span class="mut">uses {{ auto.fallback }}<br>({{ c.why }})</span>{% endif %}</td>{% endfor %}</tr>{% endfor %}
+          {% else %}<span class="mut">uses <b>{{ auto.fallback_name }}</b><br>({{ c.why }})</span>{% endif %}</td>{% endfor %}</tr>{% endfor %}
     </table></div>
-    <div class="mut" style="margin-top:6px;font-size:12px">A rule appears only if it had at least {{ auto.table.min_n if auto.table else 12 }} alerts, was profitable on most days, and beat the RSI Momentum replay by a clear margin on a cautious score (average minus one standard error). With only a few days of data most boxes will say "uses {{ auto.fallback }}" - that is the safety net working, not a fault.</div>
+    <div class="mut" style="margin-top:6px;font-size:12px">A rule appears only if it had at least {{ auto.table.min_n if auto.table else 12 }} alerts, was profitable on most days, and beat the RSI Momentum replay by a clear margin on a cautious score (average minus one standard error). With only a few days of data most boxes will say "uses {{ auto.fallback_name }}" - that is the safety net, not a fault. Set what the safety net is just below.</div>
+  </div>
+
+  <div class="warn" id="replayBox" style="margin-top:12px">
+    <b style="font-size:15px">Replay a closed trade</b>
+    <div class="mut" style="margin-top:4px">Pick a trade to see when its volume changed and what <b>every</b> exit rule would have made on that trade's own price path (gross, before costs). Only trades that came from a logged alert can be replayed.</div>
+    <div style="margin-top:8px"><select id="replaySel" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px;max-width:100%">
+      {% for r in replay_trades %}<option value="{{ r.id }}">{{ r.label }}</option>{% else %}<option value="">no closed trades yet</option>{% endfor %}</select>
+      <button onclick="replayTrade()" style="margin-left:6px;padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--green);color:#fff;cursor:pointer">Replay</button></div>
+    <div id="replayOut" style="margin-top:10px"></div>
   </div>
 
   <div class="warn" style="margin-top:12px">
@@ -178,6 +195,38 @@
         if (where === "new") setTimeout(() => location.reload(), 1200);
       } catch (e) { el.style.color = "var(--red)"; el.textContent = " request failed"; }
     }
+    async function autoSetDefault(rid) {
+      const el = document.getElementById("autoMsg");
+      try {
+        const res = await fetch("/api/auto-vol/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "set_default", rule_id: rid }) });
+        const data = await res.json();
+        el.style.color = res.ok ? "var(--green)" : "var(--red)"; el.textContent = res.ok ? "Default saved" : (data.message || "failed");
+        if (res.ok) setTimeout(() => location.reload(), 600);
+      } catch (e) { el.style.color = "var(--red)"; el.textContent = "request failed"; }
+    }
+
+    async function replayTrade() {
+      const out = document.getElementById("replayOut"), id = document.getElementById("replaySel").value;
+      if (!id) return;
+      out.innerHTML = '<span class="mut">Replaying...</span>';
+      const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+      const sgn = (v, d = 1) => (v > 0 ? "+" : "") + Number(v).toFixed(d);
+      const cls = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "mut");
+      try {
+        const res = await fetch("/api/exit-lab/replay?trade_id=" + encodeURIComponent(id));
+        const d = await res.json();
+        if (!res.ok) { out.innerHTML = '<span class="neg">' + esc(d.error || "failed") + '</span>'; return; }
+        const t = d.trade;
+        let h = '<div><b>' + esc(t.symbol) + ' ' + esc(t.direction) + '</b> &middot; alert ' + esc(t.alert_clock) + ' at ' + d.p0 + ' &middot; entry volume <b>' + esc(d.entry_volume.label) + ' ' + d.entry_volume.ratio + '&times;</b>'
+          + ' &middot; peak ' + d.peak + ' at +' + d.peak_minute + ' min<br>Actual: exit ' + (t.exit_clock || "-") + ' at ' + t.exit_price + ' = <b class="' + cls(t.pnl) + '">' + sgn(t.pnl, 0) + '</b> &middot; ' + esc(t.exit_reason || "") + '<br><span class="mut">' + esc(t.rule || "") + '</span></div>';
+        h += '<div class="sub" style="margin:10px 0 4px"><b style="color:var(--text)">Volume over time</b> (each 5-minute reading, with the option price then)</div><div class="wrap"><table><tr><th>Time</th><th>+min</th><th>Volume</th><th>Ratio</th><th>Option price</th><th>vs alert</th></tr>'
+          + d.timeline.map((x) => '<tr><td>' + x.clock + '</td><td>' + x.minute + '</td><td>' + esc(x.state) + '</td><td>' + (x.ratio == null ? "-" : x.ratio + "&times;") + '</td><td>' + x.price + '</td><td class="' + cls(x.pct) + '">' + sgn(x.pct) + '%</td></tr>').join("") + '</table></div>';
+        h += '<div class="sub" style="margin:10px 0 4px"><b style="color:var(--text)">What each rule would have made on this trade</b> (best first; * = can be selected for real trades)</div><div class="wrap"><table><tr><th>#</th><th>Exit rule</th><th>Family</th><th>Exit</th><th>Price</th><th>%</th><th>P&amp;L (Rs)</th></tr>'
+          + d.results.map((x, i) => '<tr><td class="mut">' + (i + 1) + '</td><td>' + esc(x.name) + (x.selectable ? " *" : "") + '</td><td class="fam">' + esc(x.family) + '</td><td>' + x.clock + ' (+' + x.minute + ')</td><td>' + x.price + '</td><td class="' + cls(x.pct) + '">' + sgn(x.pct) + '%</td><td class="' + cls(x.pnl) + '"><b>' + sgn(x.pnl, 0) + '</b></td></tr>').join("") + '</table></div>';
+        out.innerHTML = h;
+      } catch (e) { out.innerHTML = '<span class="neg">request failed</span>'; }
+    }
+
     async function autoAct(action) {
       const el = document.getElementById("autoMsg");
       const text = {
