@@ -9209,6 +9209,93 @@ def api_exit_lab_replay():
     })
 
 
+@app.route("/api/exit-lab/rsi-simple-history")
+def api_exit_lab_rsi_simple_history():
+    """For EVERY closed trade that came from a logged alert: what the RSI Simple
+    exit would have made on that trade's own option path, next to what the trade
+    actually made. Read-only; gross (before costs), same replay engine and
+    P&L formula (qty x (exit - alert price)) as the single-trade replay."""
+    try:
+        stop = int(request.args.get("stop", "0") or 0)
+    except ValueError:
+        stop = 0
+    if stop not in (0, 10, 15):
+        stop = 0
+    try:
+        limit = max(1, min(int(request.args.get("limit", "300")), 1000))
+    except ValueError:
+        limit = 300
+    spec = {"kind": "rsi", "which": "simple", "stop": stop or None}
+    rows_out, skipped = [], []
+    try:
+        with get_db() as conn:
+            trades = [dict(r) for r in conn.execute(
+                "SELECT * FROM paper_trades WHERE status = 'CLOSED' ORDER BY id DESC LIMIT ?", (limit,)).fetchall()]
+            for t in trades:
+                try:
+                    et = datetime.fromisoformat(t["entry_time"])
+                    row = conn.execute(
+                        "SELECT * FROM volume_alert_log WHERE UPPER(symbol) = ? AND category = ? AND alert_time >= ? AND alert_time <= ? "
+                        "ORDER BY alert_time DESC LIMIT 1",
+                        ((t["symbol"] or "").upper(), t["direction"], (et - timedelta(minutes=4)).isoformat(),
+                         (et + timedelta(minutes=2)).isoformat())).fetchone()
+                except Exception:
+                    row = None
+                if not row:
+                    skipped.append({"id": t["id"], "symbol": t["symbol"], "why": "alert not logged"})
+                    continue
+                row = dict(row)
+                if not row.get("opt_path") or row.get("p0") is None:
+                    skipped.append({"id": t["id"], "symbol": t["symbol"], "why": "alert not measured yet"})
+                    continue
+                path = json.loads(row["opt_path"])
+                vmap = {int(m): (c, ratio) for m, c, ratio in json.loads(row["vol_path"] or "[]")}
+                p0 = row["p0"]
+                res = _sim_exit(spec, path, p0, vmap, row["vol_ratio"], row["rsi_simple_min"], row["rsi_mom_min"])
+                if not res:
+                    skipped.append({"id": t["id"], "symbol": t["symbol"], "why": "no price path"})
+                    continue
+                m, px = res
+                qty = t.get("original_quantity") or t.get("quantity") or 1
+                t0 = datetime.fromisoformat(row["alert_time"]) + IST_OFFSET
+                actual = round(t.get("pnl") or 0)
+                sim = round(qty * (px - p0))
+                # RSI Simple only "fires" if the stored RSI mark exists; otherwise the
+                # replay just holds to the end of the stored path.
+                fired = bool(row["rsi_simple_min"]) or m < len(path)
+                rows_out.append({
+                    "id": t["id"], "symbol": t["symbol"], "direction": t["direction"], "qty": qty,
+                    "date": t0.strftime("%d %b"), "entry_clock": t0.strftime("%H:%M"),
+                    "actual_exit": (datetime.fromisoformat(t["exit_time"]) + IST_OFFSET).strftime("%H:%M") if t.get("exit_time") else "-",
+                    "actual_pnl": actual, "actual_reason": t.get("exit_reason") or "",
+                    "rsi_exit": (t0 + timedelta(minutes=m)).strftime("%H:%M"), "rsi_minute": m,
+                    "p0": round(p0, 2), "rsi_price": round(px, 2),
+                    "rsi_pct": round((px / p0 - 1) * 100, 2), "rsi_pnl": sim, "diff": sim - actual,
+                    "no_signal": not fired,
+                })
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    n = len(rows_out)
+    tot_a = sum(r["actual_pnl"] for r in rows_out)
+    tot_s = sum(r["rsi_pnl"] for r in rows_out)
+    by_day: dict = {}
+    for r in rows_out:
+        d = by_day.setdefault(r["date"], {"date": r["date"], "n": 0, "actual": 0, "rsi": 0})
+        d["n"] += 1
+        d["actual"] += r["actual_pnl"]
+        d["rsi"] += r["rsi_pnl"]
+    return jsonify({
+        "rule": "RSI Simple exit" + (f" (stop -{stop}%)" if stop else ""), "stop": stop, "count": n,
+        "skipped": skipped, "rows": sorted(rows_out, key=lambda r: r["id"]),
+        "totals": {"actual": tot_a, "rsi": tot_s, "diff": tot_s - tot_a,
+                   "actual_wins": sum(1 for r in rows_out if r["actual_pnl"] > 0),
+                   "rsi_wins": sum(1 for r in rows_out if r["rsi_pnl"] > 0),
+                   "better": sum(1 for r in rows_out if r["diff"] > 0),
+                   "no_signal": sum(1 for r in rows_out if r["no_signal"])},
+        "by_day": list(by_day.values()),
+    })
+
+
 @app.route("/api/exit-lab")
 def api_exit_lab():
     bucket = request.args.get("bucket", "Strong")
