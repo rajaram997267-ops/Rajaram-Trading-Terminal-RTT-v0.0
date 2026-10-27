@@ -103,6 +103,17 @@
     <div id="replayOut" style="margin-top:10px"></div>
   </div>
 
+  <div class="warn" id="rsiHistBox" style="margin-top:12px">
+    <b style="font-size:15px">RSI Simple Exit on your closed-trade history</b>
+    <div class="mut" style="margin-top:4px">For every closed trade that came from a logged alert: what you actually made vs what <b>RSI Simple Exit</b> would have made on the same option price path (gross, before costs; P&amp;L = quantity &times; (exit - alert price)).</div>
+    <div style="margin-top:8px">
+      <select id="rsiStop" style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:6px 8px">
+        <option value="0">RSI Simple exit (no stop)</option><option value="10">RSI Simple exit + stop -10%</option><option value="15">RSI Simple exit + stop -15%</option></select>
+      <label style="margin-left:8px;font-size:12px"><input type="checkbox" id="rsiDaily" checked> Date-wise only</label>
+      <button onclick="rsiHistory()" style="margin-left:6px;padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--green);color:#fff;cursor:pointer">Show</button></div>
+    <div id="rsiHistOut" style="margin-top:10px"></div>
+  </div>
+
   <div class="warn" style="margin-top:12px">
     <b>New trades currently use:</b> {{ active_label }}{% if active_is_lab %} <span class="mut">(Lab rule)</span>{% endif %} &nbsp;&middot;&nbsp;
     <b>Open trade:</b>
@@ -203,6 +214,34 @@
         el.style.color = res.ok ? "var(--green)" : "var(--red)"; el.textContent = res.ok ? "Default saved" : (data.message || "failed");
         if (res.ok) setTimeout(() => location.reload(), 600);
       } catch (e) { el.style.color = "var(--red)"; el.textContent = "request failed"; }
+    }
+
+    async function rsiHistory() {
+      const out = document.getElementById("rsiHistOut");
+      out.innerHTML = '<span class="mut">Replaying every closed trade...</span>';
+      const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+      const sgn = (v, d = 0) => (v > 0 ? "+" : "") + Number(v).toFixed(d);
+      const cls = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "mut");
+      try {
+        const res = await fetch("/api/exit-lab/rsi-simple-history?stop=" + document.getElementById("rsiStop").value);
+        const d = await res.json();
+        if (!res.ok) { out.innerHTML = '<span class="neg">' + esc(d.error || "failed") + '</span>'; return; }
+        const t = d.totals;
+        let h = '<div class="cards"><div class="card">Trades replayed<b>' + d.count + '</b></div>'
+          + '<div class="card">Actual total<b class="' + cls(t.actual) + '">' + sgn(t.actual) + '</b></div>'
+          + '<div class="card">' + esc(d.rule) + '<b class="' + cls(t.rsi) + '">' + sgn(t.rsi) + '</b></div>'
+          + '<div class="card">Difference<b class="' + cls(t.diff) + '">' + sgn(t.diff) + '</b></div>'
+          + '<div class="card">Wins actual / RSI<b>' + t.actual_wins + ' / ' + t.rsi_wins + '</b></div>'
+          + '<div class="card">RSI better on<b>' + t.better + ' of ' + d.count + '</b></div></div>';
+        if (t.no_signal) h += '<div class="sub">' + t.no_signal + ' trade(s) never got an RSI exit signal in the stored data - those are held to the end of the stored price path (marked *).</div>';
+        h += '<div class="sub" style="margin:10px 0 4px"><b style="color:var(--text)">Day by day</b></div><div class="wrap"><table><tr><th>Date</th><th>Trades</th><th>Actual P&amp;L</th><th>RSI Simple P&amp;L</th><th>Difference</th></tr>'
+          + d.by_day.map((x) => '<tr><td>' + esc(x.date) + '</td><td>' + x.n + '</td><td class="' + cls(x.actual) + '">' + sgn(x.actual) + '</td><td class="' + cls(x.rsi) + '">' + sgn(x.rsi) + '</td><td class="' + cls(x.rsi - x.actual) + '"><b>' + sgn(x.rsi - x.actual) + '</b></td></tr>').join("") + '</table></div>';
+        if (!document.getElementById("rsiDaily").checked)
+          h += '<div class="sub" style="margin:10px 0 4px"><b style="color:var(--text)">Trade by trade</b></div><div class="wrap"><table><tr><th>#</th><th>Stock</th><th>Side</th><th>Date</th><th>Entry</th><th>Actual exit</th><th>Actual P&amp;L</th><th>RSI exit</th><th>RSI price</th><th>RSI %</th><th>RSI P&amp;L</th><th>Diff</th></tr>'
+          + d.rows.map((x) => '<tr><td class="mut">' + x.id + '</td><td>' + esc(x.symbol) + '</td><td>' + esc(x.direction) + '</td><td>' + esc(x.date) + '</td><td>' + x.entry_clock + ' @ ' + x.p0 + '</td><td>' + x.actual_exit + '</td><td class="' + cls(x.actual_pnl) + '">' + sgn(x.actual_pnl) + '</td><td>' + x.rsi_exit + (x.no_signal ? ' *' : '') + '</td><td>' + x.rsi_price + '</td><td class="' + cls(x.rsi_pct) + '">' + sgn(x.rsi_pct, 2) + '%</td><td class="' + cls(x.rsi_pnl) + '"><b>' + sgn(x.rsi_pnl) + '</b></td><td class="' + cls(x.diff) + '">' + sgn(x.diff) + '</td></tr>').join("") + '</table></div>';
+        if (d.skipped.length) h += '<div class="sub" style="margin-top:8px">Not replayable (' + d.skipped.length + '): ' + d.skipped.map((x) => '#' + x.id + ' ' + esc(x.symbol) + ' (' + esc(x.why) + ')').join(", ") + '</div>';
+        out.innerHTML = h;
+      } catch (e) { out.innerHTML = '<span class="neg">request failed</span>'; }
     }
 
     async function replayTrade() {
