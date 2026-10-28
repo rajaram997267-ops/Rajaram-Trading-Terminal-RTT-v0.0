@@ -114,6 +114,16 @@
     <div id="rsiHistOut" style="margin-top:10px"></div>
   </div>
 
+  <div class="warn" id="fibHistBox" style="margin-top:12px">
+    <b style="font-size:15px">1st 5 Min FIB Exit on your closed-trade history</b>
+    <div class="mut" style="margin-top:4px">For every closed trade that came from a logged alert: what you actually made vs what the <b>1st 5 Min FIB levels strategy</b> would have made (gross, before costs), with RSI Simple alongside for comparison. FIB trades on the stock's own price, so this downloads each day's stock candles from Upstox - the first time it can take a minute and refreshes itself. Needs a valid Upstox login.</div>
+    <div style="margin-top:8px">
+      <label style="font-size:12px"><input type="checkbox" id="fibTrades"> Also show trade-by-trade</label>
+      <button onclick="fibHistory()" style="margin-left:8px;padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--green);color:#fff;cursor:pointer">Show</button>
+      <a href="/fib-history" target="_blank" style="margin-left:10px;font-size:12px">open full page</a></div>
+    <iframe id="fibFrame" style="display:none;width:100%;height:420px;margin-top:10px;border:1px solid var(--border);border-radius:6px;background:#111"></iframe>
+  </div>
+
   <div class="warn" style="margin-top:12px">
     <b>New trades currently use:</b> {{ active_label }}{% if active_is_lab %} <span class="mut">(Lab rule)</span>{% endif %} &nbsp;&middot;&nbsp;
     <b>Open trade:</b>
@@ -214,6 +224,12 @@
         el.style.color = res.ok ? "var(--green)" : "var(--red)"; el.textContent = res.ok ? "Default saved" : (data.message || "failed");
         if (res.ok) setTimeout(() => location.reload(), 600);
       } catch (e) { el.style.color = "var(--red)"; el.textContent = "request failed"; }
+    }
+
+    function fibHistory() {
+      const f = document.getElementById("fibFrame");
+      f.style.display = "block";
+      f.src = "/fib-history" + (document.getElementById("fibTrades").checked ? "?trades=1" : "");
     }
 
     async function rsiHistory() {
