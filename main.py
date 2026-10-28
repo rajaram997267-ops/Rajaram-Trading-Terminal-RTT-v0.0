@@ -10311,5 +10311,220 @@ except Exception as _init_err:
 ensure_exit_check_loop_started()  # same: starts on import, tab-independent from here on
 ensure_shadow_loop_started()
 
+# ---------------------------------------------------------------------------
+# Date-wise "what if" reports (read-only, nothing is written to the DB):
+#   /rsi-history  - RSI Simple exit vs actual, per date   (?stop=10 / ?stop=15, ?trades=1)
+#   /fib-history  - 1st 5 Min FIB exit vs actual, per date (?trades=1)
+# ---------------------------------------------------------------------------
+def _register_history_pages(app, g):
+    get_db, sim, IST = g["get_db"], g["_sim_exit"], g["IST_OFFSET"]
+
+    @app.route("/rsi-history")
+    def rsi_history_page():
+        stop = request.args.get("stop", "0")
+        stop = int(stop) if stop in ("10", "15") else 0
+        spec = {"kind": "rsi", "which": "simple", "stop": stop or None}
+        days, rows, skipped = {}, [], 0
+        with get_db() as conn:
+            trades = [dict(r) for r in conn.execute(
+                "SELECT * FROM paper_trades WHERE status = 'CLOSED' ORDER BY id").fetchall()]
+            for t in trades:
+                try:
+                    et = datetime.fromisoformat(t["entry_time"])
+                    row = conn.execute(
+                        "SELECT * FROM volume_alert_log WHERE UPPER(symbol) = ? AND category = ? "
+                        "AND alert_time >= ? AND alert_time <= ? ORDER BY alert_time DESC LIMIT 1",
+                        ((t["symbol"] or "").upper(), t["direction"],
+                         (et - timedelta(minutes=4)).isoformat(), (et + timedelta(minutes=2)).isoformat())).fetchone()
+                except Exception:
+                    row = None
+                if not row or not row["opt_path"] or row["p0"] is None:
+                    skipped += 1
+                    continue
+                row = dict(row)
+                path = json.loads(row["opt_path"])
+                vmap = {int(m): (c, r) for m, c, r in json.loads(row["vol_path"] or "[]")}
+                res = sim(spec, path, row["p0"], vmap, row["vol_ratio"], row["rsi_simple_min"], row["rsi_mom_min"])
+                if not res:
+                    skipped += 1
+                    continue
+                qty = t.get("original_quantity") or t.get("quantity") or 1
+                a = round(t.get("pnl") or 0)
+                s = round(qty * (res[1] - row["p0"]))
+                t0 = datetime.fromisoformat(row["alert_time"]) + IST
+                d = days.setdefault(t0.strftime("%Y-%m-%d"), [0, 0, 0])
+                d[0] += 1; d[1] += a; d[2] += s
+                rows.append((t["id"], t["symbol"], t0.strftime("%d %b"), a, s))
+        f = lambda v: f"{v:+,}"
+        c = lambda v: "#0a0" if v > 0 else "#d00" if v < 0 else "#888"
+        h = ["<meta name=viewport content='width=device-width,initial-scale=1'>",
+             "<body style='font-family:sans-serif;background:#111;color:#eee;padding:12px'>",
+             f"<h3>{'RSI Simple exit' + (f' + stop -{stop}%' if stop else '')} vs actual (date-wise)</h3>",
+             "<table cellpadding=6 style='border-collapse:collapse;width:100%'><tr><th align=left>Date<th>Trades<th>Actual<th>RSI Simple<th>Diff"]
+        for k in sorted(days):
+            n, a, s = days[k]
+            h.append(f"<tr style='border-top:1px solid #333'><td>{k[8:]}/{k[5:7]}<td align=center>{n}"
+                     f"<td align=right style='color:{c(a)}'>{f(a)}<td align=right style='color:{c(s)}'>{f(s)}"
+                     f"<td align=right style='color:{c(s - a)}'><b>{f(s - a)}</b>")
+        tn = sum(v[0] for v in days.values()); ta = sum(v[1] for v in days.values()); ts = sum(v[2] for v in days.values())
+        h.append(f"<tr style='border-top:2px solid #888'><td><b>TOTAL</b><td align=center>{tn}"
+                 f"<td align=right style='color:{c(ta)}'><b>{f(ta)}</b><td align=right style='color:{c(ts)}'><b>{f(ts)}</b>"
+                 f"<td align=right style='color:{c(ts - ta)}'><b>{f(ts - ta)}</b></table>")
+        h.append(f"<p style='color:#888;font-size:12px'>Gross, before costs. {skipped} closed trade(s) not replayable "
+                 f"(alert not logged/measured). Links: <a href='?stop=0'>no stop</a> | <a href='?stop=10'>stop 10%</a> | <a href='?stop=15'>stop 15%</a></p>")
+        if request.args.get("trades") == "1":
+            h.append("<table cellpadding=4 style='font-size:12px'><tr><th>#<th>Stock<th>Date<th>Actual<th>RSI")
+            h += [f"<tr><td>{i}<td>{sy}<td>{dt}<td align=right>{f(a)}<td align=right>{f(s)}" for i, sy, dt, a, s in rows]
+            h.append("</table>")
+        return "".join(h)
+
+
+    # ------------------------------------------------------------------
+    # /fib-history : 1st 5-Min FIB levels strategy replayed on every closed
+    # trade. FIB runs on the UNDERLYING's price, which the alert log does not
+    # store, so each trade-day's 1-minute stock candles are fetched from Upstox
+    # (cached) in a background thread; the page refreshes itself until done.
+    # ------------------------------------------------------------------
+    get_setting, get_key, to_ist = g["get_setting"], g["get_instrument_key"], g["_to_naive_ist"]
+    fetch1, fib_targets, fib_stage = g["_fetch_1min_raw"], g["compute_first_5min_fib_targets"], g["fib_stage_transition"]
+    state = {"running": False, "done": 0, "total": 0, "result": None, "error": None}
+    spot_cache = {}
+
+    def sim_fib(direction, tiers, spot, t0, path, rsi_min):
+        """Minute-by-minute replay of the live FIB rules. spot = {'HH:MM' start: (h, l, c)}."""
+        stage = 0
+        n = len(path)
+        for m in range(1, n + 1):
+            c = spot.get((t0 + timedelta(minutes=m - 1)).strftime("%H:%M"))
+            if c:
+                hi, lo, _cl = c
+                fav, adv = (hi, lo) if direction == "Buy" else (lo, hi)
+                new, out = fib_stage(direction, stage, tiers, fav)       # best price of the minute first
+                if out is None and new == stage:
+                    new, out = fib_stage(direction, stage, tiers, adv)   # then the worst (reversal)
+                if out == "target":
+                    return m, path[m - 1], f"T{new} target"
+                if out == "reversed":
+                    return m, path[m - 1], f"reversed T{new}"
+                if new > stage:
+                    stage = new
+                    continue
+            if stage == 0 and rsi_min and m >= rsi_min:
+                return m, path[m - 1], "RSI before T1"
+        return n, path[n - 1], "end of path"
+
+    def get_spot(symbol, day, token):
+        k = (symbol, day)
+        if k not in spot_cache:
+            key = get_key(symbol)
+            spot_cache[k] = None
+            if key:
+                rows = fetch1(key, token, day=day)
+                spot_cache[k] = {to_ist(r[0]).strftime("%H:%M"): (r[2], r[3], r[4]) for r in rows}
+        return spot_cache[k]
+
+    def work():
+        try:
+            token = get_setting("upstox_access_token")
+            with get_db() as conn:
+                trades = [dict(r) for r in conn.execute(
+                    "SELECT * FROM paper_trades WHERE status = 'CLOSED' ORDER BY id").fetchall()]
+                state["total"] = len(trades)
+                rows, skipped, reasons = [], {}, {}
+                for t in trades:
+                    state["done"] += 1
+                    why = None
+                    try:
+                        et = datetime.fromisoformat(t["entry_time"])
+                        row = conn.execute(
+                            "SELECT * FROM volume_alert_log WHERE UPPER(symbol) = ? AND category = ? "
+                            "AND alert_time >= ? AND alert_time <= ? ORDER BY alert_time DESC LIMIT 1",
+                            ((t["symbol"] or "").upper(), t["direction"],
+                             (et - timedelta(minutes=4)).isoformat(), (et + timedelta(minutes=2)).isoformat())).fetchone()
+                        if not row or not row["opt_path"] or row["p0"] is None:
+                            why = "alert not logged/measured"
+                        else:
+                            row = dict(row)
+                            path = json.loads(row["opt_path"])
+                            t0 = datetime.fromisoformat(row["alert_time"]) + IST
+                            day = t0.strftime("%Y-%m-%d")
+                            spot = get_spot((t["symbol"] or "").upper(), day, token)
+                            first = [spot.get(f"09:{15 + i}") for i in range(5)] if spot else []
+                            if not spot or not all(first):
+                                why = "stock candles unavailable"
+                            elif not path:
+                                why = "no option path"
+                            else:
+                                tiers = fib_targets(t["direction"], max(c[0] for c in first), min(c[1] for c in first))
+                                m, px, how = sim_fib(t["direction"], tiers, spot, t0, path, row["rsi_simple_min"])
+                                vmap = {int(a): (b, c) for a, b, c in json.loads(row["vol_path"] or "[]")}
+                                r = sim(spec_rsi, path, row["p0"], vmap, row["vol_ratio"], row["rsi_simple_min"], row["rsi_mom_min"])
+                                qty = t.get("original_quantity") or t.get("quantity") or 1
+                                rows.append({"id": t["id"], "sym": t["symbol"], "day": day, "a": round(t.get("pnl") or 0),
+                                             "f": round(qty * (px - row["p0"])), "r": round(qty * (r[1] - row["p0"])) if r else None,
+                                             "how": how})
+                    except Exception as e:
+                        why = "error: " + str(e)[:60]
+                    if why:
+                        skipped[t["id"]] = why
+                        reasons[why] = reasons.get(why, 0) + 1
+            state["result"] = {"rows": rows, "skipped": len(skipped), "reasons": reasons}
+        except Exception as e:
+            state["error"] = str(e)
+        finally:
+            state["running"] = False
+
+    spec_rsi = {"kind": "rsi", "which": "simple", "stop": None}
+
+    @app.route("/fib-history")
+    def fib_history_page():
+        head = "<meta name=viewport content='width=device-width,initial-scale=1'><body style='font-family:sans-serif;background:#111;color:#eee;padding:12px'>"
+        if request.args.get("restart") == "1" and not state["running"]:
+            state.update(running=False, done=0, total=0, result=None, error=None)
+        if state["result"] is None and state["error"] is None:
+            if not state["running"]:
+                state.update(running=True, done=0, total=0)
+                threading.Thread(target=work, daemon=True, name="fib-history").start()
+            return (f"<meta http-equiv=refresh content=4>{head}<h3>1st 5 Min FIB on closed trades</h3>"
+                    f"<p>Fetching stock candles and replaying... {state['done']} / {state['total'] or '?'} trades. "
+                    "This page refreshes by itself.</p>")
+        if state["error"]:
+            return head + f"<h3>Failed</h3><p>{state['error']}</p><p>(Is the Upstox token still valid?)</p><a href='?restart=1' style='color:#6cf'>Try again</a>"
+        res = state["result"]
+        days = {}
+        how = {}
+        for r in res["rows"]:
+            d = days.setdefault(r["day"], [0, 0, 0, 0])
+            d[0] += 1; d[1] += r["a"]; d[2] += r["r"] or 0; d[3] += r["f"]
+            how[r["how"].split(" ")[0] if r["how"].startswith("T") else r["how"]] = how.get(r["how"].split(" ")[0] if r["how"].startswith("T") else r["how"], 0) + 1
+        f = lambda v: f"{v:+,}"
+        c = lambda v: "#0a0" if v > 0 else "#d00" if v < 0 else "#888"
+        h = [head, "<h3>1st 5 Min FIB exit vs actual (date-wise)</h3>",
+             "<table cellpadding=5 style='border-collapse:collapse;width:100%'><tr><th align=left>Date<th>Trades<th>Actual<th>RSI Simple<th>FIB<th>FIB-Actual"]
+        for k in sorted(days):
+            n, a, s, fb = days[k]
+            h.append(f"<tr style='border-top:1px solid #333'><td>{k[8:]}/{k[5:7]}<td align=center>{n}"
+                     f"<td align=right style='color:{c(a)}'>{f(a)}<td align=right style='color:{c(s)}'>{f(s)}"
+                     f"<td align=right style='color:{c(fb)}'><b>{f(fb)}</b><td align=right style='color:{c(fb - a)}'>{f(fb - a)}")
+        tn = sum(v[0] for v in days.values()); ta = sum(v[1] for v in days.values())
+        ts = sum(v[2] for v in days.values()); tf = sum(v[3] for v in days.values())
+        h.append(f"<tr style='border-top:2px solid #888'><td><b>TOTAL</b><td align=center>{tn}"
+                 f"<td align=right style='color:{c(ta)}'><b>{f(ta)}</b><td align=right style='color:{c(ts)}'><b>{f(ts)}</b>"
+                 f"<td align=right style='color:{c(tf)}'><b>{f(tf)}</b><td align=right style='color:{c(tf - ta)}'><b>{f(tf - ta)}</b></table>")
+        wins = sum(1 for r in res["rows"] if r["f"] > 0)
+        h.append(f"<p>FIB winners: {wins} of {tn}. How FIB exited: " + ", ".join(f"{k}: {v}" for k, v in sorted(how.items())) + ".</p>")
+        h.append(f"<p style='color:#888;font-size:12px'>Gross, before costs. Not replayable: {res['skipped']} "
+                 f"({', '.join(f'{v} {k}' for k, v in res['reasons'].items()) or 'none'}). Uses 1-minute stock candles: in each minute the best price is "
+                 "checked first, then the worst, so results are an approximation of the live 5-second checks. "
+                 "<a href='?restart=1' style='color:#6cf'>Recalculate</a></p>")
+        if request.args.get("trades") == "1":
+            h.append("<table cellpadding=4 style='font-size:12px'><tr><th>#<th>Stock<th>Date<th>Actual<th>FIB<th>Exit")
+            h += [f"<tr><td>{r['id']}<td>{r['sym']}<td>{r['day'][8:]}/{r['day'][5:7]}<td align=right>{f(r['a'])}<td align=right>{f(r['f'])}<td>{r['how']}" for r in res["rows"]]
+            h.append("</table>")
+        return "".join(h)
+
+
+_register_history_pages(app, globals())
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=os.environ.get("FLASK_DEBUG") == "1")
