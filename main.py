@@ -10319,6 +10319,20 @@ ensure_shadow_loop_started()
 def _register_history_pages(app, g):
     get_db, sim, IST = g["get_db"], g["_sim_exit"], g["IST_OFFSET"]
 
+    STYLE = ("<meta name=viewport content='width=device-width,initial-scale=1'>"
+             "<script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>"
+             "<style>:root{--bg:#0b0e14;--panel:#131722;--border:#1e222d;--text:#e6e9f0;--muted:#6b7280;--green:#00c896;--red:#ff5370}"
+             ":root[data-theme=light-gray]{--red:#dc2626;--bg:#e9ebee;--panel:#fff;--border:#d0d4da;--text:#1a1d23;--green:#0e9f6e}"
+             ":root[data-theme=sky-blue]{--red:#dc2626;--bg:#eaf4fb;--panel:#fff;--border:#bfe0f2;--text:#10222c;--muted:#4a6572;--green:#0e9f6e}"
+             ":root[data-theme=off-white]{--red:#dc2626;--bg:#f7f5f0;--panel:#fff;--border:#e2ddd2;--text:#1f1c16;--muted:#6b6455;--green:#0e9f6e}"
+             "body{font-family:'Segoe UI',Arial,sans-serif;background:var(--bg);color:var(--text);margin:0;padding:12px 14px}"
+             "h3{margin:0 0 10px;font-size:15px}"
+             "table{border-collapse:collapse;width:100%;font-size:12px;background:var(--panel);border:1px solid var(--border);margin-bottom:10px}"
+             "th,td{border-bottom:1px solid var(--border);padding:7px 9px;white-space:nowrap}"
+             "th{color:var(--muted);font-size:11px;text-transform:uppercase;text-align:right}th:first-child{text-align:left}"
+             "p{font-size:12.5px;line-height:1.55;margin:8px 0}.mut{color:var(--muted);font-size:12px}a{color:var(--green)}"
+             "</style>")
+
     @app.route("/rsi-history")
     def rsi_history_page():
         stop = request.args.get("stop", "0")
@@ -10356,24 +10370,23 @@ def _register_history_pages(app, g):
                 d[0] += 1; d[1] += a; d[2] += s
                 rows.append((t["id"], t["symbol"], t0.strftime("%d %b"), a, s))
         f = lambda v: f"{v:+,}"
-        c = lambda v: "#0a0" if v > 0 else "#d00" if v < 0 else "#888"
-        h = ["<meta name=viewport content='width=device-width,initial-scale=1'>",
-             "<body style='font-family:sans-serif;background:#111;color:#eee;padding:12px'>",
+        c = lambda v: "var(--green)" if v > 0 else "var(--red)" if v < 0 else "var(--muted)"
+        h = [STYLE + "<body>",
              f"<h3>{'RSI Simple exit' + (f' + stop -{stop}%' if stop else '')} vs actual (date-wise)</h3>",
-             "<table cellpadding=6 style='border-collapse:collapse;width:100%'><tr><th align=left>Date<th>Trades<th>Actual<th>RSI Simple<th>Diff"]
+             "<table><tr><th align=left>Date<th>Trades<th>Actual<th>RSI Simple<th>Diff"]
         for k in sorted(days):
             n, a, s = days[k]
-            h.append(f"<tr style='border-top:1px solid #333'><td>{k[8:]}/{k[5:7]}<td align=center>{n}"
+            h.append(f"<tr><td>{k[8:]}/{k[5:7]}<td align=right>{n}"
                      f"<td align=right style='color:{c(a)}'>{f(a)}<td align=right style='color:{c(s)}'>{f(s)}"
                      f"<td align=right style='color:{c(s - a)}'><b>{f(s - a)}</b>")
         tn = sum(v[0] for v in days.values()); ta = sum(v[1] for v in days.values()); ts = sum(v[2] for v in days.values())
-        h.append(f"<tr style='border-top:2px solid #888'><td><b>TOTAL</b><td align=center>{tn}"
+        h.append(f"<tr style='border-top:2px solid var(--muted)'><td><b>TOTAL</b><td align=right>{tn}"
                  f"<td align=right style='color:{c(ta)}'><b>{f(ta)}</b><td align=right style='color:{c(ts)}'><b>{f(ts)}</b>"
                  f"<td align=right style='color:{c(ts - ta)}'><b>{f(ts - ta)}</b></table>")
-        h.append(f"<p style='color:#888;font-size:12px'>Gross, before costs. {skipped} closed trade(s) not replayable "
+        h.append(f"<p class=mut>Gross, before costs. {skipped} closed trade(s) not replayable "
                  f"(alert not logged/measured). Links: <a href='?stop=0'>no stop</a> | <a href='?stop=10'>stop 10%</a> | <a href='?stop=15'>stop 15%</a></p>")
         if request.args.get("trades") == "1":
-            h.append("<table cellpadding=4 style='font-size:12px'><tr><th>#<th>Stock<th>Date<th>Actual<th>RSI")
+            h.append("<table><tr><th>#<th>Stock<th>Date<th>Actual<th>RSI")
             h += [f"<tr><td>{i}<td>{sy}<td>{dt}<td align=right>{f(a)}<td align=right>{f(s)}" for i, sy, dt, a, s in rows]
             h.append("</table>")
         return "".join(h)
@@ -10478,7 +10491,7 @@ def _register_history_pages(app, g):
 
     @app.route("/fib-history")
     def fib_history_page():
-        head = "<meta name=viewport content='width=device-width,initial-scale=1'><body style='font-family:sans-serif;background:#111;color:#eee;padding:12px'>"
+        head = STYLE + "<body>"
         if request.args.get("restart") == "1" and not state["running"]:
             state.update(running=False, done=0, total=0, result=None, error=None)
         if state["result"] is None and state["error"] is None:
@@ -10489,7 +10502,7 @@ def _register_history_pages(app, g):
                     f"<p>Fetching stock candles and replaying... {state['done']} / {state['total'] or '?'} trades. "
                     "This page refreshes by itself.</p>")
         if state["error"]:
-            return head + f"<h3>Failed</h3><p>{state['error']}</p><p>(Is the Upstox token still valid?)</p><a href='?restart=1' style='color:#6cf'>Try again</a>"
+            return head + f"<h3>Failed</h3><p>{state['error']}</p><p>(Is the Upstox token still valid?)</p><a href='?restart=1'>Try again</a>"
         res = state["result"]
         days = {}
         how = {}
@@ -10498,27 +10511,27 @@ def _register_history_pages(app, g):
             d[0] += 1; d[1] += r["a"]; d[2] += r["r"] or 0; d[3] += r["f"]
             how[r["how"].split(" ")[0] if r["how"].startswith("T") else r["how"]] = how.get(r["how"].split(" ")[0] if r["how"].startswith("T") else r["how"], 0) + 1
         f = lambda v: f"{v:+,}"
-        c = lambda v: "#0a0" if v > 0 else "#d00" if v < 0 else "#888"
+        c = lambda v: "var(--green)" if v > 0 else "var(--red)" if v < 0 else "var(--muted)"
         h = [head, "<h3>1st 5 Min FIB exit vs actual (date-wise)</h3>",
-             "<table cellpadding=5 style='border-collapse:collapse;width:100%'><tr><th align=left>Date<th>Trades<th>Actual<th>RSI Simple<th>FIB<th>FIB-Actual"]
+             "<table><tr><th align=left>Date<th>Trades<th>Actual<th>RSI Simple<th>FIB<th>FIB-Actual"]
         for k in sorted(days):
             n, a, s, fb = days[k]
-            h.append(f"<tr style='border-top:1px solid #333'><td>{k[8:]}/{k[5:7]}<td align=center>{n}"
+            h.append(f"<tr><td>{k[8:]}/{k[5:7]}<td align=right>{n}"
                      f"<td align=right style='color:{c(a)}'>{f(a)}<td align=right style='color:{c(s)}'>{f(s)}"
                      f"<td align=right style='color:{c(fb)}'><b>{f(fb)}</b><td align=right style='color:{c(fb - a)}'>{f(fb - a)}")
         tn = sum(v[0] for v in days.values()); ta = sum(v[1] for v in days.values())
         ts = sum(v[2] for v in days.values()); tf = sum(v[3] for v in days.values())
-        h.append(f"<tr style='border-top:2px solid #888'><td><b>TOTAL</b><td align=center>{tn}"
+        h.append(f"<tr style='border-top:2px solid var(--muted)'><td><b>TOTAL</b><td align=right>{tn}"
                  f"<td align=right style='color:{c(ta)}'><b>{f(ta)}</b><td align=right style='color:{c(ts)}'><b>{f(ts)}</b>"
                  f"<td align=right style='color:{c(tf)}'><b>{f(tf)}</b><td align=right style='color:{c(tf - ta)}'><b>{f(tf - ta)}</b></table>")
         wins = sum(1 for r in res["rows"] if r["f"] > 0)
         h.append(f"<p>FIB winners: {wins} of {tn}. How FIB exited: " + ", ".join(f"{k}: {v}" for k, v in sorted(how.items())) + ".</p>")
-        h.append(f"<p style='color:#888;font-size:12px'>Gross, before costs. Not replayable: {res['skipped']} "
+        h.append(f"<p class=mut>Gross, before costs. Not replayable: {res['skipped']} "
                  f"({', '.join(f'{v} {k}' for k, v in res['reasons'].items()) or 'none'}). Uses 1-minute stock candles: in each minute the best price is "
                  "checked first, then the worst, so results are an approximation of the live 5-second checks. "
-                 "<a href='?restart=1' style='color:#6cf'>Recalculate</a></p>")
+                 "<a href='?restart=1'>Recalculate</a></p>")
         if request.args.get("trades") == "1":
-            h.append("<table cellpadding=4 style='font-size:12px'><tr><th>#<th>Stock<th>Date<th>Actual<th>FIB<th>Exit")
+            h.append("<table><tr><th>#<th>Stock<th>Date<th>Actual<th>FIB<th>Exit")
             h += [f"<tr><td>{r['id']}<td>{r['sym']}<td>{r['day'][8:]}/{r['day'][5:7]}<td align=right>{f(r['a'])}<td align=right>{f(r['f'])}<td>{r['how']}" for r in res["rows"]]
             h.append("</table>")
         return "".join(h)
