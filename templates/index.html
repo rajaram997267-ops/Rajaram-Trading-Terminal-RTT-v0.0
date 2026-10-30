@@ -589,7 +589,7 @@
                 <div class="list-row{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}{% if alert['confirmed_count'] and alert['confirmed_count'] >= 3 %} triple-confirmed{% endif %}" data-sector="{{ alert['sector'] }}" {% if alert["alert_name"] %}title="{{ alert['alert_name'] }}"{% endif %}>
                   <div class="row-top">
                     <span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>
-                    <span class="price-wrap"><span class="price">{{ alert["trigger_price"] or "-" }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '{{ (alert['symbol'] or '')|escape }}')" title="Fetch live price">&#8635;</button>
+                    <span class="price-wrap"><span class="price">{{ (alert["trigger_price"] or "-")|inr }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '{{ (alert['symbol'] or '')|escape }}')" title="Fetch live price">&#8635;</button>
                   </div>
                   {% if alert.get("volume") %}
                   <div class="row-vol"><span class="vol-pill {{ alert['volume']['label']|lower }}" title="{{ 'Buy' if category == 'Buy' else 'Sell' }}-side directional volume is {{ alert['volume']['ratio'] }}x its usual level for this time of day{% if alert['volume']['prev_ratio'] is not none %} (previous candle: {{ alert['volume']['prev_ratio'] }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ alert['volume']['asof'] }}.">Vol {{ alert['volume']['label'] }} &middot; {{ alert['volume']['ratio'] }}&times;</span><span>as of {{ alert['volume']['asof'] }}</span></div>
@@ -688,7 +688,7 @@
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
             <span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>
-            <span class="price-wrap"><span class="price">${escapeHtml(String(a.trigger_price || "-"))}</span>${pctBadge}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '${escapeHtml(a.symbol || "")}')" title="Fetch live price">&#8635;</button>
+            <span class="price-wrap"><span class="price">${escapeHtml(String(inr(a.trigger_price || "-")))}</span>${pctBadge}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '${escapeHtml(a.symbol || "")}')" title="Fetch live price">&#8635;</button>
           </div>
           ${volHtml}
           <div class="row-bottom">
@@ -867,7 +867,7 @@
         const res = await fetch(`/api/live-price/${encodeURIComponent(symbol)}`);
         const data = await res.json();
         if (res.ok && data.status === "ok") {
-          let html = `<span class="price">${data.ltp}</span>`;
+          let html = `<span class="price">${inr(data.ltp)}</span>`;
           if (data.pct_change_today !== null && data.pct_change_today !== undefined) {
             const cls = data.pct_change_today >= 0 ? "pos" : "neg";
             const sign = data.pct_change_today >= 0 ? "+" : "";
@@ -990,7 +990,7 @@
         ctx.moveTo(leftPad, y);
         ctx.lineTo(cssWidth - rightPad, y);
         ctx.stroke();
-        ctx.fillText(price.toFixed(2), leftPad - 8, y);
+        ctx.fillText(inr(price.toFixed(2)), leftPad - 8, y);
       }
 
       // PDH / PDL reference lines
@@ -1008,7 +1008,7 @@
         ctx.fillStyle = color;
         ctx.textAlign = "left";
         ctx.font = "10px Arial";
-        ctx.fillText(`${label} ${price.toFixed(2)}`, leftPad + 4, y - 6);
+        ctx.fillText(`${label} ${inr(price.toFixed(2))}`, leftPad + 4, y - 6);
         ctx.restore();
       }
       drawRefLine(data.prev_day_high, "#ffb800", "PDH");

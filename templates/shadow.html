@@ -50,9 +50,9 @@
   <div class="cards">
     <div class="card">Trades logged<b>{{ s.trades_logged }}</b></div>
     <div class="card">Comparable<b>{{ s.comparable }}</b></div>
-    <div class="card">Manual total<b>{{ s.manual_total }}</b></div>
-    <div class="card">RSI-rule total<b>{{ s.rsi_rule_total }}</b></div>
-    <div class="card">Rule minus manual<b class="{{ 'pos' if s.rsi_rule_minus_manual > 0 else 'neg' if s.rsi_rule_minus_manual < 0 else '' }}">{{ s.rsi_rule_minus_manual }}</b></div>
+    <div class="card">Manual total<b>{{ s.manual_total|inr }}</b></div>
+    <div class="card">RSI-rule total<b>{{ s.rsi_rule_total|inr }}</b></div>
+    <div class="card">Rule minus manual<b class="{{ 'pos' if s.rsi_rule_minus_manual > 0 else 'neg' if s.rsi_rule_minus_manual < 0 else '' }}">{{ s.rsi_rule_minus_manual|inr }}</b></div>
     <div class="card">Rule better / manual better<b>{{ s.rule_better_count }} / {{ s.manual_better_count }}</b></div>
   </div>
 
@@ -62,15 +62,15 @@
         <th>Option traded (min)</th><th>Basis / note</th><th>Final</th></tr>
     {% for r in rows %}
     <tr>
-      <td>{{ r.symbol }}</td><td>{{ r.strategy or '-' }}</td><td>{{ r.direction }}</td><td>{{ r.quantity }}</td><td>{{ r.entry_price }}</td>
-      <td>{{ r.manual_exit_time }}</td><td>{{ r.manual_exit_price }}</td>
-      <td class="{{ 'pos' if (r.manual_pnl or 0) > 0 else 'neg' if (r.manual_pnl or 0) < 0 else '' }}">{{ r.manual_pnl }}</td>
+      <td>{{ r.symbol }}</td><td>{{ r.strategy or '-' }}</td><td>{{ r.direction }}</td><td>{{ r.quantity }}</td><td>{{ r.entry_price|inr }}</td>
+      <td>{{ r.manual_exit_time }}</td><td>{{ r.manual_exit_price|inr }}</td>
+      <td class="{{ 'pos' if (r.manual_pnl or 0) > 0 else 'neg' if (r.manual_pnl or 0) < 0 else '' }}">{{ r.manual_pnl|inr }}</td>
       <td>{{ 'yes' if r.rsi_fired == 1 else 'no' if r.rsi_fired == 0 else '-' }}</td>
       <td>{{ r.rsi_fire_time or '-' }}</td>
       <td>{{ '%.1f' % r.rsi_fire_value if r.rsi_fire_value is not none else '-' }}</td>
-      <td>{{ r.rsi_price if r.rsi_price is not none else '-' }}</td>
-      <td>{{ r.rsi_pnl if r.rsi_pnl is not none else '-' }}</td>
-      <td class="{{ 'pos' if (r.diff_pnl or 0) > 0 else 'neg' if (r.diff_pnl or 0) < 0 else '' }}">{{ r.diff_pnl if r.diff_pnl is not none else '-' }}</td>
+      <td>{{ (r.rsi_price if r.rsi_price is not none else '-')|inr }}</td>
+      <td>{{ (r.rsi_pnl if r.rsi_pnl is not none else '-')|inr }}</td>
+      <td class="{{ 'pos' if (r.diff_pnl or 0) > 0 else 'neg' if (r.diff_pnl or 0) < 0 else '' }}">{{ (r.diff_pnl if r.diff_pnl is not none else '-')|inr }}</td>
       <td>{{ r.option_minutes_traded if r.option_minutes_traded is not none else '-' }} / {{ r.minutes_held if r.minutes_held is not none else '-' }}</td>
       <td class="note">{{ r.rsi_basis or '' }} {{ r.note }}</td>
       <td>{{ 'yes' if r.final == 1 else 'no' }}</td>

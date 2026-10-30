@@ -374,7 +374,7 @@
         pricesTable.innerHTML = keys.map(k => {
           const p = prices[k];
           const stale = p.age_seconds > 5;
-          return row(k, `${dotFor(!stale)}₹${p.ltp} <span class="sub">(${p.age_seconds}s old)</span>`);
+          return row(k, `${dotFor(!stale)}₹${inr(p.ltp)} <span class="sub">(${p.age_seconds}s old)</span>`);
         }).join("");
       }
     }

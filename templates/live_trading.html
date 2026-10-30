@@ -239,7 +239,7 @@
   <div class="stats">
     <div class="stat-card" style="border-color: var(--red);">
       <div class="label">Upstox available funds (Rs)</div>
-      <div class="value" id="statLiveFunds">{{ live_available_funds if live_available_funds is not none else "-" }}</div>
+      <div class="value" id="statLiveFunds">{{ (live_available_funds if live_available_funds is not none else "-")|inr }}</div>
     </div>
     <div class="stat-card">
       <div class="label">Live open</div>
@@ -251,7 +251,7 @@
     </div>
     <div class="stat-card">
       <div class="label">Live P&amp;L (Rs)</div>
-      <div class="value {% if live_pnl > 0 %}pos{% elif live_pnl < 0 %}neg{% endif %}" id="statLivePnl">{{ live_pnl }}</div>
+      <div class="value {% if live_pnl > 0 %}pos{% elif live_pnl < 0 %}neg{% endif %}" id="statLivePnl">{{ live_pnl|inr }}</div>
     </div>
   </div>
 
@@ -268,10 +268,10 @@
         <td>{{ t.symbol }}{% if t.live_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.live_option_label }}">{{ t.live_option_label }}</div>{% endif %}{% if t.rule_note %}<div class="sub" style="font-size:10px;opacity:.85" title="{{ t.rule_note }}">{{ t.rule_note }}</div>{% endif %}{% if t.volume %}<div class="vol-line"><span class="vol-pill {{ t.volume.label|lower }}" title="{{ 'Buy' if t.direction == 'Buy' else 'Sell' }}-side directional volume is {{ t.volume.ratio }}x its usual level for this time of day{% if t.entry_volume_label %}. At entry: {{ t.entry_volume_label }} ({{ t.entry_volume_ratio }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ t.volume.asof }}.">Vol {{ t.volume.label }} &middot; {{ t.volume.ratio }}&times;</span><span>as of {{ t.volume.asof }}</span></div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
         <td>{{ t.live_quantity }}{% if t.live_trail_high_pct is not none %}<div class="sub" style="font-size:11px; color: var(--green);">Trail stop: {{ "%.1f"|format(t.live_trail_high_pct - 0.5) }}%</div>{% endif %}</td>
-        <td>{{ t.live_entry_price if t.live_entry_price is not none else t.entry_price }}</td>
+        <td>{{ (t.live_entry_price if t.live_entry_price is not none else t.entry_price)|inr }}</td>
         <td>{{ t.live_entry_rsi if t.live_entry_rsi is not none else (t.entry_rsi if t.entry_rsi is not none else "-") }}</td>
-        <td>{{ t.last_checked_price or "-" }}</td>
-        <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl if t.unrealized_pnl is not none else "-" }}</td>
+        <td>{{ (t.last_checked_price or "-")|inr }}</td>
+        <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ (t.unrealized_pnl if t.unrealized_pnl is not none else "-")|inr }}</td>
         <td class="{% if t.unrealized_pnl_pct and t.unrealized_pnl_pct > 0 %}pnl-pos{% elif t.unrealized_pnl_pct and t.unrealized_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl_pct if t.unrealized_pnl_pct is not none else "-" }}{% if t.unrealized_pnl_pct is not none %}%{% endif %}</td>
         <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{% if not t.rr_is_true %}≈{% endif %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
         <td><span class="live-badge live-{{ t.live_status or 'NONE' }}">{{ t.live_status or 'NONE' }}</span></td>
@@ -334,7 +334,7 @@
           </div>
           <div class="date-right">
             <span class="date-pnl {% if group.total_pnl > 0 %}pnl-pos{% elif group.total_pnl < 0 %}pnl-neg{% endif %}">
-              {% if group.total_pnl > 0 %}+{% endif %}Rs {{ group.total_pnl }}
+              {% if group.total_pnl > 0 %}+{% endif %}Rs {{ group.total_pnl|inr }}
             </span>
             <span class="chevron">&#9660;</span>
           </div>
@@ -350,13 +350,13 @@
               <td>{{ t.symbol }}{% if t.live_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.live_option_label }}">{{ t.live_option_label }}</div>{% endif %}{% if t.rule_note %}<div class="sub" style="font-size:10px;opacity:.85" title="{{ t.rule_note }}">{{ t.rule_note }}</div>{% endif %}</td>
               <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
               <td>{{ t.live_quantity }}</td>
-              <td>{{ t.live_entry_price if t.live_entry_price is not none else t.entry_price }}</td>
+              <td>{{ (t.live_entry_price if t.live_entry_price is not none else t.entry_price)|inr }}</td>
               <td>{{ t.live_entry_rsi if t.live_entry_rsi is not none else (t.entry_rsi if t.entry_rsi is not none else "-") }}</td>
               <td>{% if t.entry_volume_label %}<span class="vol-pill {{ t.entry_volume_label|lower }}" title="Directional volume vs usual for this time of day">{{ t.entry_volume_label }} &middot; {{ t.entry_volume_ratio }}&times;</span>{% else %}-{% endif %}</td>
-              <td>{{ t.live_exit_price if t.live_exit_price is not none else t.exit_price }}</td>
+              <td>{{ (t.live_exit_price if t.live_exit_price is not none else t.exit_price)|inr }}</td>
               <td>{{ t.live_exit_rsi if t.live_exit_rsi is not none else (t.exit_rsi if t.exit_rsi is not none else "-") }}</td>
               <td>{% if t.exit_volume_label %}<span class="vol-pill {{ t.exit_volume_label|lower }}" title="Directional volume vs usual for this time of day">{{ t.exit_volume_label }} &middot; {{ t.exit_volume_ratio }}&times;</span>{% else %}-{% endif %}</td>
-              <td class="{% if t.live_pnl_value and t.live_pnl_value > 0 %}pnl-pos{% elif t.live_pnl_value and t.live_pnl_value < 0 %}pnl-neg{% endif %}">{{ t.live_pnl_value }}</td>
+              <td class="{% if t.live_pnl_value and t.live_pnl_value > 0 %}pnl-pos{% elif t.live_pnl_value and t.live_pnl_value < 0 %}pnl-neg{% endif %}">{{ t.live_pnl_value|inr }}</td>
               <td class="{% if t.live_pnl_pct and t.live_pnl_pct > 0 %}pnl-pos{% elif t.live_pnl_pct and t.live_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.live_pnl_pct if t.live_pnl_pct is not none else "-" }}{% if t.live_pnl_pct is not none %}%{% endif %}</td>
               <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{% if not t.rr_is_true %}≈{% endif %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
               <td>{{ t.live_exit_reason or t.exit_reason }}</td>
@@ -457,7 +457,7 @@
       }
       const rows = trades.map(t => {
         const pnlClass = t.unrealized_pnl > 0 ? "pnl-pos" : (t.unrealized_pnl < 0 ? "pnl-neg" : "");
-        const pnlText = (t.unrealized_pnl === null || t.unrealized_pnl === undefined) ? "-" : t.unrealized_pnl;
+        const pnlText = (t.unrealized_pnl === null || t.unrealized_pnl === undefined) ? "-" : inr(t.unrealized_pnl);
         const pctText = (t.unrealized_pnl_pct === null || t.unrealized_pnl_pct === undefined) ? "-" : t.unrealized_pnl_pct + "%";
         const entryRsi = (t.live_entry_rsi !== null && t.live_entry_rsi !== undefined) ? t.live_entry_rsi : ((t.entry_rsi !== null && t.entry_rsi !== undefined) ? t.entry_rsi : "-");
         const trailNote = (t.live_trail_high_pct !== null && t.live_trail_high_pct !== undefined)
@@ -467,9 +467,9 @@
           <td>${escapeHtml(t.symbol)}${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)}</div>` : ""}${t.rule_note ? `<div class="sub" style="font-size:10px;opacity:.85" title="${escapeHtml(t.rule_note)}">${escapeHtml(t.rule_note)}</div>` : ""}${volPillHTML(t)}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
           <td>${t.live_quantity}${trailNote}</td>
-          <td>${(t.live_entry_price !== null && t.live_entry_price !== undefined) ? t.live_entry_price : t.entry_price}</td>
+          <td>${inr((t.live_entry_price !== null && t.live_entry_price !== undefined) ? t.live_entry_price : t.entry_price)}</td>
           <td>${entryRsi}</td>
-          <td>${t.last_checked_price || "-"}</td>
+          <td>${inr(t.last_checked_price || "-")}</td>
           <td class="${pnlClass}">${pnlText}</td>
           <td class="${pnlClass}">${pctText}</td>
           <td class="${rrClass(t)}">${rrText(t)}</td>
@@ -537,13 +537,13 @@
               <td>${escapeHtml(t.symbol)}${t.live_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.live_option_label)}">${escapeHtml(t.live_option_label)}</div>` : ""}${t.rule_note ? `<div class="sub" style="font-size:10px;opacity:.85" title="${escapeHtml(t.rule_note)}">${escapeHtml(t.rule_note)}</div>` : ""}</td>
               <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
               <td>${t.live_quantity}</td>
-              <td>${(t.live_entry_price !== null && t.live_entry_price !== undefined) ? t.live_entry_price : t.entry_price}</td>
+              <td>${inr((t.live_entry_price !== null && t.live_entry_price !== undefined) ? t.live_entry_price : t.entry_price)}</td>
               <td>${entryRsi}</td>
               <td>${volCell(t.entry_volume_label, t.entry_volume_ratio)}</td>
-              <td>${exitPrice}</td>
+              <td>${inr(exitPrice)}</td>
               <td>${exitRsi}</td>
               <td>${volCell(t.exit_volume_label, t.exit_volume_ratio)}</td>
-              <td class="${pnlClassRow}">${t.live_pnl_value}</td>
+              <td class="${pnlClassRow}">${inr(t.live_pnl_value)}</td>
               <td class="${pctClass}">${pctText}</td>
               <td class="${rrClass(t)}">${rrText(t)}</td>
               <td>${escapeHtml(exitReason)}</td>
@@ -561,7 +561,7 @@
                 <span class="date-count">${g.trades.length} trade${g.trades.length !== 1 ? "s" : ""}</span>
               </div>
               <div class="date-right">
-                <span class="date-pnl ${pnlClass}">${sign}Rs ${g.total_pnl}</span>
+                <span class="date-pnl ${pnlClass}">${sign}Rs ${inr(g.total_pnl)}</span>
                 <span class="chevron">&#9660;</span>
               </div>
             </div>
@@ -587,7 +587,7 @@
         renderFailedTrades(data.failed);
         if (data.live_available_funds !== undefined) {
           document.getElementById("statLiveFunds").textContent =
-            data.live_available_funds === null ? "-" : data.live_available_funds;
+            data.live_available_funds === null ? "-" : inr(data.live_available_funds);
         }
         if (data.live_open !== undefined) {
           document.getElementById("statLiveOpen").textContent = data.live_open;
@@ -597,7 +597,7 @@
         }
         if (data.live_pnl !== undefined) {
           const liveEl = document.getElementById("statLivePnl");
-          liveEl.textContent = data.live_pnl;
+          liveEl.textContent = inr(data.live_pnl);
           liveEl.classList.remove("pos", "neg");
           if (data.live_pnl > 0) liveEl.classList.add("pos");
           if (data.live_pnl < 0) liveEl.classList.add("neg");

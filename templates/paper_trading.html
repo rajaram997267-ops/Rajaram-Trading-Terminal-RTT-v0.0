@@ -299,8 +299,8 @@
   <div class="stats">
     <div class="stat-card">
       <div class="label">Current capital (Rs)</div>
-      <div class="value {% if current_capital > capital_base %}pos{% elif current_capital < capital_base %}neg{% endif %}" id="statCurrentCapital">{{ current_capital }}</div>
-      {% if adjustments_total %}<div style="font-size: 10px; color: var(--muted); margin-top: 2px;" title="Funds you added to (or removed from) the paper account. Not P&L - never counted in Total P&L, win rate or Stats.">incl. {{ "%+.0f"|format(adjustments_total) }} funds {{ "added" if adjustments_total > 0 else "removed" }}</div>{% endif %}
+      <div class="value {% if current_capital > capital_base %}pos{% elif current_capital < capital_base %}neg{% endif %}" id="statCurrentCapital">{{ current_capital|inr }}</div>
+      {% if adjustments_total %}<div style="font-size: 10px; color: var(--muted); margin-top: 2px;" title="Funds you added to (or removed from) the paper account. Not P&L - never counted in Total P&L, win rate or Stats.">incl. {{ adjustments_total|inr(0, true) }} funds {{ "added" if adjustments_total > 0 else "removed" }}</div>{% endif %}
     </div>
     <div class="stat-card">
       <div class="label">Open trade</div>
@@ -316,7 +316,7 @@
     </div>
     <div class="stat-card">
       <div class="label">Total P&amp;L (Rs)</div>
-      <div class="value {% if total_pnl > 0 %}pos{% elif total_pnl < 0 %}neg{% endif %}" id="statPnl">{{ total_pnl }}</div>
+      <div class="value {% if total_pnl > 0 %}pos{% elif total_pnl < 0 %}neg{% endif %}" id="statPnl">{{ total_pnl|inr }}</div>
     </div>
   </div>
 
@@ -332,13 +332,13 @@
       <tr>
         <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}{% if t.rule_note %}<div class="sub" style="font-size:10px;opacity:.85" title="{{ t.rule_note }}">{{ t.rule_note }}</div>{% endif %}{% if t.volume %}<div class="vol-line"><span class="vol-pill {{ t.volume.label|lower }}" title="{{ 'Buy' if t.direction == 'Buy' else 'Sell' }}-side directional volume is {{ t.volume.ratio }}x its usual level for this time of day{% if t.entry_volume_label %}. At entry: {{ t.entry_volume_label }} ({{ t.entry_volume_ratio }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ t.volume.asof }}.">Vol {{ t.volume.label }} &middot; {{ t.volume.ratio }}&times;</span><span>as of {{ t.volume.asof }}</span></div>{% endif %}</td>
         <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
-        <td>{{ t.quantity }}{% if t.target1_hit_time %}<div class="sub" style="font-size:11px; color: var(--gold);">T1: {{ t.target1_qty }} @ {{ t.target1_exit_price }}</div>{% endif %}</td>
-        <td>{{ t.entry_price }}</td>
+        <td>{{ t.quantity }}{% if t.target1_hit_time %}<div class="sub" style="font-size:11px; color: var(--gold);">T1: {{ t.target1_qty }} @ {{ t.target1_exit_price|inr }}</div>{% endif %}</td>
+        <td>{{ t.entry_price|inr }}</td>
         <td>{{ t.entry_rsi if t.entry_rsi is not none else "-" }}</td>
         <td>{{ t.entry_time_ist }}</td>
-        <td>{{ t.last_checked_price or "-" }}</td>
+        <td>{{ (t.last_checked_price or "-")|inr }}</td>
         <td>{% if t.stop_info %}<div style="font-size:12px; color: var(--green);">{{ t.stop_info }}</div>{% endif %}{% if t.atr_value is not none %}<div class="sub" style="font-size:11px; color: var(--muted);">ATR: {{ t.atr_value }}</div>{% endif %}{% if t.rsi_value is not none %}<div class="sub" style="font-size:11px; color: var(--muted);">RSI: {{ t.rsi_value }}</div>{% endif %}</td>
-        <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl if t.unrealized_pnl is not none else "-" }}</td>
+        <td class="{% if t.unrealized_pnl and t.unrealized_pnl > 0 %}pnl-pos{% elif t.unrealized_pnl and t.unrealized_pnl < 0 %}pnl-neg{% endif %}">{{ (t.unrealized_pnl if t.unrealized_pnl is not none else "-")|inr }}</td>
         <td class="{% if t.unrealized_pnl_pct and t.unrealized_pnl_pct > 0 %}pnl-pos{% elif t.unrealized_pnl_pct and t.unrealized_pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.unrealized_pnl_pct if t.unrealized_pnl_pct is not none else "-" }}{% if t.unrealized_pnl_pct is not none %}%{% endif %}</td>
         <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{% if not t.rr_is_true %}≈{% endif %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
         <td>{{ t.last_checked_ist }}</td>
@@ -364,7 +364,7 @@
           </div>
           <div class="date-right">
             <span class="date-pnl {% if group.total_pnl > 0 %}pnl-pos{% elif group.total_pnl < 0 %}pnl-neg{% endif %}">
-              {% if group.total_pnl > 0 %}+{% endif %}Rs {{ group.total_pnl }}
+              {% if group.total_pnl > 0 %}+{% endif %}Rs {{ group.total_pnl|inr }}
             </span>
             <span class="chevron">&#9660;</span>
           </div>
@@ -380,16 +380,16 @@
               <td>{{ t.symbol }}{% if t.paper_option_label %}<div class="sub" style="font-size:11px;" title="{{ t.paper_option_label }}">{{ t.paper_option_label }}</div>{% endif %}{% if t.rule_note %}<div class="sub" style="font-size:10px;opacity:.85" title="{{ t.rule_note }}">{{ t.rule_note }}</div>{% endif %}</td>
               <td class="direction-{{ t.direction|lower }}">{{ t.direction }}</td>
               <td>{{ t.quantity }}</td>
-              <td>{{ t.entry_price }}</td>
+              <td>{{ t.entry_price|inr }}</td>
               <td>{{ t.entry_rsi if t.entry_rsi is not none else "-" }}</td>
               <td>{% if t.entry_volume_label %}<span class="vol-pill {{ t.entry_volume_label|lower }}" title="Directional volume vs usual for this time of day">{{ t.entry_volume_label }} &middot; {{ t.entry_volume_ratio }}&times;</span>{% else %}-{% endif %}</td>
-              <td>{{ t.exit_price }}</td>
+              <td>{{ t.exit_price|inr }}</td>
               <td>{{ t.exit_rsi if t.exit_rsi is not none else "-" }}</td>
               <td>{% if t.exit_volume_label %}<span class="vol-pill {{ t.exit_volume_label|lower }}" title="Directional volume vs usual for this time of day">{{ t.exit_volume_label }} &middot; {{ t.exit_volume_ratio }}&times;</span>{% else %}-{% endif %}</td>
-              <td class="{% if t.pnl and t.pnl > 0 %}pnl-pos{% elif t.pnl and t.pnl < 0 %}pnl-neg{% endif %}">{{ t.pnl }}</td>
+              <td class="{% if t.pnl and t.pnl > 0 %}pnl-pos{% elif t.pnl and t.pnl < 0 %}pnl-neg{% endif %}">{{ t.pnl|inr }}</td>
               <td class="{% if t.pnl_pct and t.pnl_pct > 0 %}pnl-pos{% elif t.pnl_pct and t.pnl_pct < 0 %}pnl-neg{% endif %}">{{ t.pnl_pct if t.pnl_pct is not none else "-" }}{% if t.pnl_pct is not none %}%{% endif %}</td>
               <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{% if not t.rr_is_true %}≈{% endif %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
-              <td>{{ t.balance_after }}</td>
+              <td>{{ t.balance_after|inr }}</td>
               <td>{{ t.exit_reason }}</td>
               <td>{{ t.exit_time_ist }}</td>
             </tr>
@@ -475,18 +475,18 @@
       }
       const rows = trades.map(t => {
         const pnlClass = t.unrealized_pnl > 0 ? "pnl-pos" : (t.unrealized_pnl < 0 ? "pnl-neg" : "");
-        const pnlText = (t.unrealized_pnl === null || t.unrealized_pnl === undefined) ? "-" : t.unrealized_pnl;
+        const pnlText = (t.unrealized_pnl === null || t.unrealized_pnl === undefined) ? "-" : inr(t.unrealized_pnl);
         const pctText = (t.unrealized_pnl_pct === null || t.unrealized_pnl_pct === undefined) ? "-" : t.unrealized_pnl_pct + "%";
         const entryRsiText = (t.entry_rsi === null || t.entry_rsi === undefined) ? "-" : t.entry_rsi;
         return `
         <tr>
           <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}${t.rule_note ? `<div class="sub" style="font-size:10px;opacity:.85" title="${escapeHtml(t.rule_note)}">${escapeHtml(t.rule_note)}</div>` : ""}${volPillHTML(t)}</td>
           <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
-          <td>${t.quantity}${t.target1_hit_time ? `<div class="sub" style="font-size:11px; color: var(--gold);">T1: ${t.target1_qty} @ ${t.target1_exit_price}</div>` : ""}</td>
-          <td>${t.entry_price}</td>
+          <td>${t.quantity}${t.target1_hit_time ? `<div class="sub" style="font-size:11px; color: var(--gold);">T1: ${t.target1_qty} @ ${inr(t.target1_exit_price)}</div>` : ""}</td>
+          <td>${inr(t.entry_price)}</td>
           <td>${entryRsiText}</td>
           <td>${t.entry_time_ist || ""}</td>
-          <td>${t.last_checked_price || "-"}</td>
+          <td>${inr(t.last_checked_price || "-")}</td>
           <td>${t.stop_info ? `<div style="font-size:12px; color: var(--green);">${escapeHtml(t.stop_info)}</div>` : ""}${(t.atr_value !== null && t.atr_value !== undefined) ? `<div class="sub" style="font-size:11px; color: var(--muted);">ATR: ${t.atr_value}</div>` : ""}${(t.rsi_value !== null && t.rsi_value !== undefined) ? `<div class="sub" style="font-size:11px; color: var(--muted);">RSI: ${t.rsi_value}</div>` : ""}</td>
           <td class="${pnlClass}">${pnlText}</td>
           <td class="${pnlClass}">${pctText}</td>
@@ -555,16 +555,16 @@
               <td>${escapeHtml(t.symbol)}${t.paper_option_label ? `<div class="sub" style="font-size:11px;" title="${escapeHtml(t.paper_option_label)}">${escapeHtml(t.paper_option_label)}</div>` : ""}${t.rule_note ? `<div class="sub" style="font-size:10px;opacity:.85" title="${escapeHtml(t.rule_note)}">${escapeHtml(t.rule_note)}</div>` : ""}</td>
               <td class="direction-${t.direction.toLowerCase()}">${t.direction}</td>
               <td>${t.quantity}</td>
-              <td>${t.entry_price}</td>
+              <td>${inr(t.entry_price)}</td>
               <td>${entryRsiText}</td>
               <td>${volCell(t.entry_volume_label, t.entry_volume_ratio)}</td>
-              <td>${t.exit_price}</td>
+              <td>${inr(t.exit_price)}</td>
               <td>${exitRsiText}</td>
               <td>${volCell(t.exit_volume_label, t.exit_volume_ratio)}</td>
-              <td class="${rowPnlClass}">${t.pnl}</td>
+              <td class="${rowPnlClass}">${inr(t.pnl)}</td>
               <td class="${rowPnlClass}">${pctText}</td>
               <td class="${rrClass(t)}">${rrText(t)}</td>
-              <td>${t.balance_after}</td>
+              <td>${inr(t.balance_after)}</td>
               <td>${escapeHtml(t.exit_reason || "")}</td>
               <td>${t.exit_time_ist || ""}</td>
             </tr>
@@ -578,7 +578,7 @@
                 <span class="date-count">${g.trades.length} trade${g.trades.length !== 1 ? "s" : ""}</span>
               </div>
               <div class="date-right">
-                <span class="date-pnl ${pnlClass}">${sign}Rs ${g.total_pnl}</span>
+                <span class="date-pnl ${pnlClass}">${sign}Rs ${inr(g.total_pnl)}</span>
                 <span class="chevron">&#9660;</span>
               </div>
             </div>
@@ -618,12 +618,12 @@
         document.getElementById("statWinRate").textContent = winRate + "%";
         const totalPnl = cs ? cs.total_pnl : data.closed.reduce((sum, t) => sum + (t.pnl || 0), 0);
         const pnlEl = document.getElementById("statPnl");
-        pnlEl.textContent = Number(totalPnl).toFixed(2);
+        pnlEl.textContent = inr(Number(totalPnl).toFixed(2));
         pnlEl.classList.remove("pos", "neg");
         if (totalPnl > 0) pnlEl.classList.add("pos");
         if (totalPnl < 0) pnlEl.classList.add("neg");
         if (data.current_capital !== undefined) {
-          document.getElementById("statCurrentCapital").textContent = data.current_capital;
+          document.getElementById("statCurrentCapital").textContent = inr(data.current_capital);
         }
       } catch (err) {
         console.error("Refresh failed", err);

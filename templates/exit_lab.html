@@ -236,7 +236,7 @@
       const out = document.getElementById("rsiHistOut");
       out.innerHTML = '<span class="mut">Replaying every closed trade...</span>';
       const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-      const sgn = (v, d = 0) => (v > 0 ? "+" : "") + Number(v).toFixed(d);
+      const sgn = (v, d = 0) => inr(Number(v).toFixed(d), null, true);
       const cls = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "mut");
       try {
         const res = await fetch("/api/exit-lab/rsi-simple-history?stop=" + document.getElementById("rsiStop").value);
@@ -254,7 +254,7 @@
           + d.by_day.map((x) => '<tr><td>' + esc(x.date) + '</td><td>' + x.n + '</td><td class="' + cls(x.actual) + '">' + sgn(x.actual) + '</td><td class="' + cls(x.rsi) + '">' + sgn(x.rsi) + '</td><td class="' + cls(x.rsi - x.actual) + '"><b>' + sgn(x.rsi - x.actual) + '</b></td></tr>').join("") + '</table></div>';
         if (!document.getElementById("rsiDaily").checked)
           h += '<div class="sub" style="margin:10px 0 4px"><b style="color:var(--text)">Trade by trade</b></div><div class="wrap"><table><tr><th>#</th><th>Stock</th><th>Side</th><th>Date</th><th>Entry</th><th>Actual exit</th><th>Actual P&amp;L</th><th>RSI exit</th><th>RSI price</th><th>RSI %</th><th>RSI P&amp;L</th><th>Diff</th></tr>'
-          + d.rows.map((x) => '<tr><td class="mut">' + x.id + '</td><td>' + esc(x.symbol) + '</td><td>' + esc(x.direction) + '</td><td>' + esc(x.date) + '</td><td>' + x.entry_clock + ' @ ' + x.p0 + '</td><td>' + x.actual_exit + '</td><td class="' + cls(x.actual_pnl) + '">' + sgn(x.actual_pnl) + '</td><td>' + x.rsi_exit + (x.no_signal ? ' *' : '') + '</td><td>' + x.rsi_price + '</td><td class="' + cls(x.rsi_pct) + '">' + sgn(x.rsi_pct, 2) + '%</td><td class="' + cls(x.rsi_pnl) + '"><b>' + sgn(x.rsi_pnl) + '</b></td><td class="' + cls(x.diff) + '">' + sgn(x.diff) + '</td></tr>').join("") + '</table></div>';
+          + d.rows.map((x) => '<tr><td class="mut">' + x.id + '</td><td>' + esc(x.symbol) + '</td><td>' + esc(x.direction) + '</td><td>' + esc(x.date) + '</td><td>' + x.entry_clock + ' @ ' + inr(x.p0) + '</td><td>' + x.actual_exit + '</td><td class="' + cls(x.actual_pnl) + '">' + sgn(x.actual_pnl) + '</td><td>' + x.rsi_exit + (x.no_signal ? ' *' : '') + '</td><td>' + inr(x.rsi_price) + '</td><td class="' + cls(x.rsi_pct) + '">' + sgn(x.rsi_pct, 2) + '%</td><td class="' + cls(x.rsi_pnl) + '"><b>' + sgn(x.rsi_pnl) + '</b></td><td class="' + cls(x.diff) + '">' + sgn(x.diff) + '</td></tr>').join("") + '</table></div>';
         if (d.skipped.length) h += '<div class="sub" style="margin-top:8px">Not replayable (' + d.skipped.length + '): ' + d.skipped.map((x) => '#' + x.id + ' ' + esc(x.symbol) + ' (' + esc(x.why) + ')').join(", ") + '</div>';
         out.innerHTML = h;
       } catch (e) { out.innerHTML = '<span class="neg">request failed</span>'; }
@@ -265,19 +265,19 @@
       if (!id) return;
       out.innerHTML = '<span class="mut">Replaying...</span>';
       const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-      const sgn = (v, d = 1) => (v > 0 ? "+" : "") + Number(v).toFixed(d);
+      const sgn = (v, d = 1) => inr(Number(v).toFixed(d), null, true);
       const cls = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "mut");
       try {
         const res = await fetch("/api/exit-lab/replay?trade_id=" + encodeURIComponent(id));
         const d = await res.json();
         if (!res.ok) { out.innerHTML = '<span class="neg">' + esc(d.error || "failed") + '</span>'; return; }
         const t = d.trade;
-        let h = '<div><b>' + esc(t.symbol) + ' ' + esc(t.direction) + '</b> &middot; alert ' + esc(t.alert_clock) + ' at ' + d.p0 + ' &middot; entry volume <b>' + esc(d.entry_volume.label) + ' ' + d.entry_volume.ratio + '&times;</b>'
-          + ' &middot; peak ' + d.peak + ' at +' + d.peak_minute + ' min<br>Actual: exit ' + (t.exit_clock || "-") + ' at ' + t.exit_price + ' = <b class="' + cls(t.pnl) + '">' + sgn(t.pnl, 0) + '</b> &middot; ' + esc(t.exit_reason || "") + '<br><span class="mut">' + esc(t.rule || "") + '</span></div>';
+        let h = '<div><b>' + esc(t.symbol) + ' ' + esc(t.direction) + '</b> &middot; alert ' + esc(t.alert_clock) + ' at ' + inr(d.p0) + ' &middot; entry volume <b>' + esc(d.entry_volume.label) + ' ' + d.entry_volume.ratio + '&times;</b>'
+          + ' &middot; peak ' + inr(d.peak) + ' at +' + d.peak_minute + ' min<br>Actual: exit ' + (t.exit_clock || "-") + ' at ' + inr(t.exit_price) + ' = <b class="' + cls(t.pnl) + '">' + sgn(t.pnl, 0) + '</b> &middot; ' + esc(t.exit_reason || "") + '<br><span class="mut">' + esc(t.rule || "") + '</span></div>';
         h += '<div class="sub" style="margin:10px 0 4px"><b style="color:var(--text)">Volume over time</b> (each 5-minute reading, with the option price then)</div><div class="wrap"><table><tr><th>Time</th><th>+min</th><th>Volume</th><th>Ratio</th><th>Option price</th><th>vs alert</th></tr>'
-          + d.timeline.map((x) => '<tr><td>' + x.clock + '</td><td>' + x.minute + '</td><td>' + esc(x.state) + '</td><td>' + (x.ratio == null ? "-" : x.ratio + "&times;") + '</td><td>' + x.price + '</td><td class="' + cls(x.pct) + '">' + sgn(x.pct) + '%</td></tr>').join("") + '</table></div>';
+          + d.timeline.map((x) => '<tr><td>' + x.clock + '</td><td>' + x.minute + '</td><td>' + esc(x.state) + '</td><td>' + (x.ratio == null ? "-" : x.ratio + "&times;") + '</td><td>' + inr(x.price) + '</td><td class="' + cls(x.pct) + '">' + sgn(x.pct) + '%</td></tr>').join("") + '</table></div>';
         h += '<div class="sub" style="margin:10px 0 4px"><b style="color:var(--text)">What each rule would have made on this trade</b> (best first; * = can be selected for real trades)</div><div class="wrap"><table><tr><th>#</th><th>Exit rule</th><th>Family</th><th>Exit</th><th>Price</th><th>%</th><th>P&amp;L (Rs)</th></tr>'
-          + d.results.map((x, i) => '<tr><td class="mut">' + (i + 1) + '</td><td>' + esc(x.name) + (x.selectable ? " *" : "") + '</td><td class="fam">' + esc(x.family) + '</td><td>' + x.clock + ' (+' + x.minute + ')</td><td>' + x.price + '</td><td class="' + cls(x.pct) + '">' + sgn(x.pct) + '%</td><td class="' + cls(x.pnl) + '"><b>' + sgn(x.pnl, 0) + '</b></td></tr>').join("") + '</table></div>';
+          + d.results.map((x, i) => '<tr><td class="mut">' + (i + 1) + '</td><td>' + esc(x.name) + (x.selectable ? " *" : "") + '</td><td class="fam">' + esc(x.family) + '</td><td>' + x.clock + ' (+' + x.minute + ')</td><td>' + inr(x.price) + '</td><td class="' + cls(x.pct) + '">' + sgn(x.pct) + '%</td><td class="' + cls(x.pnl) + '"><b>' + sgn(x.pnl, 0) + '</b></td></tr>').join("") + '</table></div>';
         out.innerHTML = h;
       } catch (e) { out.innerHTML = '<span class="neg">request failed</span>'; }
     }

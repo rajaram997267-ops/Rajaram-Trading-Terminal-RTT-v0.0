@@ -207,12 +207,12 @@
     <input type="text" id="fundsAmount" placeholder="e.g. 50000" style="max-width: 130px; flex: none; text-align: right;">
     <input type="text" id="fundsNote" placeholder="note (optional)" style="max-width: 200px; flex: none;">
     <button class="secondary" onclick="addFunds()">Add funds</button>
-    <span class="token-status" id="fundsStatus">Paper balance now: Rs {{ current_capital }}. Adds to the balance only - no trade, P&amp;L, win rate or Stats number changes, and history stays exactly as it is. Use a negative amount to remove funds.</span>
+    <span class="token-status" id="fundsStatus">Paper balance now: Rs {{ current_capital|inr }}. Adds to the balance only - no trade, P&amp;L, win rate or Stats number changes, and history stays exactly as it is. Use a negative amount to remove funds.</span>
     {% if capital_adjustments %}
     <div id="fundsLog" style="flex-basis: 100%; font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.6;">
-      <div style="font-weight: 600; color: var(--text);">Funds history (total {{ "%+.2f"|format(adjustments_total) }})</div>
+      <div style="font-weight: 600; color: var(--text);">Funds history (total {{ adjustments_total|inr(2, true) }})</div>
       {% for a in capital_adjustments %}
-      <div>{{ a.when_ist }} IST &middot; <span style="color: {% if a.amount > 0 %}var(--green){% else %}var(--red){% endif %};">{{ "%+.2f"|format(a.amount) }}</span>{% if a.note %} &middot; {{ a.note }}{% endif %}</div>
+      <div>{{ a.when_ist }} IST &middot; <span style="color: {% if a.amount > 0 %}var(--green){% else %}var(--red){% endif %};">{{ a.amount|inr(2, true) }}</span>{% if a.note %} &middot; {{ a.note }}{% endif %}</div>
       {% endfor %}
     </div>
     {% endif %}
@@ -846,7 +846,7 @@
         body: JSON.stringify({ capital: amount }),
       });
       if (res.ok) {
-        statusEl.textContent = `Saved - Rs ${amount} starting capital`;
+        statusEl.textContent = `Saved - Rs ${inr(amount)} starting capital`;
       } else {
         statusEl.textContent = "Failed to save amount";
       }
@@ -862,7 +862,7 @@
         return;
       }
       const verb = amount > 0 ? "Add" : "Remove";
-      if (!confirm(`${verb} Rs ${Math.abs(amount)} ${amount > 0 ? "to" : "from"} the paper account? Your trade history is not affected.`)) {
+      if (!confirm(`${verb} Rs ${inr(Math.abs(amount))} ${amount > 0 ? "to" : "from"} the paper account? Your trade history is not affected.`)) {
         return;
       }
       try {
@@ -873,7 +873,7 @@
         });
         const result = await res.json();
         if (res.ok) {
-          statusEl.textContent = `Done - paper balance is now Rs ${result.current_capital}`;
+          statusEl.textContent = `Done - paper balance is now Rs ${inr(result.current_capital)}`;
           setTimeout(() => location.reload(), 600);
         } else {
           statusEl.textContent = result.message || "Failed to update funds";

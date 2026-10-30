@@ -215,7 +215,7 @@
             legend: { display: false },
             tooltip: {
               callbacks: {
-                label: (item) => `${label}: Rs ${item.parsed.y}`,
+                label: (item) => `${label}: Rs ${inr(item.parsed.y)}`,
               },
             },
           },
@@ -225,7 +225,7 @@
               grid: { color: "#1e222d" },
             },
             y: {
-              ticks: { color: "#6b7280" },
+              ticks: { color: "#6b7280", callback: (v) => inr(v) },
               grid: { color: "#1e222d" },
             },
           },
@@ -342,10 +342,10 @@
             <td>${escapeHtml(r.name)}${i === 0 && !noTrophy ? " 🏆" : ""}</td>
             <td>${r.total_trades}</td>
             <td>${r.win_rate}%</td>
-            <td class="${pnlClass(r.total_pnl)}">${r.total_pnl}</td>
-            <td class="${pnlClass(r.avg_pnl)}">${r.avg_pnl}</td>
+            <td class="${pnlClass(r.total_pnl)}">${inr(r.total_pnl)}</td>
+            <td class="${pnlClass(r.avg_pnl)}">${inr(r.avg_pnl)}</td>
             <td>${r.profit_factor === null ? "-" : r.profit_factor}</td>
-            ${extraCol ? `<td class="${pnlClass(r.max_loss)}">${r.max_loss}</td>` : ""}
+            ${extraCol ? `<td class="${pnlClass(r.max_loss)}">${inr(r.max_loss)}</td>` : ""}
           </tr>
         `;
       });
