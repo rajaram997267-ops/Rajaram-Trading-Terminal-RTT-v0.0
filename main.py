@@ -31,6 +31,59 @@ IST_OFFSET = timedelta(hours=5, minutes=30)
 app = Flask(__name__)
 
 
+# --- Indian digit grouping (1,00,000 / 2,75,97,219) for every Rs amount ----
+def fmt_inr(value, decimals=None, plus=False) -> str:
+    """Group digits the Indian way: last three digits, then pairs
+    (27,18,597.05). The decimals already present are kept as they are
+    unless `decimals` is given; `plus` adds a + to positive numbers.
+    Anything that is not a plain number ("-", text, None) is returned
+    untouched, so it is safe to wrap any displayed value."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if decimals is not None:
+        try:
+            s = f"{float(value):.{int(decimals)}f}"
+        except (TypeError, ValueError):
+            return str(value)
+    else:
+        s = str(value).strip()
+    m = re.fullmatch(r"([+-]?)(\d+)(\.\d+)?", s)
+    if not m:
+        return str(value)
+    sign, ip, frac = m.group(1), m.group(2), m.group(3) or ""
+    if len(ip) > 3:
+        head, tail = ip[:-3], ip[-3:]
+        ip = re.sub(r"(?<=\d)(?=(\d{2})+$)", ",", head) + "," + tail
+    if plus and not sign and float(s) > 0:
+        sign = "+"
+    return sign + ip + frac
+
+
+app.add_template_filter(fmt_inr, "inr")
+
+# Same grouping for the browser side: every HTML page gets window.inr(v, decimals, plus).
+_INR_JS = ("<script>window.inr=function(v,d,p){if(v===null||v===undefined)return '';var s;"
+           "if(d!==undefined&&d!==null){var n=Number(v);if(!isFinite(n))return String(v);s=n.toFixed(d);}else{s=String(v).trim();}"
+           "var m=/^([+-]?)(\\d+)(\\.\\d+)?$/.exec(s);if(!m)return String(v);var sg=m[1],ip=m[2],fr=m[3]||'';"
+           "if(ip.length>3){var h=ip.slice(0,-3),t=ip.slice(-3);h=h.replace(/\\B(?=(\\d{2})+(?!\\d))/g,',');ip=h+','+t;}"
+           "if(p&&!sg&&Number(s)>0)sg='+';return sg+ip+fr;};</script>")
+
+
+@app.after_request
+def _inject_inr_helper(resp):
+    try:
+        if resp.mimetype == "text/html" and not resp.direct_passthrough:
+            body = resp.get_data(as_text=True)
+            if "window.inr=" not in body:
+                body = body.replace("</head>", _INR_JS + "</head>", 1) if "</head>" in body else _INR_JS + body
+                resp.set_data(body)
+    except Exception:
+        pass
+    return resp
+
+
 # --- Access control -------------------------------------------------------
 # Staged on purpose: each protection switches on only once its env var is set
 # on Render, so deploying this file alone changes nothing and can never lock
@@ -1572,8 +1625,8 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                         if lots < 1:
                             _mark_live_failed(
                                 trade_id,
-                                f"Available funds (Rs {available_funds:.2f}) not enough for 1 lot "
-                                f"({lot_size} qty) of {label} at premium Rs {premium}",
+                                f"Available funds (Rs {fmt_inr(available_funds, 2)}) not enough for 1 lot "
+                                f"({lot_size} qty) of {label} at premium Rs {fmt_inr(premium)}",
                                 live_quantity=0,
                             )
                         else:
@@ -9207,7 +9260,7 @@ def exit_lab_page():
                 "SELECT id, symbol, direction, pnl, exit_time FROM paper_trades WHERE status = 'CLOSED' ORDER BY id DESC LIMIT 40").fetchall()]
         for r in rt:
             ex = (datetime.fromisoformat(r["exit_time"]) + IST_OFFSET).strftime("%d %b %H:%M") if r.get("exit_time") else ""
-            r["label"] = f"#{r['id']} {r.get('symbol')} {r.get('direction')} - {ex} - P&L {round(r.get('pnl') or 0):+d}"
+            r["label"] = f"#{r['id']} {r.get('symbol')} {r.get('direction')} - {ex} - P&L {fmt_inr(round(r.get('pnl') or 0), plus=True)}"
         replay_trades = rt
     except (psycopg2.Error, RuntimeError):
         replay_trades = []
@@ -9677,7 +9730,7 @@ def paper_trading_capital_adjust():
     if current + amount <= 0:
         return jsonify({
             "status": "error",
-            "message": f"That would take the paper balance to zero or below (current balance: Rs {round(current, 2)})",
+            "message": f"That would take the paper balance to zero or below (current balance: Rs {fmt_inr(round(current, 2))})",
         }), 400
     with get_db() as conn:
         conn.execute(
@@ -10454,7 +10507,7 @@ def _register_history_pages(app, g):
                 d = days.setdefault(t0.strftime("%Y-%m-%d"), [0, 0, 0])
                 d[0] += 1; d[1] += a; d[2] += s
                 rows.append((t["id"], t["symbol"], t0.strftime("%d %b"), a, s))
-        f = lambda v: f"{v:+,}"
+        f = lambda v: fmt_inr(v, plus=True)
         c = lambda v: "var(--green)" if v > 0 else "var(--red)" if v < 0 else "var(--muted)"
         h = [STYLE + "<body>",
              f"<h3>{'RSI Simple exit' + (f' + stop -{stop}%' if stop else '')} vs actual (date-wise)</h3>",
@@ -10621,7 +10674,7 @@ def _register_history_pages(app, g):
             d[0] += 1; d[1] += r["a"]; d[2] += r["r"] or 0; d[3] += r["f"]; d[4] += r["f5"]
             how[lab(r["how"])] = how.get(lab(r["how"]), 0) + 1
             how5[lab(r["how5"])] = how5.get(lab(r["how5"]), 0) + 1
-        f = lambda v: f"{v:+,}"
+        f = lambda v: fmt_inr(v, plus=True)
         c = lambda v: "var(--green)" if v > 0 else "var(--red)" if v < 0 else "var(--muted)"
         cell = lambda v, b=False: f"<td align=right style='color:{c(v)}'>" + (f"<b>{f(v)}</b>" if b else f(v))
         h = [head, "<h3>1st 5 Min FIB exit vs actual (date-wise)</h3>",
