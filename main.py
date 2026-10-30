@@ -757,6 +757,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_t8 DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_stage INTEGER DEFAULT 0",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_fib_stage INTEGER DEFAULT 0",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS fib_stage_at TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_fib_stage_at TEXT",
         ):
             conn.execute(stmt)
         conn.commit()
@@ -2785,6 +2787,63 @@ def fib_stage_transition(direction: str, current_stage: int, tiers: list[float],
     floor = tiers[current_stage - 1]
     reversed_ = (spot_price <= floor) if direction == "Buy" else (spot_price >= floor)
     return current_stage, ("reversed" if reversed_ else None)
+
+
+def get_fib_reversal_mode() -> str:
+    """How the 1st 5 Min FIB strategy decides a reversal through its floor.
+    'candle_close' (default): touching the floor only ARMS the check - the
+    trade exits only once a COMPLETE 5-min candle of the underlying has
+    CLOSED at/through the floor (Buy: close <= floor, Sell: close >= floor).
+    If the candle closes back on the right side, the trade carries on.
+    'touch': the older behaviour - exit the moment the live price touches
+    the floor. Switch with the setting key fib_reversal_mode."""
+    return "touch" if get_setting("fib_reversal_mode", "candle_close") == "touch" else "candle_close"
+
+
+_fib_close_cache: dict = {}   # (trade id, side, stage) -> (5-min boundary checked, confirmed, info)
+_fib_reach_seen: dict = {}    # fallback "first seen" time for trades that were already at a stage before this rule existed
+
+
+def fib_floor_closed_through(trade_id: int, side: str, direction: str, floor: float, stage: int,
+                             reach_iso: str | None, spot_key: str, access_token: str) -> tuple[bool, dict]:
+    """True once a COMPLETE 5-min candle of the underlying - one that ENDED
+    after the floor tier was reached (the candle in which it was reached
+    counts) - has closed at or through that floor. Evaluated once per
+    5-min boundary per trade/side/stage (cached), from 1-minute candles so
+    each candle's timestamp is known. If candles can't be fetched or the
+    newest minute isn't in yet, returns False (no exit this pass; the next
+    poll retries) - it never exits on missing data."""
+    now_ist = datetime.utcnow() + IST_OFFSET
+    if reach_iso:
+        try:
+            reach_ist = datetime.fromisoformat(reach_iso) + IST_OFFSET
+        except ValueError:
+            reach_ist = _fib_reach_seen.setdefault((trade_id, side, stage), now_ist)
+    else:
+        reach_ist = _fib_reach_seen.setdefault((trade_id, side, stage), now_ist)
+    boundary = now_ist.replace(minute=(now_ist.minute // 5) * 5, second=0, microsecond=0)
+    key = (trade_id, side, stage)
+    cached = _fib_close_cache.get(key)
+    if cached and cached[0] == boundary:
+        return cached[1], cached[2]
+    try:
+        rows = _fetch_1min_raw(spot_key, access_token)
+    except Exception:
+        return False, {}
+    if not rows:
+        return False, {}
+    data_through = _to_naive_ist(rows[-1][0]) + timedelta(minutes=1)   # end of the newest 1-min candle we have
+    hit, info = False, {}
+    for k, (_o, _h, _l, c) in _spot_5min_buckets(rows, now_ist):
+        end = k + timedelta(minutes=5)
+        if end <= reach_ist or end > data_through:
+            continue
+        if (c <= floor) if direction == "Buy" else (c >= floor):
+            hit, info = True, {"candle": k.strftime("%H:%M"), "close": c}
+            break
+    if data_through >= boundary:   # the newest finished candle was covered - safe to reuse until the next boundary
+        _fib_close_cache[key] = (boundary, hit, info)
+    return hit, info
 
 
 def fetch_5min_candles_with_time(instrument_key: str, access_token: str) -> list[tuple[str, float, float, float, float]]:
@@ -5161,6 +5220,8 @@ def _run_paper_trade_check_impl() -> dict:
             fib_reversed_or_t2 = None
             live_fib_stage_now = None
             live_fib_reversed_or_t2 = None
+            fib_close_info: dict = {}
+            live_fib_close_info: dict = {}
             if strategy == "FIRST5MIN_FIB" and spot_candles:
                 fib_rsi_triggered, fib_rsi_info = check_rsi_simple_exit(
                     trade["direction"], spot_candles,
@@ -5184,6 +5245,26 @@ def _run_paper_trade_check_impl() -> dict:
                 live_fib_stage_now, live_fib_reversed_or_t2 = fib_stage_transition(
                     trade["direction"], live_fib_current_stage, fib_tiers, spot_live_price
                 )
+                # Candle-close confirmation (default). fib_stage_transition
+                # above is the plain touch rule; here a "reversed" is
+                # replaced by the real test - has a complete 5-min candle
+                # CLOSED at/through the floor since the floor was reached?
+                # Touches of T(N+1) and the final target still act at once;
+                # only the reversal waits for the candle. Paper and live are
+                # judged separately, each against its own stage/floor.
+                if get_fib_reversal_mode() == "candle_close" and spot_key:
+                    if (fib_current_stage >= 1 and fib_stage_now == fib_current_stage
+                            and fib_reversed_or_t2 in (None, "reversed") and trade["status"] == "OPEN"):
+                        _ok, fib_close_info = fib_floor_closed_through(
+                            trade["id"], "paper", trade["direction"], fib_tiers[fib_current_stage - 1],
+                            fib_current_stage, trade["fib_stage_at"], spot_key, access_token)
+                        fib_reversed_or_t2 = "reversed" if _ok else None
+                    if (live_fib_current_stage >= 1 and live_fib_stage_now == live_fib_current_stage
+                            and live_fib_reversed_or_t2 in (None, "reversed") and trade["live_status"] == "OPEN"):
+                        _lok, live_fib_close_info = fib_floor_closed_through(
+                            trade["id"], "live", trade["direction"], fib_tiers[live_fib_current_stage - 1],
+                            live_fib_current_stage, trade["live_fib_stage_at"], spot_key, access_token)
+                        live_fib_reversed_or_t2 = "reversed" if _lok else None
             elif strategy == "FIRST5MIN_FIB" and trade["fib_t1"] is None and access_token:
                 # First candle wasn't available yet at entry (rare - only
                 # happens if a trade opened before ~09:20 IST) - retry
@@ -5668,6 +5749,8 @@ def _run_paper_trade_check_impl() -> dict:
                     floor_n = fib_stage_now
                     floor_val = trade[f"fib_t{floor_n}"]
                     exit_reason = f"1st 5 Min FIB: reversed back through T{floor_n} ({floor_val:.2f}) - booked near T{floor_n}"
+                    if fib_close_info:
+                        exit_reason += f" (5m candle {fib_close_info['candle']} closed {fib_close_info['close']:.2f})"
                 elif fib_stage_now is not None and fib_stage_now > fib_old_stage:
                     # Advanced to an intermediate tier (T1-T3), no exit
                     # outcome yet - record the ratcheted stage, keep going.
@@ -5966,6 +6049,8 @@ def _run_paper_trade_check_impl() -> dict:
                     live_floor_n = live_fib_stage_now
                     live_floor_val = trade[f"fib_t{live_floor_n}"]
                     live_exit_reason_val = f"1st 5 Min FIB: reversed back through T{live_floor_n} ({live_floor_val:.2f}) - booked near T{live_floor_n}"
+                    if live_fib_close_info:
+                        live_exit_reason_val += f" (5m candle {live_fib_close_info['candle']} closed {live_fib_close_info['close']:.2f})"
                 elif live_fib_stage_now is not None and live_fib_stage_now > live_fib_current_stage:
                     live_fib_stage_update = live_fib_stage_now
                 elif live_fib_current_stage == 0 and not live_exited and trade["live_status"] == "OPEN" and fib_rsi_triggered:
@@ -6074,8 +6159,8 @@ def _run_paper_trade_check_impl() -> dict:
             elif live_fib_stage_update is not None:
                 with get_db() as conn:
                     conn.execute(
-                        "UPDATE paper_trades SET live_fib_stage = ?, live_mae_pct = ? WHERE id = ?",
-                        (live_fib_stage_update, new_live_mae_pct, trade["id"]),
+                        "UPDATE paper_trades SET live_fib_stage = ?, live_fib_stage_at = ?, live_mae_pct = ? WHERE id = ?",
+                        (live_fib_stage_update, now, new_live_mae_pct, trade["id"]),
                     )
                     conn.commit()
             elif trade["live_status"] == "OPEN" and new_live_mae_pct != trade["live_mae_pct"]:
@@ -6160,10 +6245,10 @@ def _run_paper_trade_check_impl() -> dict:
                     conn.execute(
                         """
                         UPDATE paper_trades
-                        SET fib_stage = ?, last_checked_price = ?, last_checked_time = ?, last_error = NULL
+                        SET fib_stage = ?, fib_stage_at = ?, last_checked_price = ?, last_checked_time = ?, last_error = NULL
                         WHERE id = ?
                         """,
-                        (trail_update["fib_stage"], last_price, now, trade["id"]),
+                        (trail_update["fib_stage"], now, last_price, now, trade["id"]),
                     )
                 elif exited:
                     qty = trade["quantity"] or 1
@@ -9632,7 +9717,7 @@ STRATEGY_DESCRIPTIONS = {
     "RSI_MOMENTUM": "10) RSI Momentum Exit (Rajaram's method): runs off the UNDERLYING's own RSI and EMA-of-Close (not the option premium) - Call exits once RSI has held below the CALL threshold for N consecutive 5-min candles AND that candle's Close is below the EMA (Put mirrors this: RSI above its threshold + Close above the EMA). Automatically widens its RSI threshold for a Deep ITM option (needs a bigger RSI move before exiting, since Deep ITM premium moves less per point of underlying) and tightens (fewer confirming candles needed) during the mid-day session when theta decay bites hardest. No fixed stop-loss floor - purely momentum/structure driven, per the original method. Every number (RSI/EMA periods, thresholds, candle counts, Deep-ITM %, mid-day window) is editable below so different combinations can be tested against each other. WARNING if live trading is on: by your own choice, live positions under this strategy have NO broker-side stop-loss at all (matches paper exactly) - the RSI/EMA check is the ONLY thing that closes them, so a position can sit fully unprotected if this app goes down, your connection drops, or (at the start of a trading day) there simply isn't enough candle history yet for RSI to be computable.",
     "CAMARILLA_LADDER": "11) Camarilla Ladder Exit (hybrid): before the underlying's price ever reaches its first Camarilla target (T1, standard public formula off the PREVIOUS day's High/Low/Close - not a guess at any proprietary indicator), this runs RSI Simple Exit's bare rule (#12) - RSI<70/>45 for 2 closed candles, no EMA leg - same no-broker-stop-until-triggered design (switched from RSI Momentum's EMA-gated check after a live example showed EMA confirmation firing too late). The moment spot price first reaches T1, that RSI check stops being used entirely and a real broker-side stop-loss order takes over instead: placed at breakeven (your entry price) the instant T1 hits, then MOVED UP (never down) each time a further tier is reached - to T1's own option premium once T2 hits, to T2's premium once T3 hits, and so on through T4. Exit happens when that stop is hit, whichever tier it's currently sitting at - there's no fixed target/booking, this only ever tightens the floor as price proves itself, using Upstox's regular Modify Order (not GTT - a plain SL order updated in place). WARNING if live trading is on: exactly like RSI Simple/Momentum, there is NO broker-side protection at all until spot first touches T1 - if this app goes down before that point, this position has nothing resting at the broker.",
     "RSI_SIMPLE": "12) RSI Simple Exit: the bare rule with nothing else added - exit Buy once 2 consecutive CLOSED 5-min candles (of the underlying) show RSI<70, exit Sell once 2 consecutive closed candles show RSI>45. No EMA/structure check, no Deep-ITM widening, no mid-day tightening - added after live testing of #10 and #11 found the plain version working better than either one with more conditions layered on top. Shares #10's core RSI period/threshold/confirm-candles settings above (not its EMA period, Deep-ITM, or mid-day settings - none of those apply here). Live trading note: unlike #10/#11, this one is NOT wired into live's own exit trigger - a live position under this strategy still gets the normal broker-side -2% stop and 0.5% trail, same as strategies #2-#9. Say the word if you'd rather it match #10/#11's no-floor, RSI-only live behavior instead.",
-    "FIRST5MIN_FIB": "13) 1st 5 Min FIB levels strategy: a separate strategy from #11/#12, though it shares the same pre-T1 RSI-only stoploss idea. T1-T8 are computed once at entry from TODAY's own FIRST 5-min candle (09:15-09:20 IST): that candle's High is the 1.00 level, Low is the 0.00 level, Range = High-Low - Buy's T1=High+Range*0.5 (1.50) through T8=High+Range*4.0 (5.00), stepping by 0.5*Range each tier; Sell mirrors this below the Low. A bigger opening candle produces bigger targets and vice versa, by design. Before spot ever reaches T1: pure RSI stoploss, no broker floor - RSI<70 (Buy) />the shared PUT threshold above (Sell) for 2 closed candles, identical rule to #12. Once T1 is reached, it's an 8-tier ratchet: the floor becomes whichever tier was last reached, advancing forward each time the next tier is hit; if spot instead reverses back through the CURRENT floor before reaching the next tier, 100% exits right there, booked near that floor. Reaching T8 is always an immediate full exit - the final tier, nothing further to ratchet to. No partial booking at any stage, just the floor moving forward. Simpler than strategy #11 on purpose: no order-modification, no captured-premium tracking - just a plain market exit the instant an outcome fires, live and paper independently (each tracks its own stage separately, so one side closing early never affects the other's checks). WARNING if live trading is on: no broker-side protection at all, for the ENTIRE life of this trade, not just pre-T1 - if this app goes down at any point, this position has nothing resting at the broker.",
+    "FIRST5MIN_FIB": "13) 1st 5 Min FIB levels strategy: a separate strategy from #11/#12, though it shares the same pre-T1 RSI-only stoploss idea. T1-T8 are computed once at entry from TODAY's own FIRST 5-min candle (09:15-09:20 IST): that candle's High is the 1.00 level, Low is the 0.00 level, Range = High-Low - Buy's T1=High+Range*0.5 (1.50) through T8=High+Range*4.0 (5.00), stepping by 0.5*Range each tier; Sell mirrors this below the Low. A bigger opening candle produces bigger targets and vice versa, by design. Before spot ever reaches T1: pure RSI stoploss, no broker floor - RSI<70 (Buy) />the shared PUT threshold above (Sell) for 2 closed candles, identical rule to #12. Once T1 is reached, it's an 8-tier ratchet: the floor becomes whichever tier was last reached, advancing forward each time the next tier is hit; if spot instead falls back to the CURRENT floor before reaching the next tier, nothing happens yet - the trade exits only if a 5-minute candle then CLOSES at/through that floor (Buy: closes at or below it, Sell: at or above it); if the candle closes back on the right side the trade simply carries on. Reaching the next tier still counts the moment price touches it. Reaching T8 is always an immediate full exit - the final tier, nothing further to ratchet to. No partial booking at any stage, just the floor moving forward. Simpler than strategy #11 on purpose: no order-modification, no captured-premium tracking - just a plain market exit the instant an outcome fires, live and paper independently (each tracks its own stage separately, so one side closing early never affects the other's checks). WARNING if live trading is on: no broker-side protection at all, for the ENTIRE life of this trade, not just pre-T1 - if this app goes down at any point, this position has nothing resting at the broker.",
 }
 
 
@@ -10426,6 +10511,30 @@ def _register_history_pages(app, g):
                 return m, path[m - 1], "RSI before T1"
         return n, path[n - 1], "end of path"
 
+    def sim_fib_close(direction, tiers, spot, t0, path, rsi_min):
+        """Same ratchet, but a fall back to the floor only exits if the 5-min candle
+        that just CLOSED (and ended after the floor was reached) closed at/through it."""
+        stage, reach, n = 0, None, len(path)
+        for m in range(1, n + 1):
+            cstart = t0 + timedelta(minutes=m - 1)
+            c = spot.get(cstart.strftime("%H:%M"))
+            if c:
+                fav = c[0] if direction == "Buy" else c[1]
+                new, out = fib_stage(direction, stage, tiers, fav)
+                if out == "target":
+                    return m, path[m - 1], f"T{new} target"
+                if new > stage:
+                    stage, reach = new, cstart
+            end = t0 + timedelta(minutes=m)
+            if stage >= 1 and end.minute % 5 == 0 and end > reach:
+                last = spot.get((end - timedelta(minutes=1)).strftime("%H:%M"))
+                floor = tiers[stage - 1]
+                if last and ((last[2] <= floor) if direction == "Buy" else (last[2] >= floor)):
+                    return m, path[m - 1], f"5m close through T{stage}"
+            if stage == 0 and rsi_min and m >= rsi_min:
+                return m, path[m - 1], "RSI before T1"
+        return n, path[n - 1], "end of path"
+
     def get_spot(symbol, day, token):
         k = (symbol, day)
         if k not in spot_cache:
@@ -10470,11 +10579,12 @@ def _register_history_pages(app, g):
                             else:
                                 tiers = fib_targets(t["direction"], max(c[0] for c in first), min(c[1] for c in first))
                                 m, px, how = sim_fib(t["direction"], tiers, spot, t0, path, row["rsi_simple_min"])
+                                m5, px5, how5 = sim_fib_close(t["direction"], tiers, spot, t0, path, row["rsi_simple_min"])
                                 vmap = {int(a): (b, c) for a, b, c in json.loads(row["vol_path"] or "[]")}
                                 r = sim(spec_rsi, path, row["p0"], vmap, row["vol_ratio"], row["rsi_simple_min"], row["rsi_mom_min"])
                                 qty = t.get("original_quantity") or t.get("quantity") or 1
                                 rows.append({"id": t["id"], "sym": t["symbol"], "day": day, "a": round(t.get("pnl") or 0),
-                                             "f": round(qty * (px - row["p0"])), "r": round(qty * (r[1] - row["p0"])) if r else None,
+                                             "f": round(qty * (px - row["p0"])), "f5": round(qty * (px5 - row["p0"])), "how5": how5, "r": round(qty * (r[1] - row["p0"])) if r else None,
                                              "how": how})
                     except Exception as e:
                         why = "error: " + str(e)[:60]
@@ -10504,35 +10614,35 @@ def _register_history_pages(app, g):
         if state["error"]:
             return head + f"<h3>Failed</h3><p>{state['error']}</p><p>(Is the Upstox token still valid?)</p><a href='?restart=1'>Try again</a>"
         res = state["result"]
-        days = {}
-        how = {}
+        days, how, how5 = {}, {}, {}
+        lab = lambda t: t.split(" ")[0] if t.startswith("T") else t
         for r in res["rows"]:
-            d = days.setdefault(r["day"], [0, 0, 0, 0])
-            d[0] += 1; d[1] += r["a"]; d[2] += r["r"] or 0; d[3] += r["f"]
-            how[r["how"].split(" ")[0] if r["how"].startswith("T") else r["how"]] = how.get(r["how"].split(" ")[0] if r["how"].startswith("T") else r["how"], 0) + 1
+            d = days.setdefault(r["day"], [0, 0, 0, 0, 0])
+            d[0] += 1; d[1] += r["a"]; d[2] += r["r"] or 0; d[3] += r["f"]; d[4] += r["f5"]
+            how[lab(r["how"])] = how.get(lab(r["how"]), 0) + 1
+            how5[lab(r["how5"])] = how5.get(lab(r["how5"]), 0) + 1
         f = lambda v: f"{v:+,}"
         c = lambda v: "var(--green)" if v > 0 else "var(--red)" if v < 0 else "var(--muted)"
+        cell = lambda v, b=False: f"<td align=right style='color:{c(v)}'>" + (f"<b>{f(v)}</b>" if b else f(v))
         h = [head, "<h3>1st 5 Min FIB exit vs actual (date-wise)</h3>",
-             "<table><tr><th align=left>Date<th>Trades<th>Actual<th>RSI Simple<th>FIB<th>FIB-Actual"]
+             "<table><tr><th align=left>Date<th>Trades<th>Actual<th>RSI Simple<th>FIB touch (old)<th>FIB 5m close (new)<th>New - old"]
         for k in sorted(days):
-            n, a, s, fb = days[k]
-            h.append(f"<tr><td>{k[8:]}/{k[5:7]}<td align=right>{n}"
-                     f"<td align=right style='color:{c(a)}'>{f(a)}<td align=right style='color:{c(s)}'>{f(s)}"
-                     f"<td align=right style='color:{c(fb)}'><b>{f(fb)}</b><td align=right style='color:{c(fb - a)}'>{f(fb - a)}")
-        tn = sum(v[0] for v in days.values()); ta = sum(v[1] for v in days.values())
-        ts = sum(v[2] for v in days.values()); tf = sum(v[3] for v in days.values())
-        h.append(f"<tr style='border-top:2px solid var(--muted)'><td><b>TOTAL</b><td align=right>{tn}"
-                 f"<td align=right style='color:{c(ta)}'><b>{f(ta)}</b><td align=right style='color:{c(ts)}'><b>{f(ts)}</b>"
-                 f"<td align=right style='color:{c(tf)}'><b>{f(tf)}</b><td align=right style='color:{c(tf - ta)}'><b>{f(tf - ta)}</b></table>")
-        wins = sum(1 for r in res["rows"] if r["f"] > 0)
-        h.append(f"<p>FIB winners: {wins} of {tn}. How FIB exited: " + ", ".join(f"{k}: {v}" for k, v in sorted(how.items())) + ".</p>")
+            n, a, s_, fb, f5 = days[k]
+            h.append(f"<tr><td>{k[8:]}/{k[5:7]}<td align=right>{n}" + cell(a) + cell(s_) + cell(fb) + cell(f5, True) + cell(f5 - fb))
+        tn = sum(v[0] for v in days.values()); ta = sum(v[1] for v in days.values()); ts = sum(v[2] for v in days.values())
+        tf = sum(v[3] for v in days.values()); t5 = sum(v[4] for v in days.values())
+        h.append(f"<tr style='border-top:2px solid var(--muted)'><td><b>TOTAL</b><td align=right>{tn}" + cell(ta, True) + cell(ts, True) + cell(tf, True) + cell(t5, True) + cell(t5 - tf, True) + "</table>")
+        w, w5 = sum(1 for r in res["rows"] if r["f"] > 0), sum(1 for r in res["rows"] if r["f5"] > 0)
+        better = sum(1 for r in res["rows"] if r["f5"] > r["f"]); worse = sum(1 for r in res["rows"] if r["f5"] < r["f"])
+        h.append(f"<p>Winners: touch {w} of {tn}, 5m close {w5} of {tn}. Waiting for the 5m close was better on {better} trades, worse on {worse}, same on {tn - better - worse}.</p>")
+        h.append("<p class=mut>How it exited - touch: " + ", ".join(f"{k}: {v}" for k, v in sorted(how.items())) + ". 5m close: " + ", ".join(f"{k}: {v}" for k, v in sorted(how5.items())) + ".</p>")
         h.append(f"<p class=mut>Gross, before costs. Not replayable: {res['skipped']} "
-                 f"({', '.join(f'{v} {k}' for k, v in res['reasons'].items()) or 'none'}). Uses 1-minute stock candles: in each minute the best price is "
-                 "checked first, then the worst, so results are an approximation of the live 5-second checks. "
+                 f"({', '.join(f'{v} {k}' for k, v in res['reasons'].items()) or 'none'}). Uses 1-minute stock candles: for the touch rule the best price of each minute "
+                 "is checked first, then the worst, so it is an approximation of the live 5-second checks; the 5m-close rule uses the close of each 5-minute candle. "
                  "<a href='?restart=1'>Recalculate</a></p>")
         if request.args.get("trades") == "1":
-            h.append("<table><tr><th>#<th>Stock<th>Date<th>Actual<th>FIB<th>Exit")
-            h += [f"<tr><td>{r['id']}<td>{r['sym']}<td>{r['day'][8:]}/{r['day'][5:7]}<td align=right>{f(r['a'])}<td align=right>{f(r['f'])}<td>{r['how']}" for r in res["rows"]]
+            h.append("<table><tr><th>#<th>Stock<th>Date<th>Actual<th>FIB touch<th>Exit<th>FIB 5m close<th>Exit")
+            h += [f"<tr><td>{r['id']}<td>{r['sym']}<td>{r['day'][8:]}/{r['day'][5:7]}<td align=right>{f(r['a'])}<td align=right>{f(r['f'])}<td>{r['how']}<td align=right>{f(r['f5'])}<td>{r['how5']}" for r in res["rows"]]
             h.append("</table>")
         return "".join(h)
 
