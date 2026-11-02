@@ -107,14 +107,14 @@ def _access_guard():
         if not WEBHOOK_SECRET:
             return None
         key = request.args.get("key", "")
-        if not hmac.compare_digest(key, WEBHOOK_SECRET):
+        if not hmac.compare_digest(key.encode("utf-8"), WEBHOOK_SECRET.encode("utf-8")):
             return jsonify({"status": "forbidden"}), 403
         return None
     if not APP_PASS:
         return None
     auth = request.authorization
-    if (auth and hmac.compare_digest(auth.username or "", APP_USER)
-            and hmac.compare_digest(auth.password or "", APP_PASS)):
+    if (auth and hmac.compare_digest((auth.username or "").encode("utf-8"), APP_USER.encode("utf-8"))
+            and hmac.compare_digest((auth.password or "").encode("utf-8"), APP_PASS.encode("utf-8"))):
         return None
     return make_response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="RTT"'})
 
@@ -3461,13 +3461,18 @@ def _attach_volume_readings(items: list[dict], access_token: str | None, is_toda
             a["volume"] = _volume_for_alert(a.get("symbol"), a["category"])
 
 
-def _volume_rank(a: dict) -> int:
+def _volume_rank(a: dict) -> tuple:
     """Dashboard sort key: Strong first, then Moderate, then alerts with no
-    reading yet, and known-Weak last. Python's sort is stable, so within a
-    rank the existing newest-first order is kept."""
-    v = a.get("volume")
-    label = v.get("label") if v else None
-    return {"Strong": 0, "Moderate": 1, "Weak": 3}.get(label, 2)
+    reading yet, and known-Weak last. Within the same label the HIGHER volume
+    ratio comes first. Python's sort is stable, so equal ratios keep the
+    existing newest-first order."""
+    v = a.get("volume") or {}
+    rank = {"Strong": 0, "Moderate": 1, "Weak": 3}.get(v.get("label"), 2)
+    try:
+        ratio = float(v.get("ratio") or 0)
+    except (TypeError, ValueError):
+        ratio = 0.0
+    return (rank, -ratio)
 
 
 def _attach_volume_to_trades(trades: list[dict]) -> None:
@@ -10059,6 +10064,18 @@ def paper_trading_reset():
 
 @app.route("/api/paper-trading/manual-exit/<int:trade_id>", methods=["POST"])
 def paper_trading_manual_exit(trade_id):
+    # Same lock the 5s exit loop holds: without it a manual click and an
+    # automatic exit could close the same trade at the same moment (double
+    # P&L write, and two competing live SELL attempts).
+    if not _exit_check_lock.acquire(timeout=20):
+        return jsonify({"status": "error", "message": "An exit check is still running - try again in a few seconds"}), 409
+    try:
+        return _paper_trading_manual_exit_impl(trade_id)
+    finally:
+        _exit_check_lock.release()
+
+
+def _paper_trading_manual_exit_impl(trade_id):
     """Manually closes a trade right now, at the freshest price we can get -
     since the exit rules don't cover every situation you might want to
     exit on (e.g. hitting a target %, end of day, news, etc.). Handles two
@@ -10151,7 +10168,14 @@ def paper_trading_manual_exit(trade_id):
             )
             conn.commit()
         _log_exit_volume_async(trade_id, trade["symbol"], trade["direction"], now)
-        return jsonify({"status": "ok", "exit_price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct})
+        resp = {"status": "ok", "exit_price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct}
+        if trade["live_status"] == "OPEN" and live_exit_order_id is None:
+            # Paper leg is closed but the real SELL was NOT confirmed - the
+            # live position may still be open at the broker. Never say plain "ok".
+            resp["status"] = "warning"
+            resp["message"] = ("Paper trade closed, but the LIVE position was NOT confirmed closed: "
+                               f"{live_exit_error or 'no confirmation from Upstox'}. Check Upstox now.")
+        return jsonify(resp)
     else:
         # Paper already closed via its own rule - this manual exit only
         # closes the still-running live leg, leaving the paper trade's
@@ -10163,14 +10187,20 @@ def paper_trading_manual_exit(trade_id):
                 SET live_exit_order_id = COALESCE(?, live_exit_order_id),
                     live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
                     live_error = COALESCE(?, live_error),
-                    live_exit_reason = 'Manual exit',
-                    live_exit_price = COALESCE(?, live_exit_price),
-                    live_exit_time = ?
+                    live_exit_reason = CASE WHEN ? THEN 'Manual exit' ELSE live_exit_reason END,
+                    live_exit_price = CASE WHEN ? THEN COALESCE(?, live_exit_price) ELSE live_exit_price END,
+                    live_exit_time = CASE WHEN ? THEN ? ELSE live_exit_time END
                 WHERE id = ?
                 """,
-                (live_exit_order_id, live_exit_order_id is not None, live_exit_error, live_fill_price, now, trade_id),
+                (live_exit_order_id, live_exit_order_id is not None, live_exit_error,
+                 live_exit_order_id is not None,
+                 live_exit_order_id is not None, live_fill_price,
+                 live_exit_order_id is not None, now, trade_id),
             )
             conn.commit()
+        if live_exit_order_id is None:
+            return jsonify({"status": "error",
+                            "message": f"Live position NOT confirmed closed: {live_exit_error or 'no confirmation from Upstox'}. Check Upstox."}), 502
         return jsonify({"status": "ok", "exit_price": exit_price, "note": "Closed the live leg only (paper side had already closed)"})
 
 
