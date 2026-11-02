@@ -784,6 +784,9 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_planned_risk_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_volume_label TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_volume_ratio DOUBLE PRECISION",
+            # First-candle (09:15) volume snapshot, logged on every trade at entry.
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_fc_ratio DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_fc_dir_share DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_volume_label TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_volume_ratio DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS lab_state TEXT",
@@ -1435,6 +1438,25 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     if get_sector_filter_enabled() and not sector_qualifies(symbol, category, access_token):
         return False, f"Sector filter is on and {symbol}'s sector doesn't currently qualify for a {category} entry"
 
+    # Optional first-candle (09:15) volume gate + exit routing. Both are OFF
+    # by default. The 09:15 reading is fetched only when one of them is on
+    # (it is also cached for the day, so the per-trade log reuses it). An
+    # unexpected error here never blocks a trade - it is logged and the
+    # entry carries on exactly as it did before this feature existed.
+    fc_info = None
+    fc_cfg = None
+    try:
+        fc_cfg = fcv_settings()
+        if fc_cfg["gate_enabled"] or fc_cfg["route_enabled"]:
+            fc_info = get_first_candle_info(symbol, access_token)
+        if fc_cfg["gate_enabled"]:
+            _fc_ok, _fc_why = fcv_gate_decision(fc_info, category, fc_cfg)
+            _fcv_log_decision(symbol, category, "ALLOWED" if _fc_ok else "SKIPPED", _fc_why)
+            if not _fc_ok:
+                return False, _fc_why
+    except Exception as e:
+        _fcv_log_decision(symbol, category, "error", f"{type(e).__name__}: {e}"[:140])
+
     option = get_atm_option(symbol, opt_type, price_val) if access_token else None
     premium = get_ltp_with_retry(option["instrument_key"], access_token) if option else None
 
@@ -1475,7 +1497,23 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     now = datetime.utcnow().isoformat()
     entry_strategy = get_exit_strategy()
     auto_info, auto_paper_only = None, False
-    if entry_strategy == "AUTO_VOL":
+    # Exit routing by 9:15 volume band (optional): if the stock's band has a
+    # strategy assigned, that strategy runs this trade - it wins over the
+    # default AND over Auto. A band left on "default" changes nothing.
+    fcv_route_info = None
+    try:
+        if fc_cfg and fc_cfg["route_enabled"] and fc_info and fc_info.get("status") == "ok":
+            _rb = fcv_band_index(fc_info["ratio"])
+            _routed = fc_cfg["route"].get(_rb) or ""
+            if _routed:
+                entry_strategy = _routed
+                fcv_route_info = {"ratio": fc_info["ratio"], "band": _FCV_BANDS[_rb][0], "strategy": _routed}
+                _fcv_log_decision(symbol, category, "ROUTED",
+                                  f"9:15 volume {fc_info['ratio']}x ({_FCV_BANDS[_rb][0]}) -> {_FCV_STRATEGY_LABELS.get(_routed, _routed)}")
+    except Exception as e:
+        fcv_route_info = None
+        _fcv_log_decision(symbol, category, "error", f"routing: {type(e).__name__}"[:140])
+    if fcv_route_info is None and entry_strategy == "AUTO_VOL":
         entry_strategy, auto_info = _auto_resolve_entry(symbol, category)
         auto_paper_only = get_setting("auto_vol_live_ok", "false") != "true"
 
@@ -1573,6 +1611,11 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
         with get_db() as conn:
             conn.execute("UPDATE paper_trades SET lab_state = ? WHERE id = ?",
                          (json.dumps({"auto": auto_info}, separators=(",", ":")), row["id"]))
+            conn.commit()
+    if fcv_route_info:
+        with get_db() as conn:
+            conn.execute("UPDATE paper_trades SET lab_state = ? WHERE id = ?",
+                         (json.dumps({"fcv": fcv_route_info}, separators=(",", ":")), row["id"]))
             conn.commit()
 
     if access_token:
@@ -1864,6 +1907,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # LAST thing this function does and on its own thread - after the live
     # order has already gone out - so it can never add delay to an order.
     _log_entry_volume_async(row["id"], symbol, category, now)
+    threading.Thread(target=_log_entry_first_candle, args=(row["id"], symbol, category), daemon=True).start()
     return True, None
 
 
@@ -3719,6 +3763,213 @@ def _volume_gated_entry(symbol: str, category: str, price_val: float,
             _log_volume_entry_decision(sym, category, "skipped", f"Strong {ratio}x but {reason or 'entry was skipped'}")
     except Exception as e:
         _log_volume_entry_decision(sym, category, "error", str(e)[:120])
+
+
+# ---------------------------------------------------------------------------
+# First-candle (09:15) volume: per-trade log, optional entry gate, optional
+# exit routing. Everything here is OFF by default. "Ratio" = the 09:15 5-min
+# candle's volume divided by its average over the previous 10 sessions - the
+# same number the /first-candle page ranks stocks by.
+# ---------------------------------------------------------------------------
+_FCV_BANDS = (
+    ("Under 1.5x", 0.0, 1.5),
+    ("1.5x to 3x", 1.5, 3.0),
+    ("3x to 5x", 3.0, 5.0),
+    ("5x and above", 5.0, float("inf")),
+)
+_FCV_LOG_MAX = 60
+_fcv_log: list[dict] = []        # recent gate / routing decisions (memory only; resets on restart)
+_fcv_cache: dict = {}            # (SYMBOL, ist_date) -> a finished, successful 09:15 reading
+_FCV_KEYS = ("fcv_gate_enabled", "fcv_gate_bands", "fcv_dir_enabled", "fcv_dir_min_pct",
+             "fcv_allow_unknown", "fcv_route_enabled",
+             "fcv_route_0", "fcv_route_1", "fcv_route_2", "fcv_route_3")
+_FCV_STRATEGY_LABELS = {
+    "HALF_HALF_HARD4": "2) -2% SL, 2% half book, 4% full exit",
+    "TRAIL_FROM_2": "3) -2% SL, trail 100% qty from 2%",
+    "FULL_AT_2": "4) -2% SL, full exit at 2%",
+    "FULL_AT_4": "5) -2% SL, full exit at 4%",
+    "ATR_TRAIL": "6) ATR stop until +2%, then trail",
+    "EMA_SPOT_TRAIL": "7) 5-EMA (spot) trail, -2% floor",
+    "EMA_SPOT_PURE": "8) Pure 5-EMA (spot) trail, no floor",
+    "JOAT_HYBRID": "9) JOAT Hybrid",
+    "JOAT_TEST_B": "Test-B: spot ATR -> 5-EMA trail",
+    "JOAT_TEST_C": "Test-C: spot ATR (own period) -> 5-EMA trail",
+    "RSI_MOMENTUM": "10) RSI Momentum Exit",
+    "CAMARILLA_LADDER": "11) Camarilla Ladder Exit",
+    "RSI_SIMPLE": "12) RSI Simple Exit",
+    "FIRST5MIN_FIB": "13) 1st 5 Min FIB levels",
+}
+
+
+def fcv_band_index(ratio) -> int | None:
+    """0 = under 1.5x, 1 = 1.5-3x, 2 = 3-5x, 3 = 5x and above (same cut-offs as the /first-candle benchmark)."""
+    if ratio is None:
+        return None
+    for i, (_name, _lo, hi) in enumerate(_FCV_BANDS):
+        if ratio < hi:
+            return i
+    return len(_FCV_BANDS) - 1
+
+
+def fcv_settings() -> dict:
+    """All first-candle-volume settings in ONE query (the entry path calls this on every alert)."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT key, value FROM settings WHERE key IN (%s)" % ",".join(["?"] * len(_FCV_KEYS)),
+            tuple(_FCV_KEYS),
+        ).fetchall()
+    vals = {r["key"]: r["value"] for r in rows}
+
+    def flag(k: str) -> bool:
+        return vals.get(k, "false") == "true"
+
+    bands: set[int] = set()
+    for part in str(vals.get("fcv_gate_bands", "2,3") or "").split(","):
+        part = part.strip()
+        if part.isdigit() and int(part) < len(_FCV_BANDS):
+            bands.add(int(part))
+    try:
+        min_pct = float(vals.get("fcv_dir_min_pct", "55"))
+    except (TypeError, ValueError):
+        min_pct = 55.0
+    min_pct = min(max(min_pct, 50.0), 100.0)
+    route = {}
+    for i in range(len(_FCV_BANDS)):
+        v = vals.get(f"fcv_route_{i}", "") or ""
+        route[i] = v if v in VALID_STRATEGIES else ""
+    return {
+        "gate_enabled": flag("fcv_gate_enabled"), "bands": sorted(bands),
+        "dir_enabled": flag("fcv_dir_enabled"), "dir_min_pct": min_pct,
+        "allow_unknown": flag("fcv_allow_unknown"),
+        "route_enabled": flag("fcv_route_enabled"), "route": route,
+    }
+
+
+def _fcv_log_decision(symbol: str, category: str, outcome: str, detail: str = "") -> None:
+    _fcv_log.append({
+        "at": (datetime.utcnow() + IST_OFFSET).strftime("%H:%M:%S"),
+        "symbol": (symbol or "").strip().upper(), "category": category, "outcome": outcome, "detail": detail,
+    })
+    del _fcv_log[:-_FCV_LOG_MAX]
+
+
+def get_first_candle_info(symbol: str, access_token: str | None) -> dict:
+    """Today's 09:15 candle for one stock: volume ratio vs its own previous
+    sessions, and how its volume splits buy/sell by where the candle closed in
+    its range (an estimate from candle structure, same method as the rest of
+    the volume tools). Returns {"status": "ok", "ratio", "buy_share",
+    "sell_share", "buy_ratio", "sell_ratio"}, or {"status": <reason>} when it
+    can't be known yet (before the 09:15 candle has closed and been published,
+    no history, API error). Only successful readings are cached - the 09:15
+    candle never changes once closed."""
+    sym = (symbol or "").strip().upper()
+    now_ist = datetime.utcnow() + IST_OFFSET
+    today = now_ist.strftime("%Y-%m-%d")
+    hit = _fcv_cache.get((sym, today))
+    if hit is not None:
+        return hit
+    if not access_token:
+        return {"status": "no_token"}
+    if now_ist.hour * 60 + now_ist.minute < 9 * 60 + 20:
+        return {"status": "candle_not_closed"}
+    key = get_instrument_key(sym)
+    if not key:
+        return {"status": "no_instrument"}
+    try:
+        base = (_get_volume_history(key, access_token) or {}).get("09:15")
+        if not base or base["n"] < _VOL_MIN_HISTORY_SESSIONS or base["vol"] <= 0:
+            return {"status": "no_baseline"}
+        raw = _vol_fetch_candles(
+            f"https://api.upstox.com/v3/historical-candle/intraday/{urllib.parse.quote(key, safe='|')}/minutes/5",
+            access_token)
+    except Exception as e:
+        return {"status": "error", "reason": type(e).__name__}
+    first = next((c for c in raw if c[0][:10] == today and c[0][11:16] == "09:15"), None)
+    vol = float(first[5] or 0) if first else 0.0
+    if first is None or vol <= 0:
+        return {"status": "no_first_candle"}   # Upstox publishes a minute or two late - retried on the next alert
+    buy, sell = _directional_pressure(first[2], first[3], first[4], first[5])
+    info = {
+        "status": "ok", "ratio": round(vol / base["vol"], 2),
+        "buy_share": round(buy / vol * 100.0, 1), "sell_share": round(sell / vol * 100.0, 1),
+        "buy_ratio": round(buy / base["buy"], 2) if base.get("buy", 0) > 0 else None,
+        "sell_ratio": round(sell / base["sell"], 2) if base.get("sell", 0) > 0 else None,
+    }
+    if len(_fcv_cache) > 600:
+        _fcv_cache.clear()
+    _fcv_cache[(sym, today)] = info
+    return info
+
+
+def fcv_gate_decision(info: dict | None, category: str, cfg: dict) -> tuple[bool, str]:
+    """(allowed, reason) for one alert under the current gate settings."""
+    if not info or info.get("status") != "ok":
+        why = (info or {}).get("status", "unavailable")
+        if cfg["allow_unknown"]:
+            return True, f"9:15 volume not available ({why}) - allowed because 'allow when unavailable' is on"
+        return False, f"First-candle volume gate: 9:15 volume not available yet ({why}) - entry skipped"
+    ratio = info["ratio"]
+    band = fcv_band_index(ratio)
+    if band not in cfg["bands"]:
+        return False, (f"First-candle volume gate: 9:15 volume {ratio}x ({_FCV_BANDS[band][0]}) "
+                       f"is not in the allowed bands - entry skipped")
+    if cfg["dir_enabled"]:
+        share = info.get("buy_share") if category == "Buy" else info.get("sell_share")
+        if share is None or share < cfg["dir_min_pct"]:
+            word = "buying" if category == "Buy" else "selling"
+            return False, (f"First-candle volume gate: 9:15 candle was only {share}% {word} "
+                           f"(needs at least {cfg['dir_min_pct']:g}%) - entry skipped")
+    return True, f"9:15 volume {ratio}x ({_FCV_BANDS[band][0]}) passed"
+
+
+def _log_entry_first_candle(trade_id: int, symbol: str, category: str) -> None:
+    """Writes the 9:15 reading onto the trade row so results can later be sliced by volume band.
+    Own thread, best-effort: entries made before the 09:15 candle has closed simply stay empty."""
+    try:
+        if category not in ("Buy", "Sell"):
+            return
+        token = get_setting("upstox_access_token")
+        if not token:
+            return
+        info = get_first_candle_info(symbol, token)
+        if not info or info.get("status") != "ok":
+            return
+        share = info["buy_share"] if category == "Buy" else info["sell_share"]
+        with get_db() as conn:
+            conn.execute("UPDATE paper_trades SET entry_fc_ratio = ?, entry_fc_dir_share = ? WHERE id = ?",
+                         (info["ratio"], share, trade_id))
+            conn.commit()
+    except Exception:
+        pass
+
+
+@app.route("/api/first-candle-gate", methods=["GET", "POST"])
+def api_first_candle_gate():
+    """GET returns the settings + recent decisions. POST updates whichever fields are sent."""
+    try:
+        if request.method == "POST":
+            d = request.get_json(silent=True) or {}
+            for src, dst in (("gate_enabled", "fcv_gate_enabled"), ("dir_enabled", "fcv_dir_enabled"),
+                             ("allow_unknown", "fcv_allow_unknown"), ("route_enabled", "fcv_route_enabled")):
+                if src in d:
+                    set_setting(dst, "true" if d[src] else "false")
+            if "bands" in d:
+                ok_bands = sorted({int(b) for b in (d["bands"] or []) if str(b).isdigit() and int(b) < len(_FCV_BANDS)})
+                set_setting("fcv_gate_bands", ",".join(str(b) for b in ok_bands))
+            if "dir_min_pct" in d:
+                try:
+                    set_setting("fcv_dir_min_pct", str(min(max(float(d["dir_min_pct"]), 50.0), 100.0)))
+                except (TypeError, ValueError):
+                    pass
+            if isinstance(d.get("route"), dict):
+                for i in range(len(_FCV_BANDS)):
+                    v = str(d["route"].get(str(i), d["route"].get(i, "")) or "")
+                    set_setting(f"fcv_route_{i}", v if v in VALID_STRATEGIES else "")
+        cfg = fcv_settings()
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"status": "error", "message": "database unavailable"}), 503
+    return jsonify({"status": "ok", **cfg, "route": {str(k): v for k, v in cfg["route"].items()},
+                    "band_names": [b[0] for b in _FCV_BANDS], "log": list(reversed(_fcv_log))})
 
 
 @app.route("/api/volume-entry/log")
@@ -7847,7 +8098,11 @@ def _first_candle_stats(symbol: str, date_str: str, hist: list, raw_day: list, d
         last_prev = sorted(sessions[base_days[0]], key=lambda c: c[0])[-1]
         prev_close = float(last_prev[4])
     hi_c = max(day_c, key=lambda c: float(c[2]))
+    after_c = day_c[1:]   # candles after the 9:15 one - what a trader entering later could still catch
+    up_after = _fc_pct(max(float(c[2]) for c in after_c), first[4]) if after_c else None
+    down_after = _fc_pct(min(float(c[3]) for c in after_c), first[4]) if after_c else None
     out["price"] = {
+        "best_up_after_first_pct": up_after, "best_down_after_first_pct": down_after,
         "prev_close": prev_close,
         "gap_open_pct": _fc_pct(first[1], prev_close),
         "first_candle_close_vs_prev_close_pct": _fc_pct(first[4], prev_close),
@@ -7962,6 +8217,12 @@ def _fc_table_row(r: dict) -> dict:
         "below_20d_high_pct": (r.get("context") or {}).get("prev_close_vs_high_20d_pct"),
         "day_high_vs_prev_close_pct": pr.get("day_high_vs_prev_close_pct"),
         "last_close_vs_prev_close_pct": pr.get("last_close_vs_prev_close_pct"),
+        "after_first_pct": pr.get("move_after_first_candle_to_last_pct"),
+        "after_first_up_pct": pr.get("best_up_after_first_pct"),
+        "after_first_down_pct": pr.get("best_down_after_first_pct"),
+        "buy_share_pct": vs.get("buy_share_of_candle_pct"),
+        "buy_pressure_ratio": vs.get("buy_pressure_ratio"),
+        "sell_pressure_ratio": vs.get("sell_pressure_ratio"),
     }
 
 
@@ -9424,7 +9685,7 @@ def _strategy_name(strategy_id: str) -> str:
     return rule["name"] if rule else (strategy_id or "")
 
 
-def _rule_note(t: dict) -> str:
+def _rule_note_core(t: dict) -> str:
     """One line for a trade row: which exit rule it runs and, for Auto trades, why."""
     strat = t.get("strategy") or ""
     try:
@@ -9438,6 +9699,25 @@ def _rule_note(t: dict) -> str:
             return f"Auto picked: {name} ({auto.get('level')}, {auto.get('n')} alerts)"
         return f"Auto: no proven rule ({auto.get('why') or 'n/a'}) - used default: {name}"
     return f"Exit rule: {name}" if name else ""
+
+
+def _rule_note(t: dict) -> str:
+    """Exit-rule note plus, when known, how the 9:15 volume looked at entry (and
+    whether it picked the exit rule). Shown as the small line under the symbol."""
+    parts = [_rule_note_core(t)]
+    try:
+        st = json.loads(t.get("lab_state") or "{}")
+    except Exception:
+        st = {}
+    fcv = st.get("fcv") if isinstance(st, dict) else None
+    if fcv:
+        parts.append(f"Routed by 9:15 volume {fcv.get('ratio')}x ({fcv.get('band')})")
+    if t.get("entry_fc_ratio") is not None:
+        txt = f"9:15 vol {t['entry_fc_ratio']}x"
+        if t.get("entry_fc_dir_share") is not None:
+            txt += f", {t['entry_fc_dir_share']}% {'buying' if t.get('direction') == 'Buy' else 'selling'}"
+        parts.append(txt)
+    return " | ".join(p for p in parts if p)
 
 
 def _attach_rule_notes(trades: list) -> None:
@@ -9803,6 +10083,10 @@ def settings_page():
         auto_exit_time=get_auto_exit_time() or "",
         volume_entry_enabled=get_volume_entry_enabled(),
         volume_exit_enabled=get_volume_exit_enabled(),
+        fcv=fcv_settings(),
+        fcv_route_list=[fcv_settings()["route"][i] for i in range(len(_FCV_BANDS))],
+        fcv_band_names=[b[0] for b in _FCV_BANDS],
+        fcv_strategy_options=[(sid, _FCV_STRATEGY_LABELS.get(sid, sid)) for sid in VALID_STRATEGIES],
         theta_switch_enabled=get_theta_switch_enabled(),
         live_entry_mode=get_live_entry_mode(),
         gtt_trailing_gap_mode=get_gtt_trailing_gap_mode(),
