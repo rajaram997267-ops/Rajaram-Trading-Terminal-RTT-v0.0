@@ -619,6 +619,16 @@ def init_db():
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS alert_decisions (
+                id SERIAL PRIMARY KEY,
+                created_at TEXT, ist_date TEXT, symbol TEXT, category TEXT,
+                decision TEXT, reason TEXT, price DOUBLE PRECISION
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_decisions_date ON alert_decisions (ist_date)")
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS rsi_shadow (
                 trade_id INTEGER PRIMARY KEY,
                 trade_date TEXT, symbol TEXT, direction TEXT,
@@ -1344,20 +1354,24 @@ def create_paper_trades_for_batch(data: dict) -> None:
     # dashboard (saved separately in the webhook handler) - only trade
     # creation is skipped here.
     if category == "Buy" and not get_buy_alerts_enabled():
+        _record_batch_skip(data, category, "Buy alerts are switched off in Settings")
         return
     if category == "Sell" and not get_sell_alerts_enabled():
+        _record_batch_skip(data, category, "Sell alerts are switched off in Settings")
         return
 
     # Entry-time filter - lets the user skip the noisier opening minutes
     # entirely and only let the system open trades from a chosen clock
     # time onward (e.g. 09:45). Off by default (no filter).
     if not is_after_entry_time_filter():
+        _record_batch_skip(data, category, "Before the entry-time filter in Settings")
         return
 
     # Latest-entry / auto-exit clock guard (both off unless set in
     # Settings): no new trades once the cutoff passes, nor once the
     # auto-exit time has - see new_entry_blocked_by_clock.
     if new_entry_blocked_by_clock():
+        _record_batch_skip(data, category, "Past the latest-entry / auto-exit time")
         return
 
     with get_db() as conn:
@@ -1365,6 +1379,7 @@ def create_paper_trades_for_batch(data: dict) -> None:
             "SELECT id FROM paper_trades WHERE status = 'OPEN' LIMIT 1"
         ).fetchone()
     if already_open:
+        _record_batch_skip(data, category, "A trade is already open")
         return  # a trade is already running - wait for it to exit first
 
     stocks = [s.strip() for s in str(data.get("stocks", "")).split(",") if s.strip()]
@@ -1387,7 +1402,13 @@ def create_paper_trades_for_batch(data: dict) -> None:
             symbol, price_val = s, candidate
             break
     if symbol is None:
+        _record_batch_skip(data, category, "No usable trigger price in the alert")
         return
+
+    for _other, _other_price in _batch_symbols(data):
+        if _other != symbol:
+            _record_alert_decision(_other, category, "SKIPPED",
+                                   "Not tried: only the first valid stock of an alert is traded", _other_price)
 
     if get_volume_entry_enabled():
         # Volume-rule entry: judge this alert on its own thread (webhook
@@ -3679,6 +3700,97 @@ def _log_volume_entry_decision(symbol: str, category: str, outcome: str, detail:
         "symbol": symbol, "category": category, "outcome": outcome, "detail": detail,
     })
     del _volume_entry_log[:-_VOLUME_ENTRY_LOG_MAX]
+    if outcome in ("skipped", "error"):
+        _record_alert_decision(symbol, category, "SKIPPED" if outcome == "skipped" else "ERROR",
+                               f"Volume entry rule: {detail}")
+
+
+# ---------------------------------------------------------------------------
+# Permanent record of what happened to EVERY alerted stock (traded, or skipped
+# and why). Best-effort: a failure here is swallowed and can never touch the
+# entry path. Shown as the "Decision" column on the First Candle page.
+# ---------------------------------------------------------------------------
+def _record_alert_decision(symbol: str, category: str, decision: str, reason: str = "", price=None) -> None:
+    try:
+        sym = (symbol or "").strip().upper()
+        if not sym or sym == "UNKNOWN" or category not in ("Buy", "Sell"):
+            return
+        now_utc = datetime.utcnow()
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO alert_decisions (created_at, ist_date, symbol, category, decision, reason, price) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (now_utc.isoformat(), (now_utc + IST_OFFSET).strftime("%Y-%m-%d"), sym, category,
+                 decision, (reason or "")[:300], price),
+            )
+            conn.commit()
+    except Exception:
+        pass
+
+
+def _batch_symbols(data: dict) -> list:
+    """[(symbol, price or None), ...] for every stock in one Chartink alert payload."""
+    stocks = [x.strip() for x in str(data.get("stocks", "")).split(",") if x.strip()]
+    prices = [x.strip() for x in str(data.get("trigger_prices", "")).split(",") if x.strip()]
+    if not stocks:
+        stocks = [data.get("symbol", "UNKNOWN")]
+        prices = [str(data.get("price", ""))]
+    out = []
+    for i, sym in enumerate(stocks):
+        try:
+            price = float(prices[i]) if i < len(prices) else None
+        except (ValueError, TypeError):
+            price = None
+        out.append((sym, price))
+    return out
+
+
+def _record_batch_skip(data: dict, category: str, reason: str) -> None:
+    """Every stock of an alert that never reached the entry step, with the reason."""
+    for sym, price in _batch_symbols(data):
+        _record_alert_decision(sym, category, "SKIPPED", reason, price)
+
+
+def _decisions_by_symbol(date_str: str) -> dict:
+    """One decision per stock for the day: a trade beats everything; otherwise the
+    first real reason (gate / filter) beats the generic 'trade already open' or
+    'not tried' notes."""
+    try:
+        with get_db() as conn:
+            rs = conn.execute(
+                "SELECT symbol, decision, reason FROM alert_decisions WHERE ist_date = ? ORDER BY id",
+                (date_str,),
+            ).fetchall()
+    except Exception:
+        return {}
+
+    def rank(decision, reason):
+        if decision == "TRADED":
+            return 0
+        if (reason or "").startswith(("A trade is already open", "Not tried")):
+            return 2
+        return 1
+
+    best: dict = {}
+    for r in rs:
+        k = rank(r["decision"], r["reason"])
+        if r["symbol"] not in best or k < best[r["symbol"]][0]:
+            best[r["symbol"]] = (k, {"decision": r["decision"], "reason": r["reason"]})
+    return {sym: v[1] for sym, v in best.items()}
+
+
+@app.route("/api/alert-decisions")
+def api_alert_decisions():
+    """?date=YYYY-MM-DD (default today IST): every recorded decision, oldest first."""
+    date_str = request.args.get("date") or _ist_today_str()
+    try:
+        with get_db() as conn:
+            rs = conn.execute(
+                "SELECT created_at, symbol, category, decision, reason, price FROM alert_decisions "
+                "WHERE ist_date = ? ORDER BY id", (date_str,)).fetchall()
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    return jsonify({"date": date_str, "count": len(rs), "decisions": [dict(r) for r in rs]})
 
 
 def _open_trade_if_free(symbol: str, category: str, price_val: float,
@@ -3691,8 +3803,12 @@ def _open_trade_if_free(symbol: str, category: str, price_val: float,
                 "SELECT id FROM paper_trades WHERE status = 'OPEN' LIMIT 1"
             ).fetchone()
         if already_open:
+            _record_alert_decision(symbol, category, "SKIPPED", "A trade is already open", price_val)
             return False, "A trade is already open"
-        return open_trade_for_symbol(symbol, category, price_val, alert_name=alert_name, scan_name=scan_name)
+        created, why = open_trade_for_symbol(symbol, category, price_val, alert_name=alert_name, scan_name=scan_name)
+        _record_alert_decision(symbol, category, "TRADED" if created else "SKIPPED",
+                               "Trade opened" if created else (why or "Entry was skipped"), price_val)
+        return created, why
 
 
 def _log_volume_alert(sym: str, category: str, price_val: float, label, ratio, asof: str, decision: str) -> None:
@@ -8233,7 +8349,7 @@ def _fc_table_row(r: dict) -> dict:
 _fc_board_lock = threading.Lock()
 _fc_board: dict = {}              # date_str -> job state
 _FC_BOARD_TTL_SECONDS = 600       # reuse a finished board for 10 minutes
-_FC_BOARD_MAX_SYMBOLS = 60
+_FC_BOARD_MAX_SYMBOLS = 120
 
 
 def _fc_board_worker(date_str: str, token: str, symbols: list, cats: dict) -> None:
@@ -8291,7 +8407,7 @@ def api_first_candle_board():
                 old_dates = sorted(k for k, v in _fc_board.items() if v["state"] != "running" and k != date_str)
                 for k in old_dates[:len(_fc_board) - 29]:
                     _fc_board.pop(k, None)
-            st = {"state": "running", "started": now_m, "finished": None, "total": len(symbols),
+            st = {"state": "running", "started": now_m, "finished": None, "total": len(symbols), "alerted": len(cats),
                   "done": 0, "reports": [], "error": None}
             _fc_board[date_str] = st
             if not symbols:
@@ -8301,8 +8417,13 @@ def api_first_candle_board():
                 threading.Thread(target=_fc_board_worker, args=(date_str, token, symbols, cats), daemon=True).start()
     rows = [_fc_table_row(r) for r in list(st["reports"])]
     rows.sort(key=lambda r: r["first_candle_ratio"] or 0, reverse=True)
+    decisions = _decisions_by_symbol(date_str)   # read now, not cached with the board
+    for r in rows:
+        d = decisions.get(r["symbol"])
+        r["decision"] = d["decision"] if d else None
+        r["decision_reason"] = d["reason"] if d else None
     return jsonify({"date": date_str, "state": st["state"], "total": st["total"], "done": st["done"],
-                    "error": st["error"], "rows": rows})
+                    "total_alerted": st.get("alerted", st["total"]), "error": st["error"], "rows": rows})
 
 
 @app.route("/first-candle")
