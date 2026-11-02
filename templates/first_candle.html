@@ -66,6 +66,14 @@
     <button id="loadBtn">Load</button>
     <button id="refreshBtn">Re-run</button>
     <label>Highlight 9:15 ratio &ge; <input type="number" id="hotInput" value="3" min="0" step="0.5">&times;</label>
+    <label>Show
+      <select id="showSel">
+        <option value="all">All alerts</option>
+        <option value="traded">Traded</option>
+        <option value="skipped">Skipped</option>
+        <option value="norecord">No record</option>
+      </select>
+    </label>
   </div>
   <div id="status"></div>
 
@@ -95,6 +103,13 @@
     </label>
     <label><input type="checkbox" id="benchDirOnly"> only where the 9:15 candle agrees with the alert, at least
       <input type="number" id="benchDirMin" value="55" min="50" max="100" step="1">% buying (Buy) / selling (Sell)</label>
+    <label>Include
+      <select id="benchInclude">
+        <option value="all">all alerts</option>
+        <option value="traded">only alerts that became trades</option>
+        <option value="skipped">only skipped alerts</option>
+      </select>
+    </label>
     <button id="benchBtn">Build benchmark</button>
     <button id="benchStop">Stop</button>
   </div>
@@ -113,7 +128,7 @@
 
 <script>
   const COLS = [
-    ["symbol", "Symbol"], ["category", "Alert"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
+    ["symbol", "Symbol"], ["category", "Alert"], ["decision", "Decision"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
     ["pct_of_avg_day_volume", "9:15 % of day"], ["first_candle_body_pct", "9:15 body %"], ["gap_open_pct", "Gap %"],
     ["day_volume_ratio", "Day vol"], ["below_20d_high_pct", "Below 20d high %"],
     ["day_high_vs_prev_close_pct", "Day high %"], ["last_close_vs_prev_close_pct", "Last %"],
@@ -140,6 +155,12 @@
     if (v === null || v === undefined) return '<span class="mut">-</span>';
     if (k === "symbol") return esc(v);
     if (k === "category") return '<span class="tag ' + esc(v) + '">' + esc(v) + '</span>';
+    if (k === "decision") {
+      const why = r.decision_reason ? esc(r.decision_reason) : "";
+      if (v === "TRADED") return '<span class="tag Buy" title="' + why + '">Traded</span>';
+      const short = r.decision_reason ? esc(r.decision_reason.length > 46 ? r.decision_reason.slice(0, 46) + "..." : r.decision_reason) : "";
+      return '<span class="tag" title="' + why + '">' + (v === "ERROR" ? "Error" : "Skipped") + '</span> <span class="mut">' + short + '</span>';
+    }
     if (k === "beats_sessions") return esc(v);
     if (PCT.has(k)) return '<span class="' + (v > 0 ? "pos" : v < 0 ? "neg" : "") + '">' + (v > 0 ? "+" : "") + v + '%</span>';
     if (k === "first_candle_ratio" || k === "day_volume_ratio" || k === "dir_pressure_ratio") return v + "&times;";
@@ -157,7 +178,12 @@
       if (k === sortKey) sortDir = -sortDir; else { sortKey = k; sortDir = -1; }
       render();
     });
-    const sorted = rows.slice().sort((a, b) => {
+    const show = document.getElementById("showSel").value;
+    const shown = rows.filter(r => show === "all" ||
+      (show === "traded" && r.decision === "TRADED") ||
+      (show === "skipped" && r.decision && r.decision !== "TRADED") ||
+      (show === "norecord" && !r.decision));
+    const sorted = shown.slice().sort((a, b) => {
       const x = a[sortKey], y = b[sortKey];
       if (x === null || x === undefined) return 1;
       if (y === null || y === undefined) return -1;
@@ -189,7 +215,10 @@
       } else if (d.state === "error") {
         st.textContent = "Stopped early: " + (d.error || "error") + " (showing " + rows.length + " stocks)";
       } else {
-        st.textContent = rows.length ? (rows.length + " stocks for " + d.date) : "No Buy/Sell alerts found for " + d.date;
+        st.textContent = rows.length
+          ? (rows.length + " stocks for " + d.date + (d.total_alerted > rows.length ? " (" + (d.total_alerted - rows.length) + " more alerted stocks not shown - list capped)" : "") +
+             ". Decision is recorded from the day this feature went live; earlier days show '-'.")
+          : "No Buy/Sell alerts found for " + d.date;
       }
     } catch (e) {
       st.textContent = "Could not reach the server";
@@ -232,7 +261,9 @@
     const hitAt = parseFloat(document.getElementById("benchMove").value) || 3;
     const dirOnly = document.getElementById("benchDirOnly").checked;
     const dirMin = parseFloat(document.getElementById("benchDirMin").value) || 55;
+    const inc = document.getElementById("benchInclude").value;
     const usable = benchRows.filter(r => r.status === "ok" && r[key] !== null && r[key] !== undefined &&
+      (inc === "all" || (inc === "traded" && r.decision === "TRADED") || (inc === "skipped" && r.decision && r.decision !== "TRADED")) &&
       (!dirOnly || (r.dir_share_pct !== null && r.dir_share_pct !== undefined && r.dir_share_pct >= dirMin)));
     const all = stat(usable, hitAt);
     let html = "";
@@ -304,6 +335,8 @@
   document.getElementById("benchMove").oninput = renderBench;
   document.getElementById("benchMetric").onchange = renderBench;
   document.getElementById("benchDirOnly").onchange = renderBench;
+  document.getElementById("benchInclude").onchange = renderBench;
+  document.getElementById("showSel").onchange = render;
   document.getElementById("benchDirMin").oninput = renderBench;
 
   document.getElementById("loadBtn").onclick = () => load(false);
