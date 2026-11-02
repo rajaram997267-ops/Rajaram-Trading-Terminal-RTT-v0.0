@@ -3369,6 +3369,12 @@ def _build_volume_reading(symbol: str, access_token: str, as_of_ist: datetime | 
         }
     if out["buy"]["label"] is None and out["sell"]["label"] is None:
         out["status"] = "no_baseline"
+    # The 09:15 candle vs the same candle of earlier sessions (total volume).
+    first_c = next((c for st, c in closed if c[0][11:16] == "09:15"), None)
+    base_first = slots.get("09:15")
+    if (first_c is not None and base_first and base_first["n"] >= _VOL_MIN_HISTORY_SESSIONS
+            and base_first["vol"] > 0):
+        out["first_candle"] = {"ratio": round(float(first_c[5] or 0) / base_first["vol"], 2)}
     return out
 
 
@@ -3443,7 +3449,8 @@ def _volume_for_alert(symbol: str | None, category: str) -> dict | None:
     side = r.get("buy" if category == "Buy" else "sell")
     if not side or side.get("label") is None:
         return None
-    return {"label": side["label"], "ratio": side["ratio"], "prev_ratio": side["prev_ratio"], "asof": r["asof"]}
+    return {"label": side["label"], "ratio": side["ratio"], "prev_ratio": side["prev_ratio"], "asof": r["asof"],
+            "first_ratio": (r.get("first_candle") or {}).get("ratio")}
 
 
 def _attach_volume_readings(items: list[dict], access_token: str | None, is_today: bool) -> None:
@@ -7717,6 +7724,325 @@ def api_volume_backfill():
     except (psycopg2.Error, RuntimeError):
         return jsonify({"error": "database unavailable"}), 503
     return jsonify({"results": results})
+
+
+# =============================================================================
+# First-5-min-candle volume report. READ-ONLY: never opens/closes a trade and
+# writes nothing. For one stock and one IST day it measures the 09:15 candle's
+# volume against the same 09:15 candle of the previous sessions, so a "big
+# opening volume" can be given a number (ratio, rank, share of a normal day's
+# volume) and later compared across many stocks / days.
+# =============================================================================
+def _fc_median(vals: list) -> float:
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def _fc_pct(a, b):
+    """(a - b) / b * 100, or None when b is missing/zero."""
+    try:
+        if not b:
+            return None
+        return round((float(a) - float(b)) / float(b) * 100.0, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_candle_stats(symbol: str, date_str: str, hist: list, raw_day: list, daily: list | None = None) -> dict:
+    """Pure calculation (no network). `hist` = 5-min candles of earlier
+    sessions, `raw_day` = 5-min candles of date_str, both in Upstox format
+    [timestamp, open, high, low, close, volume, oi]. `daily` (optional) =
+    daily candles of earlier sessions, used for the 20/60-day high."""
+    cont_end = _VOL_CONTINUOUS_END_MINUTES
+
+    def continuous(c):
+        h, m = int(c[0][11:13]), int(c[0][14:16])
+        return h * 60 + m < cont_end
+
+    sessions: dict[str, list] = {}
+    for c in hist:
+        d = c[0][:10]
+        if d < date_str and continuous(c):
+            sessions.setdefault(d, []).append(c)
+    base_days = sorted(sessions, reverse=True)[:_VOL_HISTORY_SESSIONS]
+
+    day_c = sorted((c for c in raw_day if c[0][:10] == date_str and continuous(c)), key=lambda c: c[0])
+    first = next((c for c in day_c if c[0][11:16] == "09:15"), None)
+    if first is None:
+        return {"symbol": symbol, "date": date_str, "status": "no_first_candle"}
+
+    last_slot = day_c[-1][0][11:16]   # latest candle of the day under study
+    base_rows = []
+    for d in base_days:
+        cs = sorted(sessions[d], key=lambda c: c[0])
+        f = next((c for c in cs if c[0][11:16] == "09:15"), None)
+        if f is None:
+            continue
+        slot = {c[0][11:16]: c for c in cs}
+        base_rows.append({
+            "date": d,
+            "first_vol": float(f[5] or 0),
+            "slot_vol": {k: float(v[5] or 0) for k, v in slot.items() if k in ("09:20", "09:25")},
+            "buy": _directional_pressure(f[2], f[3], f[4], f[5])[0],
+            "sell": _directional_pressure(f[2], f[3], f[4], f[5])[1],
+            "day_vol": sum(float(c[5] or 0) for c in cs),
+            "cum_same_time": sum(float(c[5] or 0) for c in cs if c[0][11:16] <= last_slot),
+            "first_open": float(f[1]), "last_close": float(cs[-1][4]),
+        })
+    n = len(base_rows)
+    v1 = float(first[5] or 0)
+    out: dict = {"symbol": symbol, "date": date_str, "status": "ok", "baseline_sessions": n}
+    if n < _VOL_MIN_HISTORY_SESSIONS:
+        out["status"] = "no_baseline"
+        out["first_candle_volume"] = int(v1)
+        return out
+
+    vols = [r["first_vol"] for r in base_rows]
+    mean_v = sum(vols) / n
+    med_v = _fc_median(vols)
+    sd = (sum((x - mean_v) ** 2 for x in vols) / n) ** 0.5
+    daily_mean = sum(r["day_vol"] for r in base_rows) / n
+    buy1, sell1 = _directional_pressure(first[2], first[3], first[4], first[5])
+    mean_buy = sum(r["buy"] for r in base_rows) / n
+    mean_sell = sum(r["sell"] for r in base_rows) / n
+
+    out["first_candle"] = {
+        "open": float(first[1]), "high": float(first[2]), "low": float(first[3]), "close": float(first[4]),
+        "volume": int(v1),
+        "range_pct": _fc_pct(first[2], first[3]),
+        "body_pct": _fc_pct(first[4], first[1]),
+        "close_position_in_range": (round((float(first[4]) - float(first[3])) / (float(first[2]) - float(first[3])), 2)
+                                    if float(first[2]) > float(first[3]) else None),
+    }
+    out["volume_strength"] = {
+        "avg_first_candle_volume": int(mean_v),
+        "median_first_candle_volume": int(med_v),
+        "max_first_candle_volume": int(max(vols)),
+        "ratio_vs_average": round(v1 / mean_v, 2) if mean_v > 0 else None,
+        "ratio_vs_median": round(v1 / med_v, 2) if med_v > 0 else None,
+        "ratio_vs_max": round(v1 / max(vols), 2) if max(vols) > 0 else None,
+        "beats_sessions": f"{sum(1 for x in vols if x < v1)} of {n}",
+        "z_score": round((v1 - mean_v) / sd, 2) if sd > 0 else None,
+        "pct_of_avg_full_day_volume": round(v1 / daily_mean * 100.0, 2) if daily_mean > 0 else None,
+        "buy_pressure_ratio": round(buy1 / mean_buy, 2) if mean_buy > 0 else None,
+        "sell_pressure_ratio": round(sell1 / mean_sell, 2) if mean_sell > 0 else None,
+        "buy_share_of_candle_pct": round(buy1 / v1 * 100.0, 1) if v1 > 0 else None,
+    }
+
+    # does the volume persist after the opening candle?
+    persist = {}
+    for slot in ("09:20", "09:25"):
+        c = next((x for x in day_c if x[0][11:16] == slot), None)
+        bases = [r["slot_vol"][slot] for r in base_rows if slot in r["slot_vol"]]
+        if c is not None and len(bases) >= _VOL_MIN_HISTORY_SESSIONS and sum(bases) > 0:
+            persist[slot] = {"volume": int(c[5] or 0), "ratio_vs_average": round(float(c[5] or 0) / (sum(bases) / len(bases)), 2)}
+    out["next_candles"] = persist
+
+    # price outcome (partial if the day is still running)
+    prev_close = None
+    if base_days:
+        last_prev = sorted(sessions[base_days[0]], key=lambda c: c[0])[-1]
+        prev_close = float(last_prev[4])
+    hi_c = max(day_c, key=lambda c: float(c[2]))
+    out["price"] = {
+        "prev_close": prev_close,
+        "gap_open_pct": _fc_pct(first[1], prev_close),
+        "first_candle_close_vs_prev_close_pct": _fc_pct(first[4], prev_close),
+        "day_high": float(hi_c[2]), "day_high_time": hi_c[0][11:16],
+        "day_high_vs_prev_close_pct": _fc_pct(hi_c[2], prev_close),
+        "last_close": float(day_c[-1][4]), "last_candle": day_c[-1][0][11:16],
+        "last_close_vs_prev_close_pct": _fc_pct(day_c[-1][4], prev_close),
+        "move_after_first_candle_to_high_pct": _fc_pct(hi_c[2], first[4]),
+        "move_after_first_candle_to_last_pct": _fc_pct(day_c[-1][4], first[4]),
+    }
+    # whole-day volume so far, like-for-like (same clock time in earlier sessions)
+    cum_today = sum(float(c[5] or 0) for c in day_c)
+    mean_cum = sum(r["cum_same_time"] for r in base_rows) / n
+    out["day_volume_so_far"] = {
+        "through": last_slot,
+        "volume": int(cum_today),
+        "ratio_vs_same_time_average": round(cum_today / mean_cum, 2) if mean_cum > 0 else None,
+        "pct_of_avg_full_day_volume": round(cum_today / daily_mean * 100.0, 1) if daily_mean > 0 else None,
+    }
+
+    # where the stock was coming from: distance below its recent highs/lows
+    if daily:
+        ds = sorted((c for c in daily if c[0][:10] < date_str), key=lambda c: c[0])
+        ctx = {}
+        for label, cnt in (("20d", 20), ("60d", 60)):
+            win = ds[-cnt:]
+            if len(win) >= max(10, cnt // 2) and prev_close:
+                hi = max(float(c[2]) for c in win)
+                lo = min(float(c[3]) for c in win)
+                ctx[f"high_{label}"] = hi
+                ctx[f"prev_close_vs_high_{label}_pct"] = _fc_pct(prev_close, hi)
+                ctx[f"low_{label}"] = lo
+                ctx[f"prev_close_vs_low_{label}_pct"] = _fc_pct(prev_close, lo)
+                ctx[f"sessions_used_{label}"] = len(win)
+        if ctx:
+            out["context"] = ctx
+
+    out["baseline"] = [
+        {"date": r["date"], "first_candle_volume": int(r["first_vol"]),
+         "day_move_open_to_close_pct": _fc_pct(r["last_close"], r["first_open"])}
+        for r in base_rows
+    ]
+    return out
+
+
+def _first_candle_report(symbol: str, date_str: str, access_token: str) -> dict:
+    key = get_instrument_key(symbol)
+    if not key:
+        return {"symbol": symbol, "date": date_str, "status": "no_instrument"}
+    day = datetime.strptime(date_str, "%Y-%m-%d")
+    q = urllib.parse.quote(key, safe="|")
+    base_url = "https://api.upstox.com/v3/historical-candle/"
+    try:
+        hist = _vol_fetch_candles(
+            f"{base_url}{q}/minutes/5/{(day - timedelta(days=1)).strftime('%Y-%m-%d')}/{(day - timedelta(days=20)).strftime('%Y-%m-%d')}",
+            access_token)
+        daily = None
+        try:   # context only - a failure here must not lose the main report
+            daily = _vol_fetch_candles(
+                f"{base_url}{q}/days/1/{(day - timedelta(days=1)).strftime('%Y-%m-%d')}/{(day - timedelta(days=100)).strftime('%Y-%m-%d')}",
+                access_token)
+        except Exception:
+            daily = None
+        if date_str < _ist_today_str():
+            raw_day = _vol_fetch_candles(f"{base_url}{q}/minutes/5/{date_str}/{date_str}", access_token)
+        else:
+            raw_day = _vol_fetch_candles(f"{base_url}intraday/{q}/minutes/5", access_token)
+    except Exception as e:
+        return {"symbol": symbol, "date": date_str, "status": "error", "reason": f"{type(e).__name__}: {e}"[:200]}
+    return _first_candle_stats(symbol, date_str, hist, raw_day, daily)
+
+
+@app.route("/api/first-candle-report")
+def api_first_candle_report():
+    """?symbol=DIXON (or DIXON,TRENT)  &date=YYYY-MM-DD (default today IST)
+    ?all=1 hands over to /api/first-candle-board (background job, ranked
+    table of every Buy/Sell-alerted stock that day)."""
+    token = get_setting("upstox_access_token")
+    if not token:
+        return jsonify({"error": "No Upstox token saved"}), 400
+    date_str = request.args.get("date") or _ist_today_str()
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+
+    if request.args.get("all"):
+        return api_first_candle_board()
+    symbols = [x.strip().upper() for x in (request.args.get("symbol") or "").split(",") if x.strip()][:10]
+    if not symbols:
+        return jsonify({"error": "give ?symbol=DIXON (or ?symbol=DIXON,TRENT)"}), 400
+
+    reports = [_first_candle_report(x, date_str, token) for x in symbols]
+
+    if len(reports) == 1:
+        return jsonify(reports[0])
+    return jsonify({"date": date_str, "details": reports})
+
+
+def _fc_table_row(r: dict) -> dict:
+    vs = r.get("volume_strength") or {}
+    pr = r.get("price") or {}
+    return {
+        "symbol": r.get("symbol"), "category": r.get("alert_category"), "status": r.get("status"),
+        "first_candle_ratio": vs.get("ratio_vs_average"),
+        "beats_sessions": vs.get("beats_sessions"),
+        "first_candle_volume": (r.get("first_candle") or {}).get("volume"),
+        "pct_of_avg_day_volume": vs.get("pct_of_avg_full_day_volume"),
+        "first_candle_body_pct": (r.get("first_candle") or {}).get("body_pct"),
+        "gap_open_pct": pr.get("gap_open_pct"),
+        "day_volume_ratio": (r.get("day_volume_so_far") or {}).get("ratio_vs_same_time_average"),
+        "below_20d_high_pct": (r.get("context") or {}).get("prev_close_vs_high_20d_pct"),
+        "day_high_vs_prev_close_pct": pr.get("day_high_vs_prev_close_pct"),
+        "last_close_vs_prev_close_pct": pr.get("last_close_vs_prev_close_pct"),
+    }
+
+
+# The board covers many stocks (3 Upstox calls each). The app runs ONE
+# gunicorn worker, so doing that inside a web request would freeze every
+# other request - including the Chartink webhook. It therefore runs in a
+# background thread; the page just polls for progress.
+_fc_board_lock = threading.Lock()
+_fc_board: dict = {}              # date_str -> job state
+_FC_BOARD_TTL_SECONDS = 600       # reuse a finished board for 10 minutes
+_FC_BOARD_MAX_SYMBOLS = 60
+
+
+def _fc_board_worker(date_str: str, token: str, symbols: list, cats: dict) -> None:
+    st = _fc_board[date_str]
+    try:
+        for sym in symbols:
+            try:
+                r = _first_candle_report(sym, date_str, token)
+            except Exception as e:
+                r = {"symbol": sym, "date": date_str, "status": "error", "reason": f"{type(e).__name__}"}
+            r["alert_category"] = cats.get(sym)
+            st["reports"].append(r)
+            st["done"] += 1
+            time.sleep(0.15)   # be gentle with Upstox's rate limit
+        st["state"] = "done"
+    except Exception as e:
+        st["state"] = "error"
+        st["error"] = f"{type(e).__name__}: {e}"[:200]
+    finally:
+        st["finished"] = time.monotonic()
+
+
+@app.route("/api/first-candle-board")
+def api_first_candle_board():
+    """?date=YYYY-MM-DD (default today IST) &refresh=1 to force a re-run.
+    Returns {state: running|done|error, total, done, rows:[...]} for every
+    Buy/Sell-alerted stock of that day, ranked by first-candle volume ratio."""
+    token = get_setting("upstox_access_token")
+    if not token:
+        return jsonify({"error": "No Upstox token saved"}), 400
+    date_str = request.args.get("date") or _ist_today_str()
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    force = bool(request.args.get("refresh"))
+    with _fc_board_lock:
+        st = _fc_board.get(date_str)
+        now_m = time.monotonic()
+        stale = (st is None
+                 or (st["state"] == "running" and now_m - st["started"] > 600)   # stuck job
+                 or (st["state"] != "running" and (force or now_m - (st.get("finished") or 0) > _FC_BOARD_TTL_SECONDS)))
+        if stale:
+            try:
+                cats: dict[str, str] = {}
+                for a in _alerts_for_ist_date(date_str):
+                    sym = (a.get("symbol") or "").strip().upper()
+                    cat = categorize(a)
+                    if sym and sym not in cats and cat in ("Buy", "Sell"):
+                        cats[sym] = cat
+            except (psycopg2.Error, RuntimeError):
+                return jsonify({"error": "database unavailable"}), 503
+            symbols = list(cats)[:_FC_BOARD_MAX_SYMBOLS]
+            st = {"state": "running", "started": now_m, "finished": None, "total": len(symbols),
+                  "done": 0, "reports": [], "error": None}
+            _fc_board[date_str] = st
+            if not symbols:
+                st["state"] = "done"
+                st["finished"] = now_m
+            else:
+                threading.Thread(target=_fc_board_worker, args=(date_str, token, symbols, cats), daemon=True).start()
+    rows = [_fc_table_row(r) for r in list(st["reports"])]
+    rows.sort(key=lambda r: r["first_candle_ratio"] or 0, reverse=True)
+    return jsonify({"date": date_str, "state": st["state"], "total": st["total"], "done": st["done"],
+                    "error": st["error"], "rows": rows})
+
+
+@app.route("/first-candle")
+def first_candle_page():
+    return render_template("first_candle.html", active_tab="first_candle", date=_ist_today_str())
 
 
 # =============================================================================
