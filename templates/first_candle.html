@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - First Candle</title>
+  <style>
+    :root { --bg:#0b0e14; --panel:#131722; --border:#1e222d; --text:#e6e9f0; --muted:#6b7280; --green:#00c896; --gold:#ffb800; --red:#ff5370; }
+    :root[data-theme="light-gray"] { --red:#dc2626; --bg:#e9ebee; --panel:#ffffff; --border:#d0d4da; --text:#1a1d23; --muted:#6b7280; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="sky-blue"] { --red:#dc2626; --bg:#eaf4fb; --panel:#ffffff; --border:#bfe0f2; --text:#10222c; --muted:#4a6572; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="off-white"] { --red:#dc2626; --bg:#f7f5f0; --panel:#ffffff; --border:#e2ddd2; --text:#1f1c16; --muted:#6b6455; --green:#0e9f6e; --gold:#b45309; }
+    * { box-sizing: border-box; }
+    body { font-family:'Segoe UI',Arial,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px 32px 48px; }
+    a { color: var(--green); }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .tabbar { display:flex; gap:4px; border-bottom:1px solid var(--border); margin:18px 0 20px; overflow-x:auto; }
+    .tabbar a { padding:10px 14px; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; white-space:nowrap; }
+    .tabbar a.active { color:var(--text); border-bottom-color:var(--green); }
+    .tabbar a:hover { color:var(--text); }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:0 0 14px; font-size:13px; color:var(--muted); }
+    .controls input { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:13px; }
+    .controls input[type=number] { width:70px; }
+    .controls button { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
+    .controls button:hover { border-color:var(--green); }
+    #status { font-size:13px; color:var(--muted); margin:0 0 12px; min-height:18px; }
+    .wrap { overflow-x:auto; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
+    table { border-collapse:collapse; width:100%; font-size:12px; }
+    th, td { border-bottom:1px solid var(--border); padding:8px 10px; text-align:left; white-space:nowrap; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; cursor:pointer; user-select:none; }
+    th:hover { color:var(--text); }
+    tr:last-child td { border-bottom:none; }
+    tr.hot td { background:rgba(0,200,150,0.10); }
+    .pos { color:var(--green); } .neg { color:var(--red); } .mut { color:var(--muted); }
+    .tag { font-size:10px; padding:1px 6px; border-radius:8px; border:1px solid var(--border); }
+    .tag.Buy { color:var(--green); border-color:var(--green); } .tag.Sell { color:var(--red); border-color:var(--red); }
+    .foot { margin-top:14px; font-size:11px; color:var(--muted); line-height:1.5; }
+  </style>
+</head>
+<body>
+  <h2 style="margin:0">First Candle <span style="color:var(--muted);font-weight:400;font-size:14px">RTT v0.0</span></h2>
+  <div class="sub">How strong was each alerted stock's 9:15 candle volume compared with its own last 10 sessions, and what did the stock do afterwards. Read-only.</div>
+
+  <div class="tabbar">
+    <a href="/">Dashboard</a>
+    <a href="/paper-trading">Paper Trading</a>
+    <a href="/live-trading">Live Trading</a>
+    <a href="/stats">Stats</a>
+    <a href="/websocket-stats">WS Speed</a>
+    <a href="/settings">Settings</a>
+    <a href="/shadow">Manual vs RSI</a>
+    <a href="/exit-lab">Exit Lab</a>
+    <a href="/first-candle" class="active">First Candle</a>
+  </div>
+
+  <div class="controls">
+    <label>Date <input type="date" id="dateInput" value="{{ date }}"></label>
+    <button id="loadBtn">Load</button>
+    <button id="refreshBtn">Re-run</button>
+    <label>Highlight 9:15 ratio &ge; <input type="number" id="hotInput" value="3" min="0" step="0.5">&times;</label>
+  </div>
+  <div id="status"></div>
+
+  <div class="wrap"><table id="tbl">
+    <thead><tr id="head"></tr></thead>
+    <tbody id="body"></tbody>
+  </table></div>
+
+  <div class="foot">
+    Covers stocks with a Buy or Sell alert on the chosen day. <b>9:15 ratio</b> = first 5-min candle volume &divide; its average over the previous 10 sessions.
+    <b>Day vol</b> = whole-day volume so far &divide; the average at the same clock time. <b>Below 20d high</b> = previous close vs the highest high of the last 20 sessions.
+    Percent moves are from the previous close. A day still in progress shows partial numbers. Click a column heading to sort.
+  </div>
+
+<script>
+  const COLS = [
+    ["symbol", "Symbol"], ["category", "Alert"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
+    ["pct_of_avg_day_volume", "9:15 % of day"], ["first_candle_body_pct", "9:15 body %"], ["gap_open_pct", "Gap %"],
+    ["day_volume_ratio", "Day vol"], ["below_20d_high_pct", "Below 20d high %"],
+    ["day_high_vs_prev_close_pct", "Day high %"], ["last_close_vs_prev_close_pct", "Last %"]
+  ];
+  const PCT = new Set(["first_candle_body_pct","gap_open_pct","below_20d_high_pct","day_high_vs_prev_close_pct","last_close_vs_prev_close_pct"]);
+  let rows = [], sortKey = "first_candle_ratio", sortDir = -1, timer = null;
+
+  function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+  function cell(k, r) {
+    const v = r[k];
+    if (v === null || v === undefined) return '<span class="mut">-</span>';
+    if (k === "symbol") return esc(v);
+    if (k === "category") return '<span class="tag ' + esc(v) + '">' + esc(v) + '</span>';
+    if (k === "beats_sessions") return esc(v);
+    if (PCT.has(k)) return '<span class="' + (v > 0 ? "pos" : v < 0 ? "neg" : "") + '">' + (v > 0 ? "+" : "") + v + '%</span>';
+    if (k === "first_candle_ratio" || k === "day_volume_ratio") return v + "&times;";
+    if (k === "pct_of_avg_day_volume") return v + "%";
+    return esc(v);
+  }
+
+  function render() {
+    const hot = parseFloat(document.getElementById("hotInput").value) || 0;
+    document.getElementById("head").innerHTML = COLS.map(c =>
+      '<th data-k="' + c[0] + '">' + c[1] + (c[0] === sortKey ? (sortDir < 0 ? " &darr;" : " &uarr;") : "") + '</th>').join("");
+    document.querySelectorAll("#head th").forEach(th => th.onclick = () => {
+      const k = th.dataset.k;
+      if (k === sortKey) sortDir = -sortDir; else { sortKey = k; sortDir = -1; }
+      render();
+    });
+    const sorted = rows.slice().sort((a, b) => {
+      const x = a[sortKey], y = b[sortKey];
+      if (x === null || x === undefined) return 1;
+      if (y === null || y === undefined) return -1;
+      if (typeof x === "string") return sortDir * (x < y ? -1 : x > y ? 1 : 0);
+      return sortDir * (x - y);
+    });
+    document.getElementById("body").innerHTML = sorted.map(r => {
+      const isHot = hot > 0 && r.first_candle_ratio !== null && r.first_candle_ratio >= hot;
+      if (r.status !== "ok") {
+        return '<tr><td>' + esc(r.symbol) + '</td><td>' + cell("category", r) + '</td><td colspan="' + (COLS.length - 2) + '" class="mut">no data (' + esc(r.status) + ')</td></tr>';
+      }
+      return '<tr class="' + (isHot ? "hot" : "") + '">' + COLS.map(c => '<td>' + cell(c[0], r) + '</td>').join("") + '</tr>';
+    }).join("");
+  }
+
+  async function load(refresh) {
+    clearTimeout(timer);
+    const date = document.getElementById("dateInput").value;
+    const st = document.getElementById("status");
+    try {
+      const res = await fetch("/api/first-candle-board?date=" + encodeURIComponent(date) + (refresh ? "&refresh=1" : ""));
+      const d = await res.json();
+      if (!res.ok) { st.textContent = d.error || "Could not load"; return; }
+      rows = d.rows || [];
+      render();
+      if (d.state === "running") {
+        st.textContent = "Working... " + d.done + " of " + d.total + " stocks";
+        timer = setTimeout(() => load(false), 2500);
+      } else if (d.state === "error") {
+        st.textContent = "Stopped early: " + (d.error || "error") + " (showing " + rows.length + " stocks)";
+      } else {
+        st.textContent = rows.length ? (rows.length + " stocks for " + d.date) : "No Buy/Sell alerts found for " + d.date;
+      }
+    } catch (e) {
+      st.textContent = "Could not reach the server";
+    }
+  }
+
+  document.getElementById("loadBtn").onclick = () => load(false);
+  document.getElementById("refreshBtn").onclick = () => load(true);
+  document.getElementById("hotInput").oninput = render;
+  load(false);
+</script>
+</body>
+</html>

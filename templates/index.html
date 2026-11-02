@@ -240,6 +240,7 @@
     .vol-pill.strong { color: var(--green); border-color: var(--green); }
     .vol-pill.moderate { color: var(--gold); border-color: var(--gold); }
     .vol-pill.weak { color: var(--muted); }
+    .vol-pill.fc { color: var(--text); }
     .pct-change {
       font-size: 11px;
       font-weight: 600;
@@ -547,6 +548,7 @@
     <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
     <a href="/shadow" class="{% if active_tab == 'shadow' %}active{% endif %}">Manual vs RSI</a>
     <a href="/exit-lab" class="{% if active_tab == 'exit_lab' %}active{% endif %}">Exit Lab</a>
+    <a href="/first-candle" class="{% if active_tab == 'first_candle' %}active{% endif %}">First Candle</a>
   </div>
 
   <div class="layout">
@@ -591,7 +593,7 @@
                     <span class="price-wrap"><span class="price">{{ (alert["trigger_price"] or "-")|inr }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '{{ (alert['symbol'] or '')|escape }}')" title="Fetch live price">&#8635;</button>
                   </div>
                   {% if alert.get("volume") %}
-                  <div class="row-vol"><span class="vol-pill {{ alert['volume']['label']|lower }}" title="{{ 'Buy' if category == 'Buy' else 'Sell' }}-side directional volume is {{ alert['volume']['ratio'] }}x its usual level for this time of day{% if alert['volume']['prev_ratio'] is not none %} (previous candle: {{ alert['volume']['prev_ratio'] }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ alert['volume']['asof'] }}.">Vol {{ alert['volume']['label'] }} &middot; {{ alert['volume']['ratio'] }}&times;</span><span>as of {{ alert['volume']['asof'] }}</span></div>
+                  <div class="row-vol"><span class="vol-pill {{ alert['volume']['label']|lower }}" title="{{ 'Buy' if category == 'Buy' else 'Sell' }}-side directional volume is {{ alert['volume']['ratio'] }}x its usual level for this time of day{% if alert['volume']['prev_ratio'] is not none %} (previous candle: {{ alert['volume']['prev_ratio'] }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ alert['volume']['asof'] }}.">Vol {{ alert['volume']['label'] }} &middot; {{ alert['volume']['ratio'] }}&times;</span>{% if alert['volume'].get('first_ratio') is not none %}<span class="vol-pill fc" title="First 5-min candle (9:15) volume is {{ alert['volume']['first_ratio'] }}x its average over the previous 10 sessions.">9:15 vol {{ alert['volume']['first_ratio'] }}&times;</span>{% endif %}<span>as of {{ alert['volume']['asof'] }}</span></div>
                   {% endif %}
                   <div class="row-bottom">
                     <span class="badges-inline">
@@ -681,7 +683,7 @@
         const side = cat === "Buy" ? "Buy" : "Sell";
         const prevTxt = (v.prev_ratio !== null && v.prev_ratio !== undefined) ? ` (previous candle: ${v.prev_ratio}x)` : "";
         const tip = `${side}-side directional volume is ${v.ratio}x its usual level for this time of day${prevTxt}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of ${v.asof}.`;
-        volHtml = `<div class="row-vol"><span class="vol-pill ${escapeHtml(v.label.toLowerCase())}" title="${escapeHtml(tip)}">Vol ${escapeHtml(v.label)} &middot; ${v.ratio}&times;</span><span>as of ${escapeHtml(v.asof)}</span></div>`;
+        volHtml = `<div class="row-vol"><span class="vol-pill ${escapeHtml(v.label.toLowerCase())}" title="${escapeHtml(tip)}">Vol ${escapeHtml(v.label)} &middot; ${v.ratio}&times;</span>${(v.first_ratio !== null && v.first_ratio !== undefined) ? `<span class="vol-pill fc" title="First 5-min candle (9:15) volume is ${v.first_ratio}x its average over the previous 10 sessions.">9:15 vol ${v.first_ratio}&times;</span>` : ""}<span>as of ${escapeHtml(v.asof)}</span></div>`;
       }
       return `
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
