@@ -83,8 +83,18 @@
       <select id="benchKey">
         <option value="first_candle_ratio">9:15 ratio</option>
         <option value="day_volume_ratio">Day volume ratio</option>
+        <option value="dir_pressure_ratio">Directional pressure ratio</option>
       </select>
     </label>
+    <label>Measure move
+      <select id="benchMetric">
+        <option value="after">From 9:15 close to last close (tradable)</option>
+        <option value="best">Best swing after 9:15 (high for Buy, low for Sell)</option>
+        <option value="prev">From previous close (includes the gap)</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="benchDirOnly"> only where the 9:15 candle agrees with the alert, at least
+      <input type="number" id="benchDirMin" value="55" min="50" max="100" step="1">% buying (Buy) / selling (Sell)</label>
     <button id="benchBtn">Build benchmark</button>
     <button id="benchStop">Stop</button>
   </div>
@@ -98,7 +108,7 @@
   <div class="foot">
     Covers stocks with a Buy or Sell alert on the chosen day. <b>9:15 ratio</b> = first 5-min candle volume &divide; its average over the previous 10 sessions.
     <b>Day vol</b> = whole-day volume so far &divide; the average at the same clock time. <b>Below 20d high</b> = previous close vs the highest high of the last 20 sessions.
-    Percent moves are from the previous close. A day still in progress shows partial numbers. Click a column heading to sort.
+    <b>After 9:15 %</b> = move from the 9:15 candle&#39;s close to the latest close - the part you could actually trade (the benchmark uses this by default; &quot;from previous close&quot; also counts the overnight gap). &quot;Best swing&quot; is the peak after 9:15, so it is optimistic. <b>9:15 buy share</b> and <b>Dir. pressure</b> estimate buying vs selling from where the candle closed in its range (not true buy/sell volume); Dir. pressure is the side matching the alert (buying for Buy, selling for Sell) vs its 10-session average. A day still in progress shows partial numbers. Click a column heading to sort.
   </div>
 
 <script>
@@ -106,10 +116,22 @@
     ["symbol", "Symbol"], ["category", "Alert"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
     ["pct_of_avg_day_volume", "9:15 % of day"], ["first_candle_body_pct", "9:15 body %"], ["gap_open_pct", "Gap %"],
     ["day_volume_ratio", "Day vol"], ["below_20d_high_pct", "Below 20d high %"],
-    ["day_high_vs_prev_close_pct", "Day high %"], ["last_close_vs_prev_close_pct", "Last %"]
+    ["day_high_vs_prev_close_pct", "Day high %"], ["last_close_vs_prev_close_pct", "Last %"],
+    ["after_first_pct", "After 9:15 %"], ["buy_share_pct", "9:15 buy share"], ["dir_pressure_ratio", "Dir. pressure"]
   ];
-  const PCT = new Set(["first_candle_body_pct","gap_open_pct","below_20d_high_pct","day_high_vs_prev_close_pct","last_close_vs_prev_close_pct"]);
+  const PCT = new Set(["first_candle_body_pct","gap_open_pct","below_20d_high_pct","day_high_vs_prev_close_pct","last_close_vs_prev_close_pct","after_first_pct"]);
   let rows = [], sortKey = "first_candle_ratio", sortDir = -1, timer = null;
+
+  // Direction-aware fields: for a Buy alert "directional" = the buying side of the 9:15 candle, for a Sell alert the selling side.
+  function decorate(r) {
+    if (r && r.status === "ok") {
+      const sell = r.category === "Sell";
+      r.dir_pressure_ratio = sell ? r.sell_pressure_ratio : r.buy_pressure_ratio;
+      const b = r.buy_share_pct;
+      r.dir_share_pct = (b === null || b === undefined) ? null : (sell ? Math.round((100 - b) * 10) / 10 : b);
+    }
+    return r;
+  }
 
   function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
@@ -120,7 +142,8 @@
     if (k === "category") return '<span class="tag ' + esc(v) + '">' + esc(v) + '</span>';
     if (k === "beats_sessions") return esc(v);
     if (PCT.has(k)) return '<span class="' + (v > 0 ? "pos" : v < 0 ? "neg" : "") + '">' + (v > 0 ? "+" : "") + v + '%</span>';
-    if (k === "first_candle_ratio" || k === "day_volume_ratio") return v + "&times;";
+    if (k === "first_candle_ratio" || k === "day_volume_ratio" || k === "dir_pressure_ratio") return v + "&times;";
+    if (k === "buy_share_pct") return v + "%";
     if (k === "pct_of_avg_day_volume") return v + "%";
     return esc(v);
   }
@@ -158,7 +181,7 @@
       const res = await fetch("/api/first-candle-board?date=" + encodeURIComponent(date) + (refresh ? "&refresh=1" : ""));
       const d = await res.json();
       if (!res.ok) { st.textContent = d.error || "Could not load"; return; }
-      rows = d.rows || [];
+      rows = (d.rows || []).map(decorate);
       render();
       if (d.state === "running") {
         st.textContent = "Working... " + d.done + " of " + d.total + " stocks";
@@ -180,9 +203,16 @@
   function bandOf(x) { return x < 1.5 ? 0 : x < 3 ? 1 : x < 5 ? 2 : 3; }
   // Buy alerts want the stock up, Sell alerts want it down.
   function dirMove(r) {
-    const m = r.last_close_vs_prev_close_pct;
-    if (m === null || m === undefined) return null;
-    return r.category === "Sell" ? -m : m;
+    const mode = document.getElementById("benchMetric").value;
+    const sell = r.category === "Sell";
+    const has = x => x !== null && x !== undefined;
+    if (mode === "best") {
+      const m = sell ? r.after_first_down_pct : r.after_first_up_pct;   // Sell: how far it fell (negative number)
+      return has(m) ? (sell ? -m : m) : null;
+    }
+    const m = mode === "prev" ? r.last_close_vs_prev_close_pct : r.after_first_pct;
+    if (!has(m)) return null;
+    return sell ? -m : m;
   }
   function median(a) {
     const s = a.slice().sort((x, y) => x - y), n = s.length;
@@ -200,7 +230,10 @@
   function renderBench() {
     const key = document.getElementById("benchKey").value;
     const hitAt = parseFloat(document.getElementById("benchMove").value) || 3;
-    const usable = benchRows.filter(r => r.status === "ok" && r[key] !== null && r[key] !== undefined);
+    const dirOnly = document.getElementById("benchDirOnly").checked;
+    const dirMin = parseFloat(document.getElementById("benchDirMin").value) || 55;
+    const usable = benchRows.filter(r => r.status === "ok" && r[key] !== null && r[key] !== undefined &&
+      (!dirOnly || (r.dir_share_pct !== null && r.dir_share_pct !== undefined && r.dir_share_pct >= dirMin)));
     const all = stat(usable, hitAt);
     let html = "";
     for (let b = 0; b < BANDS.length; b++) {
@@ -251,7 +284,7 @@
       try {
         const d = await boardFor(dates[i], token);
         if (d === null) return;
-        const rows = (d.rows || []).map(r => Object.assign({ date: dates[i] }, r));
+        const rows = (d.rows || []).map(r => decorate(Object.assign({ date: dates[i] }, r)));
         benchRows = benchRows.concat(rows);
         used.push(dates[i] + " (" + rows.filter(r => r.status === "ok").length + ")");
         renderBench();
@@ -269,6 +302,9 @@
   document.getElementById("benchStop").onclick = () => { benchToken++; document.getElementById("benchStatus").textContent = "Stopped."; };
   document.getElementById("benchKey").onchange = renderBench;
   document.getElementById("benchMove").oninput = renderBench;
+  document.getElementById("benchMetric").onchange = renderBench;
+  document.getElementById("benchDirOnly").onchange = renderBench;
+  document.getElementById("benchDirMin").oninput = renderBench;
 
   document.getElementById("loadBtn").onclick = () => load(false);
   document.getElementById("refreshBtn").onclick = () => load(true);

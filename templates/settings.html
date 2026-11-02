@@ -403,6 +403,54 @@
     </span>
   </div>
 
+  <div class="settings-box" style="flex-direction: column; align-items: stretch; gap: 10px;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvGate" {% if fcv.gate_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span style="font-weight:600;">First-candle (9:15) volume entry gate</span>
+      <span class="token-status" id="fcvGateStatus">...</span>
+    </div>
+    <div class="token-status">The 9:15 candle's volume compared with its own average over the previous 10 sessions (the ratio on the First Candle page). When the gate is on, an alert only opens a trade if its stock's ratio falls in a band ticked below. Not every day has 3x or 5x stocks, so tick whichever bands you want to trade.</div>
+    <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center;">
+      <span>Allowed bands:</span>
+      {% for name in fcv_band_names %}
+      <label style="display:flex; gap:6px; align-items:center;"><input type="checkbox" class="fcvBand" value="{{ loop.index0 }}" {% if loop.index0 in fcv.bands %}checked{% endif %} onchange="saveFcv()"> {{ name }}</label>
+      {% endfor %}
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvDir" {% if fcv.dir_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span>Candle must agree with the alert: at least</span>
+      <input type="text" id="fcvDirMin" value="{{ '%g' % fcv.dir_min_pct }}" style="width:46px; text-align:center;" onchange="saveFcv()">
+      <span>% buying for a Buy alert / selling for a Sell alert</span>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvUnknown" {% if fcv.allow_unknown %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span>Still allow the trade when 9:15 volume isn't available yet</span>
+      <span class="token-status">Off = skip. It isn't available before about 9:22 each day (the 9:15 candle must close and be published), or when a stock has too little history.</span>
+    </div>
+    <hr style="border:none; border-top:1px solid var(--border); width:100%; margin:4px 0;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvRoute" {% if fcv.route_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span style="font-weight:600;">Exit strategy by 9:15 volume band</span>
+      <span class="token-status" id="fcvRouteStatus">...</span>
+    </div>
+    <div class="token-status">When on, each trade uses the strategy picked for its stock's band (this beats the default strategy and Auto). A band left on "default" uses whatever strategy is selected above. A trade keeps its strategy once opened.</div>
+    {% for name in fcv_band_names %}{% set bi = loop.index0 %}
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <span style="min-width:100px;">{{ name }}</span>
+      <select class="fcvRoute" data-band="{{ bi }}" onchange="saveFcv()">
+        <option value="">Use the default strategy</option>
+        {% for sid, label in fcv_strategy_options %}<option value="{{ sid }}" {% if fcv_route_list[bi] == sid %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </div>
+    {% endfor %}
+    <div>
+      <span style="font-weight:600;">Recent first-candle decisions</span>
+      <button class="secondary" onclick="loadFcv()" style="margin-left: 8px;">Refresh</button>
+      <div id="fcvLog" class="token-status" style="margin-top:6px;">Loading...</div>
+      <span class="token-status">Kept in memory only - clears when the app restarts. Every trade also records its 9:15 volume (shown under the symbol) whether or not these switches are on.</span>
+    </div>
+  </div>
+
   <div class="settings-box">
     <label class="switch">
       <input type="checkbox" id="thetaSwitchToggle" {% if theta_switch_enabled %}checked{% endif %} onchange="toggleThetaSwitch()">
@@ -421,6 +469,7 @@
       document.documentElement.setAttribute("data-theme", t);
     }
     loadVolumeLog();
+    loadFcv();
     (function initThemeSelect() {
       var t = "dark";
       try { t = localStorage.getItem("rtt-theme") || "dark"; } catch (e) {}
@@ -728,6 +777,65 @@
         }).join("");
       } catch (err) {
         el.textContent = "Couldn't load the log.";
+      }
+    }
+
+    function fcvFillSelects(route) {
+      document.querySelectorAll(".fcvRoute").forEach((sel) => { sel.value = (route && route[sel.dataset.band]) || ""; });
+    }
+
+    function fcvRender(d) {
+      const names = d.band_names || [];
+      document.getElementById("fcvGateStatus").textContent = d.gate_enabled
+        ? (d.bands.length ? "ON - only alerts in: " + d.bands.map((i) => names[i]).join(", ") + (d.dir_enabled ? ", and candle agreeing >= " + d.dir_min_pct + "%" : "") : "ON but no band ticked - every alert will be skipped")
+        : "OFF - 9:15 volume does not affect entries";
+      document.getElementById("fcvRouteStatus").textContent = d.route_enabled ? "ON" : "OFF - every trade uses the default strategy";
+      const el = document.getElementById("fcvLog");
+      if (!d.log || !d.log.length) {
+        el.textContent = (d.gate_enabled || d.route_enabled) ? "No alerts judged yet since the app last started." : "Nothing yet - both switches are off.";
+        return;
+      }
+      el.innerHTML = d.log.slice(0, 20).map((x) => {
+        const colour = (x.outcome === "ALLOWED" || x.outcome === "ROUTED") ? "var(--green)" : (x.outcome === "error" ? "var(--red)" : "var(--muted)");
+        return `<div><span style="color:${colour}; font-weight:600;">${escapeHtml(x.outcome)}</span> ${escapeHtml(x.at)} ${escapeHtml(x.symbol)} (${escapeHtml(x.category)}) - ${escapeHtml(x.detail)}</div>`;
+      }).join("");
+    }
+
+    async function loadFcv() {
+      try {
+        const res = await fetch("/api/first-candle-gate");
+        const d = await res.json();
+        fcvFillSelects(d.route);
+        fcvRender(d);
+      } catch (err) {
+        document.getElementById("fcvLog").textContent = "Couldn't load.";
+      }
+    }
+
+    async function saveFcv() {
+      const route = {};
+      document.querySelectorAll(".fcvRoute").forEach((sel) => { route[sel.dataset.band] = sel.value; });
+      const body = {
+        gate_enabled: document.getElementById("fcvGate").checked,
+        bands: Array.from(document.querySelectorAll(".fcvBand")).filter((x) => x.checked).map((x) => parseInt(x.value, 10)),
+        dir_enabled: document.getElementById("fcvDir").checked,
+        dir_min_pct: parseFloat(document.getElementById("fcvDirMin").value) || 55,
+        allow_unknown: document.getElementById("fcvUnknown").checked,
+        route_enabled: document.getElementById("fcvRoute").checked,
+        route: route,
+      };
+      try {
+        const res = await fetch("/api/first-candle-gate", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        });
+        const d = await res.json();
+        if (d.status !== "ok") { document.getElementById("fcvGateStatus").textContent = d.message || "Failed to save"; return; }
+        document.getElementById("fcvDirMin").value = d.dir_min_pct;
+        fcvFillSelects(d.route);
+        fcvRender(d);
+      } catch (err) {
+        document.getElementById("fcvGateStatus").textContent = "Failed to save - see console";
+        console.error(err);
       }
     }
 
