@@ -8026,6 +8026,10 @@ def api_first_candle_board():
             except (psycopg2.Error, RuntimeError):
                 return jsonify({"error": "database unavailable"}), 503
             symbols = list(cats)[:_FC_BOARD_MAX_SYMBOLS]
+            if len(_fc_board) >= 30:   # keep memory bounded: drop the oldest finished dates
+                old_dates = sorted(k for k, v in _fc_board.items() if v["state"] != "running" and k != date_str)
+                for k in old_dates[:len(_fc_board) - 29]:
+                    _fc_board.pop(k, None)
             st = {"state": "running", "started": now_m, "finished": None, "total": len(symbols),
                   "done": 0, "reports": [], "error": None}
             _fc_board[date_str] = st
