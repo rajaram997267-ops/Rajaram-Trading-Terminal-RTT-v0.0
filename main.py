@@ -1534,7 +1534,22 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     except Exception as e:
         fcv_route_info = None
         _fcv_log_decision(symbol, category, "error", f"routing: {type(e).__name__}"[:140])
-    if fcv_route_info is None and entry_strategy == "AUTO_VOL":
+    # Optional exit-strategy ROTATION test: each new trade takes the next strategy
+    # in the ticked list, so every strategy gets its own real, comparable trades.
+    # Paper-only (like Auto): the live leg is not placed for these trades.
+    fcv_rotate_pick = None
+    try:
+        if fcv_route_info is None and fc_cfg and fc_cfg["rotate_enabled"] and fc_cfg["rotate_list"]:
+            _rot = fc_cfg["rotate_list"]
+            fcv_rotate_pick = fc_cfg["rotate_next"] % len(_rot)
+            entry_strategy = _rot[fcv_rotate_pick]
+            auto_paper_only = True
+            _fcv_log_decision(symbol, category, "ROTATED",
+                              f"Rotation test -> {_FCV_STRATEGY_LABELS.get(entry_strategy, entry_strategy)} (paper only)")
+    except Exception as e:
+        fcv_rotate_pick = None
+        _fcv_log_decision(symbol, category, "error", f"rotation: {type(e).__name__}"[:140])
+    if fcv_route_info is None and fcv_rotate_pick is None and entry_strategy == "AUTO_VOL":
         entry_strategy, auto_info = _auto_resolve_entry(symbol, category)
         auto_paper_only = get_setting("auto_vol_live_ok", "false") != "true"
 
@@ -1638,6 +1653,15 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
             conn.execute("UPDATE paper_trades SET lab_state = ? WHERE id = ?",
                          (json.dumps({"fcv": fcv_route_info}, separators=(",", ":")), row["id"]))
             conn.commit()
+    if fcv_rotate_pick is not None:
+        try:   # advance the rotation only once a trade really opened
+            with get_db() as conn:
+                conn.execute("UPDATE paper_trades SET lab_state = ? WHERE id = ?",
+                             (json.dumps({"fcv": {"rotation": True, "strategy": entry_strategy}}, separators=(",", ":")), row["id"]))
+                conn.commit()
+            set_setting("fcv_rotate_next", str(fcv_rotate_pick + 1))
+        except Exception:
+            pass
 
     if access_token:
         ensure_websocket_started(access_token)
@@ -1650,7 +1674,9 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # option TYPE differs by alert direction. Any failure here is recorded
     # on the trade and never blocks the paper trade itself.
     if get_live_trading_enabled() and auto_paper_only:
-        _mark_live_failed(row["id"], "Auto (volume-driven) is paper-only until you allow it for live trades on the Exit Lab page")
+        _mark_live_failed(row["id"], "Exit-strategy rotation test is paper-only - no live order was placed"
+                          if fcv_rotate_pick is not None else
+                          "Auto (volume-driven) is paper-only until you allow it for live trades on the Exit Lab page")
     elif get_live_trading_enabled():
         opt_type = "CE" if category == "Buy" else "PE"
         trade_id = row["id"]
@@ -3898,7 +3924,10 @@ _fcv_log: list[dict] = []        # recent gate / routing decisions (memory only;
 _fcv_cache: dict = {}            # (SYMBOL, ist_date) -> a finished, successful 09:15 reading
 _FCV_KEYS = ("fcv_gate_enabled", "fcv_gate_bands", "fcv_dir_enabled", "fcv_dir_min_pct",
              "fcv_allow_unknown", "fcv_route_enabled",
-             "fcv_route_0", "fcv_route_1", "fcv_route_2", "fcv_route_3")
+             "fcv_route_0", "fcv_route_1", "fcv_route_2", "fcv_route_3",
+             "fcv_rotate_enabled", "fcv_rotate_list", "fcv_rotate_next")
+# Strategies compared by the optional rotation test (a new trade takes the next one in turn).
+_FCV_ROTATE_DEFAULT = ("RSI_SIMPLE", "RSI_MOMENTUM", "FIRST5MIN_FIB", "EMA_SPOT_TRAIL")
 _FCV_STRATEGY_LABELS = {
     "HALF_HALF_HARD4": "2) -2% SL, 2% half book, 4% full exit",
     "TRAIL_FROM_2": "3) -2% SL, trail 100% qty from 2%",
@@ -3953,7 +3982,17 @@ def fcv_settings() -> dict:
     for i in range(len(_FCV_BANDS)):
         v = vals.get(f"fcv_route_{i}", "") or ""
         route[i] = v if v in VALID_STRATEGIES else ""
+    rot_raw = vals.get("fcv_rotate_list")
+    if rot_raw is None:
+        rotate_list = list(_FCV_ROTATE_DEFAULT)
+    else:
+        rotate_list = [x for x in (p.strip() for p in str(rot_raw).split(",")) if x in VALID_STRATEGIES]
+    try:
+        rotate_next = max(int(vals.get("fcv_rotate_next", "0") or 0), 0)
+    except (TypeError, ValueError):
+        rotate_next = 0
     return {
+        "rotate_enabled": flag("fcv_rotate_enabled"), "rotate_list": rotate_list, "rotate_next": rotate_next,
         "gate_enabled": flag("fcv_gate_enabled"), "bands": sorted(bands),
         "dir_enabled": flag("fcv_dir_enabled"), "dir_min_pct": min_pct,
         "allow_unknown": flag("fcv_allow_unknown"),
@@ -4077,6 +4116,11 @@ def api_first_candle_gate():
                     set_setting("fcv_dir_min_pct", str(min(max(float(d["dir_min_pct"]), 50.0), 100.0)))
                 except (TypeError, ValueError):
                     pass
+            if "rotate_enabled" in d:
+                set_setting("fcv_rotate_enabled", "true" if d["rotate_enabled"] else "false")
+            if isinstance(d.get("rotate_list"), list):
+                ok_rot = [x for x in d["rotate_list"] if x in VALID_STRATEGIES]
+                set_setting("fcv_rotate_list", ",".join(ok_rot))
             if isinstance(d.get("route"), dict):
                 for i in range(len(_FCV_BANDS)):
                     v = str(d["route"].get(str(i), d["route"].get(i, "")) or "")
@@ -7862,9 +7906,12 @@ def _summarize_group(rows: list[dict], group_key: str) -> list[dict]:
     strategy's own running balance, which isn't a meaningful concept for
     a shared single-position account split across groups)."""
     groups: dict[str, list[float]] = {}
+    pcts: dict[str, list[float]] = {}
     for r in rows:
         key = r.get(group_key) or "(not recorded)"
         groups.setdefault(key, []).append(r["pnl"] or 0)
+        if r.get("pnl_pct") is not None:
+            pcts.setdefault(key, []).append(r["pnl_pct"])
 
     summary = []
     for key, pnls in groups.items():
@@ -7881,6 +7928,9 @@ def _summarize_group(rows: list[dict], group_key: str) -> list[dict]:
             "avg_pnl": round(total / len(pnls), 2) if pnls else 0,
             "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else None,
             "max_loss": round(min(pnls), 2) if pnls else 0,
+            # Average % return per trade: unlike Rs, it is not distorted by the
+            # account compounding, so it is the fair number to compare groups on.
+            "avg_pct": round(sum(pcts[key]) / len(pcts[key]), 2) if pcts.get(key) else None,
         })
     summary.sort(key=lambda s: s["total_pnl"], reverse=True)
     return summary
@@ -7991,7 +8041,7 @@ def api_stats_breakdown():
     with get_db() as conn:
         rows = conn.execute(
             "SELECT alert_name, scan_name, strategy, pnl, pnl_pct, entry_price, exit_reason, entry_volume_label, "
-            "paper_option_label, shadow_tracked, shadow_weak_price FROM paper_trades "
+            "entry_fc_ratio, paper_option_label, shadow_tracked, shadow_weak_price FROM paper_trades "
             "WHERE status = 'CLOSED' AND pnl IS NOT NULL"
         ).fetchall()
     rows = [dict(r) for r in rows]
@@ -8001,6 +8051,20 @@ def api_stats_breakdown():
     by_volume = _summarize_group([{**r, "vol_group": _volume_group_label(r)} for r in rows], "vol_group")
     by_volume.sort(key=lambda g: (_volume_group_sort_key(g["name"]), g["name"]))  # Strong -> Weak, then the rest
     shadow_weak = _shadow_weak_exit_summary(rows)
+
+    # 9:15 volume band (logged on every trade at entry) - alone, and split by exit strategy.
+    band_names = [b[0] for b in _FCV_BANDS]
+    band_rows = []
+    for r in rows:
+        if r.get("entry_fc_ratio") is None:
+            continue
+        bn = band_names[fcv_band_index(r["entry_fc_ratio"])]
+        strat = r.get("strategy") or "(not recorded)"
+        band_rows.append({**r, "band": bn, "band_strategy": f"{bn}  |  {_FCV_STRATEGY_LABELS.get(strat, strat)}"})
+    by_band = _summarize_group(band_rows, "band")
+    by_band.sort(key=lambda g: band_names.index(g["name"]) if g["name"] in band_names else 99)
+    by_band_strategy = _summarize_group(band_rows, "band_strategy")
+    by_band_strategy.sort(key=lambda g: (band_names.index(g["name"].split("  |  ")[0]) if g["name"].split("  |  ")[0] in band_names else 99, g["name"]))
 
     # Combined (alert, strategy) pair breakdown.
     pair_rows = []
@@ -8015,6 +8079,8 @@ def api_stats_breakdown():
         "by_alert": by_alert,
         "by_strategy": by_strategy,
         "by_volume": by_volume,
+        "by_fc_band": by_band,
+        "by_fc_band_strategy": by_band_strategy,
         "volume_tracking_note": (
             "Directional volume at entry vs the same time of day over the last ~10 "
             "sessions - an estimate from candle structure, not true buy/sell volume. "
@@ -9831,7 +9897,9 @@ def _rule_note(t: dict) -> str:
     except Exception:
         st = {}
     fcv = st.get("fcv") if isinstance(st, dict) else None
-    if fcv:
+    if fcv and fcv.get("rotation"):
+        parts.append("Exit-strategy rotation test")
+    elif fcv:
         parts.append(f"Routed by 9:15 volume {fcv.get('ratio')}x ({fcv.get('band')})")
     if t.get("entry_fc_ratio") is not None:
         txt = f"9:15 vol {t['entry_fc_ratio']}x"
