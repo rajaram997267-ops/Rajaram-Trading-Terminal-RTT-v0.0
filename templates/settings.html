@@ -443,6 +443,18 @@
       </select>
     </div>
     {% endfor %}
+    <hr style="border:none; border-top:1px solid var(--border); width:100%; margin:4px 0;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvRot" {% if fcv.rotate_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span style="font-weight:600;">Exit-strategy rotation test (paper only)</span>
+      <span class="token-status" id="fcvRotStatus">...</span>
+    </div>
+    <div class="token-status">Each new trade takes the next ticked strategy in turn, so every strategy collects its own real trades - compare them on the Stats page under "9:15 Volume Band x Exit Strategy". While this is on, new trades are <b>paper only</b>: no live order is placed (live trading shows those trades as not placed). A band chosen in "Exit strategy by 9:15 volume band" above takes priority over the rotation.</div>
+    <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center;">
+      {% for sid, label in fcv_strategy_options %}
+      <label style="display:flex; gap:6px; align-items:center;"><input type="checkbox" class="fcvRotItem" value="{{ sid }}" {% if sid in fcv.rotate_list %}checked{% endif %} onchange="saveFcv()"> {{ label }}</label>
+      {% endfor %}
+    </div>
     <div>
       <span style="font-weight:600;">Recent first-candle decisions</span>
       <button class="secondary" onclick="loadFcv()" style="margin-left: 8px;">Refresh</button>
@@ -790,6 +802,9 @@
         ? (d.bands.length ? "ON - only alerts in: " + d.bands.map((i) => names[i]).join(", ") + (d.dir_enabled ? ", and candle agreeing >= " + d.dir_min_pct + "%" : "") : "ON but no band ticked - every alert will be skipped")
         : "OFF - 9:15 volume does not affect entries";
       document.getElementById("fcvRouteStatus").textContent = d.route_enabled ? "ON" : "OFF - every trade uses the default strategy";
+      document.getElementById("fcvRotStatus").textContent = d.rotate_enabled
+        ? (d.rotate_list && d.rotate_list.length ? "ON - paper only, " + d.rotate_list.length + " strategies in turn" : "ON but none ticked - nothing rotates")
+        : "OFF";
       const el = document.getElementById("fcvLog");
       if (!d.log || !d.log.length) {
         el.textContent = (d.gate_enabled || d.route_enabled) ? "No alerts judged yet since the app last started." : "Nothing yet - both switches are off.";
@@ -823,6 +838,8 @@
         allow_unknown: document.getElementById("fcvUnknown").checked,
         route_enabled: document.getElementById("fcvRoute").checked,
         route: route,
+        rotate_enabled: document.getElementById("fcvRot").checked,
+        rotate_list: Array.from(document.querySelectorAll(".fcvRotItem")).filter((x) => x.checked).map((x) => x.value),
       };
       try {
         const res = await fetch("/api/first-candle-gate", {
