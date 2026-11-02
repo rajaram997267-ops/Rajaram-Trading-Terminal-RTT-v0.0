@@ -432,6 +432,9 @@
           alert(result.message || "Manual exit failed");
           return;
         }
+        if (result.status === "warning") {
+          alert(result.message);
+        }
         await refreshTrades();
       } catch (err) {
         alert("Manual exit failed - see console");
