@@ -8516,7 +8516,12 @@ def api_first_candle_board():
 # LTP quote would have shown). No slippage or charges are added to any rule.
 # =============================================================================
 _EC_STRATS = (("RSI_SIMPLE", "RSI Simple"), ("RSI_MOMENTUM", "RSI Momentum"),
-              ("FIRST5MIN_FIB", "1st 5 Min FIB"), ("EMA_SPOT_TRAIL", "5-EMA trail"))
+              ("FIRST5MIN_FIB", "1st 5 Min FIB"), ("EMA_SPOT_TRAIL", "5-EMA trail"),
+              # The same three rules with the 5-EMA trail's hard -2% stop added underneath,
+              # to show how much of the 5-EMA result is just the stop-loss.
+              ("RSI_SIMPLE_STOP", "RSI Simple + -2% stop"), ("RSI_MOMENTUM_STOP", "RSI Momentum + -2% stop"),
+              ("FIRST5MIN_FIB_STOP", "1st 5 Min FIB + -2% stop"))
+_EC_VERSION = "v2"   # bump when the replay gains new results, so older rows are recomputed
 
 
 def _ec_params() -> dict:
@@ -8575,6 +8580,7 @@ def _ec_replay_trade(trade: dict, spot_1m: list, warm: list, opt_1m: list, param
     out = {}
     # ---- RSI Simple
     T = first_fire(lambda T, ser, n: check_rsi_simple_exit(direction, ser, **rule)[0])
+    T_simple = T
     out["RSI_SIMPLE"] = (_ec_book(entry_price, qty, price_at(T), T, "RSI rule fired") if T else hold_to_eod("never fired - held to end of day"))
 
     # ---- RSI Momentum (with the live mid-day / Deep-ITM adjustments)
@@ -8586,23 +8592,32 @@ def _ec_replay_trade(trade: dict, spot_1m: list, warm: list, opt_1m: list, param
         return check_rsi_momentum_exit(direction, ser, rsi_period=rule["rsi_period"], ema_period=params["ema_period"],
                                        call_threshold=call_t, put_warning_threshold=put_t, confirm_candles=confirm)[0]
     T = first_fire(mom_check)
+    T_mom = T
     out["RSI_MOMENTUM"] = (_ec_book(entry_price, qty, price_at(T), T, "RSI + EMA rule fired") if T else hold_to_eod("never fired - held to end of day"))
 
     # ---- 5-EMA (spot) trail with the -2% hard stop on the option
     ema_T = first_fire(lambda T, ser, n: check_exit(direction, ser)[0])
     stop_level = entry_price * 0.98
-    stop = None
+    stop = None      # (time, price) of the first minute the option trades at/below -2%
     for r in opt_1m:
         st = _to_naive_ist(r[0])
         en = st + timedelta(minutes=1)
         if st < entry_min + timedelta(minutes=1) or en > eod:
             continue
-        if ema_T is not None and en > ema_T:
-            break
         if r[3] <= stop_level:
             stop = (en, min(r[1], stop_level))     # a gap open below the stop fills at the open
             break
-    if stop is not None:
+
+    def with_stop(plain: dict, rule_time):
+        """The plain rule, unless the -2% stop would have fired first."""
+        if stop is not None and (rule_time is None or stop[0] <= rule_time):
+            return _ec_book(entry_price, qty, stop[1], stop[0], "-2% stop-loss")
+        return dict(plain)
+    rsi_simple_T = T_simple
+    out["RSI_SIMPLE_STOP"] = with_stop(out["RSI_SIMPLE"], rsi_simple_T)
+    out["RSI_MOMENTUM_STOP"] = with_stop(out["RSI_MOMENTUM"], T_mom)
+
+    if stop is not None and (ema_T is None or stop[0] <= ema_T):
         out["EMA_SPOT_TRAIL"] = _ec_book(entry_price, qty, stop[1], stop[0], "-2% stop-loss")
     elif ema_T is not None:
         out["EMA_SPOT_TRAIL"] = _ec_book(entry_price, qty, price_at(ema_T), ema_T, "5-EMA (spot) reversal")
@@ -8613,6 +8628,7 @@ def _ec_replay_trade(trade: dict, spot_1m: list, warm: list, opt_1m: list, param
     first = next((b for b in buckets if b[0].strftime("%H:%M") == "09:15"), None)
     if first is None:
         out["FIRST5MIN_FIB"] = _ec_book(entry_price, qty, None, None, "no 09:15 candle - FIB levels unavailable")
+        out["FIRST5MIN_FIB_STOP"] = dict(out["FIRST5MIN_FIB"])
         return out
     tiers = compute_first_5min_fib_targets(direction, first[1][1], first[1][2])
     live_from = day0.replace(hour=9, minute=20)
@@ -8649,6 +8665,7 @@ def _ec_replay_trade(trade: dict, spot_1m: list, warm: list, opt_1m: list, param
                         break
     out["FIRST5MIN_FIB"] = (_ec_book(entry_price, qty, price_at(fire[0]), fire[0], fire[1]) if fire
                             else hold_to_eod("no target / reversal - held to end of day"))
+    out["FIRST5MIN_FIB_STOP"] = with_stop(out["FIRST5MIN_FIB"], fire[0] if fire else None)
     return out
 
 
@@ -8706,7 +8723,7 @@ def _ec_worker(token: str, trades: list) -> None:
                     {"direction": t["direction"], "entry_ist": entry_ist, "entry_price": t["entry_price"],
                      "qty": t.get("original_quantity") or t.get("quantity") or 1, "strike": t.get("paper_strike")},
                     spot_1m, warm, opt_1m, params)
-                _ec_save(t["id"], day, "ok", "", res)
+                _ec_save(t["id"], day, "ok", _EC_VERSION, res)
                 job["done_ok"] += 1
             except Exception as e:
                 job["no_data"] += 1
@@ -8730,14 +8747,15 @@ def api_exit_compare_run():
             return jsonify(dict(_ec_job))
         try:
             with get_db() as conn:
-                skip_status = "('ok')" if retry else "('ok', 'no_data')"
+                skip_rows = (f"(status = 'ok' AND note = '{_EC_VERSION}')" if retry
+                             else f"(status = 'ok' AND note = '{_EC_VERSION}') OR status = 'no_data'")
                 trades = [dict(r) for r in conn.execute(
                     "SELECT id, symbol, direction, entry_time, entry_price, quantity, original_quantity, "
                     "paper_instrument_key, paper_strike FROM paper_trades "
                     "WHERE status = 'CLOSED' AND direction IN ('Buy', 'Sell') AND entry_time IS NOT NULL "
                     "AND entry_price IS NOT NULL AND paper_instrument_key IS NOT NULL "
                     "AND COALESCE(paper_option_label, '') NOT LIKE ? "
-                    f"AND id NOT IN (SELECT trade_id FROM exit_replay WHERE status IN {skip_status}) "
+                    f"AND id NOT IN (SELECT trade_id FROM exit_replay WHERE {skip_rows}) "
                     "ORDER BY id DESC LIMIT ?", ("EQUITY%", _EC_MAX_TRADES)).fetchall()]
         except Exception as e:
             return jsonify({"status": "error", "message": f"could not list trades: {type(e).__name__}"}), 500
@@ -8780,7 +8798,8 @@ def api_exit_compare_data():
             "entry_price": r["entry_price"], "actual_strategy": _FCV_STRATEGY_LABELS.get(r["strategy"], r["strategy"] or ""),
             "actual_pct": r["pnl_pct"], "actual_pnl": r["pnl"], "results": json.loads(r["results"]),
         })
-    return jsonify({"trades": trades, "coverage": {c["status"]: c["n"] for c in cov},
+    outdated = sum(1 for t in trades if "RSI_SIMPLE_STOP" not in t["results"])
+    return jsonify({"trades": trades, "outdated": outdated, "coverage": {c["status"]: c["n"] for c in cov},
                     "strategies": [{"id": a, "name": b} for a, b in _EC_STRATS], "bands": band_names})
 
 
