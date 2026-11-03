@@ -629,6 +629,14 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alert_decisions_date ON alert_decisions (ist_date)")
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS exit_replay (
+                trade_id INTEGER PRIMARY KEY,
+                trade_date TEXT, computed_at TEXT, status TEXT, note TEXT, results TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS rsi_shadow (
                 trade_id INTEGER PRIMARY KEY,
                 trade_date TEXT, symbol TEXT, direction TEXT,
@@ -1536,16 +1544,15 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
         _fcv_log_decision(symbol, category, "error", f"routing: {type(e).__name__}"[:140])
     # Optional exit-strategy ROTATION test: each new trade takes the next strategy
     # in the ticked list, so every strategy gets its own real, comparable trades.
-    # Paper-only (like Auto): the live leg is not placed for these trades.
+    # Applies to the live leg too (live follows the trade's strategy as usual).
     fcv_rotate_pick = None
     try:
         if fcv_route_info is None and fc_cfg and fc_cfg["rotate_enabled"] and fc_cfg["rotate_list"]:
             _rot = fc_cfg["rotate_list"]
             fcv_rotate_pick = fc_cfg["rotate_next"] % len(_rot)
             entry_strategy = _rot[fcv_rotate_pick]
-            auto_paper_only = True
             _fcv_log_decision(symbol, category, "ROTATED",
-                              f"Rotation test -> {_FCV_STRATEGY_LABELS.get(entry_strategy, entry_strategy)} (paper only)")
+                              f"Rotation test -> {_FCV_STRATEGY_LABELS.get(entry_strategy, entry_strategy)}")
     except Exception as e:
         fcv_rotate_pick = None
         _fcv_log_decision(symbol, category, "error", f"rotation: {type(e).__name__}"[:140])
@@ -1674,9 +1681,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # option TYPE differs by alert direction. Any failure here is recorded
     # on the trade and never blocks the paper trade itself.
     if get_live_trading_enabled() and auto_paper_only:
-        _mark_live_failed(row["id"], "Exit-strategy rotation test is paper-only - no live order was placed"
-                          if fcv_rotate_pick is not None else
-                          "Auto (volume-driven) is paper-only until you allow it for live trades on the Exit Lab page")
+        _mark_live_failed(row["id"], "Auto (volume-driven) is paper-only until you allow it for live trades on the Exit Lab page")
     elif get_live_trading_enabled():
         opt_type = "CE" if category == "Buy" else "PE"
         trade_id = row["id"]
@@ -8493,6 +8498,295 @@ def api_first_candle_board():
     return jsonify({"date": date_str, "state": st["state"], "total": st["total"], "done": st["done"],
                     "total_alerted": st.get("alerted", st["total"]), "error": st["error"], "rows": rows})
 
+
+
+# =============================================================================
+# EXIT COMPARE. Replays every closed paper trade through four exit rules on the
+# SAME trade (same entry, same option, same day), so the strategies can be
+# compared fairly instead of on different trades. Read-only: it never opens or
+# closes anything; results go to its own table (exit_replay).
+#
+# How each rule is reproduced (the live rules themselves are reused, not copied):
+#   RSI Simple    - check_rsi_simple_exit on the underlying's closed 5-min candles
+#   RSI Momentum  - check_rsi_momentum_exit, incl. the mid-day and Deep-ITM tweaks
+#   1st 5 Min FIB - tiers from the 09:15 candle, fib_stage_transition for the
+#                   ratchet, floor needs a 5-min CLOSE through it, RSI stop pre-T1
+#   5-EMA trail   - -2% hard stop on the option + check_exit (2 candles past EMA5)
+# The exit is priced at the option's 1-minute close at the signal time (what an
+# LTP quote would have shown). No slippage or charges are added to any rule.
+# =============================================================================
+_EC_STRATS = (("RSI_SIMPLE", "RSI Simple"), ("RSI_MOMENTUM", "RSI Momentum"),
+              ("FIRST5MIN_FIB", "1st 5 Min FIB"), ("EMA_SPOT_TRAIL", "5-EMA trail"))
+
+
+def _ec_params() -> dict:
+    hh, mm = ((get_auto_exit_time() or "15:20") + ":0").split(":")[:2]
+    return {
+        "eod_h": int(hh), "eod_m": int(mm),
+        "rule": dict(rsi_period=get_rsi_period(), call_threshold=get_rsi_call_threshold(),
+                     put_warning_threshold=get_rsi_put_warning_threshold(), confirm_candles=get_rsi_confirm_candles()),
+        "ema_period": get_rsi_ema_period(),
+        "midday_start": get_rsi_midday_start(), "midday_end": get_rsi_midday_end(),
+        "midday_confirm": get_rsi_midday_confirm_candles(),
+        "deep_pct": get_rsi_deep_itm_moneyness_pct(),
+        "deep_call": get_rsi_deep_itm_call_threshold(), "deep_put": get_rsi_deep_itm_put_warning_threshold(),
+    }
+
+
+def _ec_book(entry_price, qty, price, when, reason):
+    if price is None or when is None:
+        return {"time": None, "price": None, "pct": None, "pnl": None, "reason": reason or "option had no price"}
+    return {"time": when.strftime("%H:%M"), "price": round(price, 2),
+            "pct": round((price / entry_price - 1) * 100, 2) if entry_price else None,
+            "pnl": round((price - entry_price) * qty, 2), "reason": reason}
+
+
+def _ec_replay_trade(trade: dict, spot_1m: list, warm: list, opt_1m: list, params: dict) -> dict:
+    """Pure calculation (no network, no DB). trade needs: direction, entry_ist,
+    entry_price, qty, strike. spot_1m / opt_1m are raw 1-minute candles
+    [ts, o, h, l, c, vol, oi]; warm is (o, h, l, c) candles of earlier sessions.
+    Returns {strategy_id: {time, price, pct, pnl, reason}}."""
+    import bisect
+    direction, entry_ist = trade["direction"], trade["entry_ist"]
+    entry_price, qty = trade["entry_price"], trade["qty"]
+    day0 = entry_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    eod = day0.replace(hour=params["eod_h"], minute=params["eod_m"])
+    buckets = _spot_5min_buckets(spot_1m, day0 + timedelta(days=1))
+    ends = [k + timedelta(minutes=5) for k, _ in buckets]
+    ohlc = [v for _, v in buckets]
+    close_at_end = {e: v[3] for e, v in zip(ends, ohlc)}
+    times = [entry_ist] + [e for e in ends if entry_ist < e <= eod]
+    rule = params["rule"]
+    entry_min = entry_ist.replace(second=0, microsecond=0)
+
+    def price_at(when):
+        return _option_price_at(opt_1m, when)
+
+    def hold_to_eod(note):
+        return _ec_book(entry_price, qty, price_at(eod), eod, note)
+
+    def first_fire(check):
+        for T in times:
+            n = bisect.bisect_right(ends, T)
+            if n and check(T, _engine_series(warm, ohlc[:n]), n):
+                return T
+        return None
+
+    out = {}
+    # ---- RSI Simple
+    T = first_fire(lambda T, ser, n: check_rsi_simple_exit(direction, ser, **rule)[0])
+    out["RSI_SIMPLE"] = (_ec_book(entry_price, qty, price_at(T), T, "RSI rule fired") if T else hold_to_eod("never fired - held to end of day"))
+
+    # ---- RSI Momentum (with the live mid-day / Deep-ITM adjustments)
+    def mom_check(T, ser, n):
+        confirm = params["midday_confirm"] if params["midday_start"] <= T.strftime("%H:%M") < params["midday_end"] else rule["confirm_candles"]
+        call_t, put_t = rule["call_threshold"], rule["put_warning_threshold"]
+        if _is_deep_itm_option(direction, trade.get("strike"), ohlc[n - 1][3], params["deep_pct"]):
+            call_t, put_t = params["deep_call"], params["deep_put"]
+        return check_rsi_momentum_exit(direction, ser, rsi_period=rule["rsi_period"], ema_period=params["ema_period"],
+                                       call_threshold=call_t, put_warning_threshold=put_t, confirm_candles=confirm)[0]
+    T = first_fire(mom_check)
+    out["RSI_MOMENTUM"] = (_ec_book(entry_price, qty, price_at(T), T, "RSI + EMA rule fired") if T else hold_to_eod("never fired - held to end of day"))
+
+    # ---- 5-EMA (spot) trail with the -2% hard stop on the option
+    ema_T = first_fire(lambda T, ser, n: check_exit(direction, ser)[0])
+    stop_level = entry_price * 0.98
+    stop = None
+    for r in opt_1m:
+        st = _to_naive_ist(r[0])
+        en = st + timedelta(minutes=1)
+        if st < entry_min + timedelta(minutes=1) or en > eod:
+            continue
+        if ema_T is not None and en > ema_T:
+            break
+        if r[3] <= stop_level:
+            stop = (en, min(r[1], stop_level))     # a gap open below the stop fills at the open
+            break
+    if stop is not None:
+        out["EMA_SPOT_TRAIL"] = _ec_book(entry_price, qty, stop[1], stop[0], "-2% stop-loss")
+    elif ema_T is not None:
+        out["EMA_SPOT_TRAIL"] = _ec_book(entry_price, qty, price_at(ema_T), ema_T, "5-EMA (spot) reversal")
+    else:
+        out["EMA_SPOT_TRAIL"] = hold_to_eod("no stop or reversal - held to end of day")
+
+    # ---- 1st 5 Min FIB
+    first = next((b for b in buckets if b[0].strftime("%H:%M") == "09:15"), None)
+    if first is None:
+        out["FIRST5MIN_FIB"] = _ec_book(entry_price, qty, None, None, "no 09:15 candle - FIB levels unavailable")
+        return out
+    tiers = compute_first_5min_fib_targets(direction, first[1][1], first[1][2])
+    live_from = day0.replace(hour=9, minute=20)
+    fire = None
+    n0 = bisect.bisect_right(ends, entry_ist)
+    if entry_ist >= live_from and n0 and check_rsi_simple_exit(direction, _engine_series(warm, ohlc[:n0]), **rule)[0]:
+        fire = (entry_ist, "RSI stoploss before T1")
+    stage, reach = 0, None
+    if fire is None:
+        for r in spot_1m:
+            st = _to_naive_ist(r[0])
+            en = st + timedelta(minutes=1)
+            if en <= entry_ist or en > eod or en <= live_from:
+                continue
+            containing = st <= entry_ist < en
+            price = r[4] if containing else (r[2] if direction == "Buy" else r[3])   # extreme of the minute, close for the entry minute
+            new_stage, outcome = fib_stage_transition(direction, stage, tiers, price)
+            if outcome == "target":
+                fire = (en, f"reached the final target (T{new_stage})")
+                break
+            if new_stage > stage:
+                stage, reach = new_stage, st
+            if en.minute % 5 == 0 and en in close_at_end:
+                c5 = close_at_end[en]
+                if stage >= 1:
+                    floor = tiers[stage - 1]
+                    if en > reach and ((c5 <= floor) if direction == "Buy" else (c5 >= floor)):
+                        fire = (en, f"5-min close back through T{stage}")
+                        break
+                else:
+                    n = bisect.bisect_right(ends, en)
+                    if check_rsi_simple_exit(direction, _engine_series(warm, ohlc[:n]), **rule)[0]:
+                        fire = (en, "RSI stoploss before T1")
+                        break
+    out["FIRST5MIN_FIB"] = (_ec_book(entry_price, qty, price_at(fire[0]), fire[0], fire[1]) if fire
+                            else hold_to_eod("no target / reversal - held to end of day"))
+    return out
+
+
+_ec_lock = threading.Lock()
+_ec_job: dict = {"state": "idle"}
+_EC_MAX_TRADES = 600
+
+
+def _ec_save(trade_id: int, trade_date: str, status: str, note: str, results) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO exit_replay (trade_id, trade_date, computed_at, status, note, results) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT (trade_id) DO UPDATE SET trade_date = EXCLUDED.trade_date, computed_at = EXCLUDED.computed_at, "
+            "status = EXCLUDED.status, note = EXCLUDED.note, results = EXCLUDED.results",
+            (trade_id, trade_date, datetime.utcnow().isoformat(), status, note[:200],
+             json.dumps(results, separators=(",", ":")) if results is not None else None))
+        conn.commit()
+
+
+def _ec_worker(token: str, trades: list) -> None:
+    job = _ec_job
+    params = _ec_params()
+    spot_cache: dict = {}
+    try:
+        for t in trades:
+            try:
+                entry_ist = datetime.fromisoformat(t["entry_time"]) + IST_OFFSET
+                day = entry_ist.strftime("%Y-%m-%d")
+                now_ist = datetime.utcnow() + IST_OFFSET
+                if day == now_ist.strftime("%Y-%m-%d") and now_ist.strftime("%H:%M") < "15:30":
+                    job["waiting"] += 1                     # today's session is still running
+                    continue
+                spot_key = get_instrument_key(t["symbol"])
+                opt_key = t.get("paper_instrument_key")
+                if not spot_key or not opt_key:
+                    _ec_save(t["id"], day, "no_data", "no instrument key", None)
+                    job["no_data"] += 1
+                    continue
+                if (spot_key, day) not in spot_cache:
+                    spot_cache[(spot_key, day)] = (_fetch_1min_raw(spot_key, token, day=day),
+                                                   _vt_warmup_before(spot_key, token, day))
+                    time.sleep(0.15)
+                spot_1m, warm = spot_cache[(spot_key, day)]
+                try:
+                    opt_1m = _fetch_1min_raw(opt_key, token, day=day)
+                except Exception as e:
+                    opt_1m = []
+                time.sleep(0.15)
+                if not spot_1m or not opt_1m:
+                    _ec_save(t["id"], day, "no_data",
+                             "no option candles returned (contract may have expired)" if spot_1m and not opt_1m else "no underlying candles", None)
+                    job["no_data"] += 1
+                    continue
+                res = _ec_replay_trade(
+                    {"direction": t["direction"], "entry_ist": entry_ist, "entry_price": t["entry_price"],
+                     "qty": t.get("original_quantity") or t.get("quantity") or 1, "strike": t.get("paper_strike")},
+                    spot_1m, warm, opt_1m, params)
+                _ec_save(t["id"], day, "ok", "", res)
+                job["done_ok"] += 1
+            except Exception as e:
+                job["no_data"] += 1
+            finally:
+                job["checked"] += 1
+        job["state"] = "done"
+    except Exception as e:
+        job["state"] = "error"
+        job["error"] = f"{type(e).__name__}: {e}"[:200]
+
+
+@app.route("/api/exit-compare/run", methods=["POST"])
+def api_exit_compare_run():
+    """Starts the replay in the background. {"retry": true} also re-tries trades that earlier had no data."""
+    token = get_setting("upstox_access_token")
+    if not token:
+        return jsonify({"status": "error", "message": "No Upstox token saved - log in to Upstox first"}), 400
+    retry = bool((request.get_json(silent=True) or {}).get("retry"))
+    with _ec_lock:
+        if _ec_job.get("state") == "running":
+            return jsonify(dict(_ec_job))
+        try:
+            with get_db() as conn:
+                skip_status = "('ok')" if retry else "('ok', 'no_data')"
+                trades = [dict(r) for r in conn.execute(
+                    "SELECT id, symbol, direction, entry_time, entry_price, quantity, original_quantity, "
+                    "paper_instrument_key, paper_strike FROM paper_trades "
+                    "WHERE status = 'CLOSED' AND direction IN ('Buy', 'Sell') AND entry_time IS NOT NULL "
+                    "AND entry_price IS NOT NULL AND paper_instrument_key IS NOT NULL "
+                    "AND COALESCE(paper_option_label, '') NOT LIKE 'EQUITY%' "
+                    f"AND id NOT IN (SELECT trade_id FROM exit_replay WHERE status IN {skip_status}) "
+                    "ORDER BY id DESC LIMIT ?", (_EC_MAX_TRADES,)).fetchall()]
+        except (psycopg2.Error, RuntimeError):
+            return jsonify({"status": "error", "message": "database unavailable"}), 503
+        _ec_job.clear()
+        _ec_job.update({"state": "running", "total": len(trades), "checked": 0, "done_ok": 0, "no_data": 0,
+                        "waiting": 0, "error": None})
+        if not trades:
+            _ec_job["state"] = "done"
+        else:
+            threading.Thread(target=_ec_worker, args=(token, trades), daemon=True).start()
+    return jsonify(dict(_ec_job))
+
+
+@app.route("/api/exit-compare/status")
+def api_exit_compare_status():
+    return jsonify(dict(_ec_job))
+
+
+@app.route("/api/exit-compare/data")
+def api_exit_compare_data():
+    """Every replayed trade with its four results and what actually ran."""
+    try:
+        with get_db() as conn:
+            rs = conn.execute(
+                "SELECT r.trade_id, r.trade_date, r.results, t.symbol, t.direction, t.entry_fc_ratio, t.entry_time, "
+                "t.exit_time, t.entry_price, t.strategy, t.pnl_pct, t.pnl FROM exit_replay r "
+                "JOIN paper_trades t ON t.id = r.trade_id WHERE r.status = 'ok' ORDER BY r.trade_date, r.trade_id").fetchall()
+            cov = conn.execute("SELECT status, COUNT(*) AS n FROM exit_replay GROUP BY status").fetchall()
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    band_names = [b[0] for b in _FCV_BANDS]
+    trades = []
+    for r in rs:
+        ratio = r["entry_fc_ratio"]
+        trades.append({
+            "id": r["trade_id"], "date": r["trade_date"], "symbol": r["symbol"], "direction": r["direction"],
+            "fc_ratio": ratio, "band": band_names[fcv_band_index(ratio)] if ratio is not None else None,
+            "entry_hhmm": (datetime.fromisoformat(r["entry_time"]) + IST_OFFSET).strftime("%H:%M"),
+            "exit_hhmm": (datetime.fromisoformat(r["exit_time"]) + IST_OFFSET).strftime("%H:%M") if r["exit_time"] else None,
+            "entry_price": r["entry_price"], "actual_strategy": _FCV_STRATEGY_LABELS.get(r["strategy"], r["strategy"] or ""),
+            "actual_pct": r["pnl_pct"], "actual_pnl": r["pnl"], "results": json.loads(r["results"]),
+        })
+    return jsonify({"trades": trades, "coverage": {c["status"]: c["n"] for c in cov},
+                    "strategies": [{"id": a, "name": b} for a, b in _EC_STRATS], "bands": band_names})
+
+
+@app.route("/exit-compare")
+def exit_compare_page():
+    return render_template("exit_compare.html", active_tab="exit_compare")
 
 # ---------------------------------------------------------------------------
 # Back-fill of the 9:15 volume reading onto PAST trades, so the Stats page can
