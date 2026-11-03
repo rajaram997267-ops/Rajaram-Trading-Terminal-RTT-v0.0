@@ -173,6 +173,10 @@
   <div class="chart-box">
     <h3>Performance by 9:15 Volume Band</h3>
     <div class="sub">Closed paper trades only - the 9:15 candle's volume vs its own 10-session average, logged when each trade opened</div>
+    <div style="margin:6px 0 10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <button id="fcBackfillBtn" style="background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer;">Fill 9:15 data for past trades</button>
+      <span class="sub" id="fcBackfillStatus">Looks up each past trade's 9:15 volume from Upstox history. Runs in the background - you can leave this page open or come back later.</span>
+    </div>
     <div class="table-scroll"><table class="breakdown" id="bandTable"></table></div>
   </div>
 
@@ -383,6 +387,26 @@
       });
       table.innerHTML = html;
     }
+
+    async function fcBackfillPoll(first) {
+      const st = document.getElementById("fcBackfillStatus");
+      try {
+        const res = await fetch("/api/first-candle-backfill", first ? { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" } : undefined);
+        const d = await res.json();
+        if (!res.ok) { st.textContent = d.message || "Could not start"; return; }
+        if (d.state === "running") {
+          st.textContent = "Working... " + d.done + " of " + d.total + " trades checked, " + d.filled + " filled";
+          setTimeout(() => fcBackfillPoll(false), 3000);
+        } else if (d.state === "done") {
+          st.textContent = "Done. " + d.filled + " trades filled" + (d.skipped_early ? ", " + d.skipped_early + " skipped (entered before 9:22, when the 9:15 candle was not yet known)" : "") +
+            (d.no_data ? ", " + d.no_data + " had no usable data" : "") + ".";
+          loadBreakdown();
+        } else if (d.state === "error") {
+          st.textContent = "Stopped: " + (d.error || "error");
+        }
+      } catch (e) { st.textContent = "Could not reach the server"; }
+    }
+    document.getElementById("fcBackfillBtn").onclick = () => fcBackfillPoll(true);
 
     async function loadBreakdown() {
       try {
