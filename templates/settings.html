@@ -172,6 +172,7 @@
     <a href="/shadow" class="{% if active_tab == 'shadow' %}active{% endif %}">Manual vs RSI</a>
     <a href="/exit-lab" class="{% if active_tab == 'exit_lab' %}active{% endif %}">Exit Lab</a>
     <a href="/first-candle" class="{% if active_tab == 'first_candle' %}active{% endif %}">First Candle</a>
+    <a href="/exit-compare" class="{% if active_tab == 'exit_compare' %}active{% endif %}">Exit Compare</a>
   </div>
 
   <div class="settings-box">
@@ -446,10 +447,10 @@
     <hr style="border:none; border-top:1px solid var(--border); width:100%; margin:4px 0;">
     <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
       <label class="switch"><input type="checkbox" id="fcvRot" {% if fcv.rotate_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
-      <span style="font-weight:600;">Exit-strategy rotation test (paper only)</span>
+      <span style="font-weight:600;">Exit-strategy rotation test (paper and live)</span>
       <span class="token-status" id="fcvRotStatus">...</span>
     </div>
-    <div class="token-status">Each new trade takes the next ticked strategy in turn, so every strategy collects its own real trades - compare them on the Stats page under "9:15 Volume Band x Exit Strategy". While this is on, new trades are <b>paper only</b>: no live order is placed (live trading shows those trades as not placed). A band chosen in "Exit strategy by 9:15 volume band" above takes priority over the rotation.</div>
+    <div class="token-status">Each new trade takes the next ticked strategy in turn, so every strategy collects its own real trades - compare them on the Stats page under "9:15 Volume Band x Exit Strategy". It applies to live trades too once live trading is on. <b>Note:</b> RSI Momentum and 1st 5 Min FIB have no broker-side stop-loss on a live position, and RSI Simple only has the normal -2% stop - so tick only the strategies you are happy to run live. A band chosen in "Exit strategy by 9:15 volume band" above takes priority over the rotation.</div>
     <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center;">
       {% for sid, label in fcv_strategy_options %}
       <label style="display:flex; gap:6px; align-items:center;"><input type="checkbox" class="fcvRotItem" value="{{ sid }}" {% if sid in fcv.rotate_list %}checked{% endif %} onchange="saveFcv()"> {{ label }}</label>
@@ -803,7 +804,7 @@
         : "OFF - 9:15 volume does not affect entries";
       document.getElementById("fcvRouteStatus").textContent = d.route_enabled ? "ON" : "OFF - every trade uses the default strategy";
       document.getElementById("fcvRotStatus").textContent = d.rotate_enabled
-        ? (d.rotate_list && d.rotate_list.length ? "ON - paper only, " + d.rotate_list.length + " strategies in turn" : "ON but none ticked - nothing rotates")
+        ? (d.rotate_list && d.rotate_list.length ? "ON - " + d.rotate_list.length + " strategies in turn (paper and live)" : "ON but none ticked - nothing rotates")
         : "OFF";
       const el = document.getElementById("fcvLog");
       if (!d.log || !d.log.length) {

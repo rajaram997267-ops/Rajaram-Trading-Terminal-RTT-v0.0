@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - Exit Compare</title>
+  <style>
+    :root { --bg:#0b0e14; --panel:#131722; --border:#1e222d; --text:#e6e9f0; --muted:#6b7280; --green:#00c896; --gold:#ffb800; --red:#ff5370; }
+    :root[data-theme="light-gray"] { --red:#dc2626; --bg:#e9ebee; --panel:#ffffff; --border:#d0d4da; --text:#1a1d23; --muted:#6b7280; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="sky-blue"] { --red:#dc2626; --bg:#eaf4fb; --panel:#ffffff; --border:#bfe0f2; --text:#10222c; --muted:#4a6572; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="off-white"] { --red:#dc2626; --bg:#f7f5f0; --panel:#ffffff; --border:#e2ddd2; --text:#1f1c16; --muted:#6b6455; --green:#0e9f6e; --gold:#b45309; }
+    * { box-sizing: border-box; }
+    body { font-family:'Segoe UI',Arial,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px 32px 48px; }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .tabbar { display:flex; gap:4px; border-bottom:1px solid var(--border); margin:18px 0 20px; overflow-x:auto; }
+    .tabbar a { padding:10px 14px; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; white-space:nowrap; }
+    .tabbar a.active { color:var(--text); border-bottom-color:var(--green); }
+    .tabbar a:hover { color:var(--text); }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:0 0 12px; font-size:13px; color:var(--muted); }
+    .controls input, .controls select { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:13px; }
+    .controls button { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
+    .controls button:hover { border-color:var(--green); }
+    #status, #cov { font-size:13px; color:var(--muted); margin:0 0 10px; min-height:18px; }
+    h3 { margin:24px 0 4px; font-size:16px; }
+    .wrap { overflow-x:auto; background:var(--panel); border:1px solid var(--border); border-radius:8px; margin-top:8px; }
+    table { border-collapse:collapse; width:100%; font-size:12px; }
+    th, td { border-bottom:1px solid var(--border); padding:8px 10px; text-align:left; white-space:nowrap; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; }
+    tr:last-child td { border-bottom:none; }
+    tr.actual td { font-weight:600; border-top:2px solid var(--border); }
+    .pos { color:var(--green); } .neg { color:var(--red); } .mut { color:var(--muted); }
+    .tag { font-size:10px; padding:1px 6px; border-radius:8px; border:1px solid var(--border); }
+    .tag.Buy { color:var(--green); border-color:var(--green); } .tag.Sell { color:var(--red); border-color:var(--red); }
+    .foot { margin-top:14px; font-size:11px; color:var(--muted); line-height:1.6; max-width:1000px; }
+  </style>
+</head>
+<body>
+  <h2 style="margin:0">Exit Compare <span style="color:var(--muted);font-weight:400;font-size:14px">RTT v0.0</span></h2>
+  <div class="sub">Every past trade replayed through four exit rules on the same entry, so the strategies are compared on identical trades. Read-only.</div>
+
+  <div class="tabbar">
+    <a href="/">Dashboard</a>
+    <a href="/paper-trading">Paper Trading</a>
+    <a href="/live-trading">Live Trading</a>
+    <a href="/stats">Stats</a>
+    <a href="/websocket-stats">WS Speed</a>
+    <a href="/settings">Settings</a>
+    <a href="/shadow">Manual vs RSI</a>
+    <a href="/exit-lab">Exit Lab</a>
+    <a href="/first-candle">First Candle</a>
+    <a href="/exit-compare" class="active">Exit Compare</a>
+  </div>
+
+  <div class="controls">
+    <button id="runBtn">Replay new trades</button>
+    <label><input type="checkbox" id="retryBox"> also retry trades that had no data</label>
+  </div>
+  <div id="status">Replays each closed paper trade from Upstox history in the background (a few minutes for a few hundred trades). You can leave this page open or come back later.</div>
+  <div id="cov"></div>
+
+  <div class="controls">
+    <label>9:15 band <select id="fBand"></select></label>
+    <label>Direction <select id="fDir"><option value="">All</option><option value="Buy">Buy</option><option value="Sell">Sell</option></select></label>
+    <label>From <input type="date" id="fFrom"></label>
+    <label>To <input type="date" id="fTo"></label>
+    <label><input type="checkbox" id="fPaired" checked> only trades where all four rules have a price</label>
+  </div>
+
+  <h3>Result</h3>
+  <div class="sub" id="sumNote"></div>
+  <div class="wrap"><table>
+    <thead><tr><th>Exit rule</th><th>Trades</th><th>Win rate</th><th>Avg %</th><th>Median %</th><th>Total %</th><th>Profit factor</th><th>Total P&amp;L (Rs)</th><th>Best on</th></tr></thead>
+    <tbody id="sumBody"></tbody>
+  </table></div>
+
+  <h3>Trade by trade</h3>
+  <div class="wrap"><table>
+    <thead><tr id="tHead"></tr></thead>
+    <tbody id="tBody"></tbody>
+  </table></div>
+
+  <div class="foot">
+    <b>How to read it:</b> every row of the Result table uses the same trades (when the box above is ticked), so the numbers are directly comparable. "Best on" counts the trades where that rule had the highest % (ties count for each). "What actually ran" is what your trades really made, which mixes in whatever strategy was active on each day.
+    <b>Approximations:</b> each exit is priced at the option's 1-minute close at the signal time, with no slippage or charges. FIB touches use the underlying's 1-minute highs/lows. The RSI/EMA settings used are the ones currently in Settings, not necessarily those active on the day. Trades whose option contract has expired may have no price data and are listed as "no data" in the count above.
+    A rule needs roughly 30 or more trades before its numbers mean much.
+  </div>
+
+<script>
+  let DATA = null, timer = null;
+  const SHORT = { "RSI_SIMPLE": "RSI Simple", "RSI_MOMENTUM": "RSI Momentum", "FIRST5MIN_FIB": "1st 5 Min FIB", "EMA_SPOT_TRAIL": "5-EMA trail" };
+
+  function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+  function cls(v) { return v > 0 ? "pos" : v < 0 ? "neg" : ""; }
+  function pctTxt(v) { return v === null || v === undefined ? '<span class="mut">-</span>' : '<span class="' + cls(v) + '">' + (v > 0 ? "+" : "") + v.toFixed(2) + '%</span>'; }
+  function inr(v) { return v === null || v === undefined ? "-" : (v < 0 ? "-" : "") + Math.abs(Math.round(v)).toLocaleString("en-IN"); }
+  function median(a) { const s = a.slice().sort((x, y) => x - y), n = s.length; return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : null; }
+
+  function filtered() {
+    const band = document.getElementById("fBand").value, dir = document.getElementById("fDir").value;
+    const from = document.getElementById("fFrom").value, to = document.getElementById("fTo").value;
+    const paired = document.getElementById("fPaired").checked;
+    return DATA.trades.filter(t => {
+      if (band === "__none") { if (t.band) return false; } else if (band && t.band !== band) return false;
+      if (dir && t.direction !== dir) return false;
+      if (from && t.date < from) return false;
+      if (to && t.date > to) return false;
+      if (paired && !DATA.strategies.every(s => t.results[s.id] && t.results[s.id].pct !== null && t.results[s.id].pct !== undefined)) return false;
+      return true;
+    });
+  }
+
+  function stats(vals, rupees) {
+    const n = vals.length, wins = vals.filter(v => v > 0).length;
+    const gain = vals.filter(v => v > 0).reduce((a, b) => a + b, 0), loss = -vals.filter(v => v < 0).reduce((a, b) => a + b, 0);
+    return { n, wr: n ? wins / n * 100 : null, avg: n ? vals.reduce((a, b) => a + b, 0) / n : null, med: median(vals),
+             tot: vals.reduce((a, b) => a + b, 0), pf: loss > 0 ? gain / loss : null, rs: rupees.reduce((a, b) => a + b, 0) };
+  }
+
+  function render() {
+    if (!DATA) return;
+    const ts = filtered();
+    document.getElementById("sumNote").textContent = ts.length + " trades in this view";
+    // best-on counts
+    const best = {}; DATA.strategies.forEach(s => best[s.id] = 0);
+    ts.forEach(t => {
+      let top = -Infinity;
+      DATA.strategies.forEach(s => { const p = t.results[s.id] && t.results[s.id].pct; if (p !== null && p !== undefined && p > top) top = p; });
+      if (top === -Infinity) return;
+      DATA.strategies.forEach(s => { const p = t.results[s.id] && t.results[s.id].pct; if (p !== null && p !== undefined && p === top) best[s.id]++; });
+    });
+    let html = "";
+    DATA.strategies.forEach(s => {
+      const rows = ts.filter(t => t.results[s.id] && t.results[s.id].pct !== null && t.results[s.id].pct !== undefined);
+      const st = stats(rows.map(t => t.results[s.id].pct), rows.map(t => t.results[s.id].pnl || 0));
+      html += rowHtml(s.name, st, best[s.id]);
+    });
+    const act = ts.filter(t => t.actual_pct !== null && t.actual_pct !== undefined);
+    html += rowHtml("What actually ran", stats(act.map(t => t.actual_pct), act.map(t => t.actual_pnl || 0)), null, true);
+    document.getElementById("sumBody").innerHTML = html;
+
+    document.getElementById("tHead").innerHTML = ["Date", "Symbol", "Dir", "9:15 ratio", "Entry", "What ran"].concat(DATA.strategies.map(s => s.name)).map(h => "<th>" + esc(h) + "</th>").join("");
+    document.getElementById("tBody").innerHTML = ts.slice().reverse().map(t => {
+      const cells = DATA.strategies.map(s => {
+        const r = t.results[s.id];
+        if (!r || r.pct === null || r.pct === undefined) return '<td class="mut" title="' + esc(r ? r.reason : "") + '">-</td>';
+        return '<td title="' + esc(r.reason) + '">' + pctTxt(r.pct) + ' <span class="mut">' + esc(r.time) + '</span></td>';
+      }).join("");
+      return '<tr><td>' + esc(t.date) + '</td><td>' + esc(t.symbol) + '</td><td><span class="tag ' + esc(t.direction) + '">' + esc(t.direction) + '</span></td>' +
+        '<td>' + (t.fc_ratio === null || t.fc_ratio === undefined ? '<span class="mut">-</span>' : t.fc_ratio + "&times;") + '</td>' +
+        '<td>' + esc(t.entry_hhmm) + ' <span class="mut">@ ' + t.entry_price + '</span></td>' +
+        '<td>' + pctTxt(t.actual_pct) + ' <span class="mut">' + esc(t.actual_strategy) + '</span></td>' + cells + '</tr>';
+    }).join("");
+  }
+
+  function rowHtml(name, st, bestN, isActual) {
+    return '<tr class="' + (isActual ? "actual" : "") + '"><td>' + esc(name) + '</td><td>' + st.n + '</td><td>' + (st.wr === null ? "-" : st.wr.toFixed(1) + "%") +
+      '</td><td>' + pctTxt(st.avg) + '</td><td>' + pctTxt(st.med) + '</td><td>' + pctTxt(st.n ? st.tot : null) + '</td><td>' + (st.pf === null ? "-" : st.pf.toFixed(2)) +
+      '</td><td class="' + cls(st.rs) + '">' + inr(st.n ? st.rs : null) + '</td><td>' + (bestN === null ? '<span class="mut">-</span>' : bestN) + '</td></tr>';
+  }
+
+  async function load() {
+    const res = await fetch("/api/exit-compare/data");
+    const d = await res.json();
+    if (!res.ok) { document.getElementById("status").textContent = d.error || "Could not load"; return; }
+    DATA = d;
+    const sel = document.getElementById("fBand"), keep = sel.value;
+    sel.innerHTML = '<option value="">All bands</option>' + d.bands.map(b => '<option value="' + esc(b) + '">' + esc(b) + '</option>').join("") + '<option value="__none">No 9:15 data</option>';
+    sel.value = keep;
+    const c = d.coverage || {};
+    document.getElementById("cov").textContent = (c.ok || 0) + " trades replayed" + (c.no_data ? ", " + c.no_data + " had no usable data (often an expired option contract)" : "") + ".";
+    render();
+  }
+
+  async function poll(first) {
+    const st = document.getElementById("status");
+    try {
+      const res = await fetch("/api/exit-compare/" + (first ? "run" : "status"), first ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ retry: document.getElementById("retryBox").checked }) } : undefined);
+      const d = await res.json();
+      if (!res.ok) { st.textContent = d.message || "Could not start"; return; }
+      if (d.state === "running") {
+        st.textContent = "Working... " + d.checked + " of " + d.total + " trades checked, " + d.done_ok + " replayed";
+        timer = setTimeout(() => poll(false), 3000);
+      } else if (d.state === "done") {
+        st.textContent = "Done. " + d.done_ok + " replayed, " + d.no_data + " had no data" + (d.waiting ? ", " + d.waiting + " from today wait until 15:30" : "") + ".";
+        load();
+      } else if (d.state === "error") {
+        st.textContent = "Stopped: " + (d.error || "error");
+      }
+    } catch (e) { st.textContent = "Could not reach the server"; }
+  }
+
+  document.getElementById("runBtn").onclick = () => { clearTimeout(timer); poll(true); };
+  ["fBand", "fDir", "fFrom", "fTo", "fPaired"].forEach(id => document.getElementById(id).onchange = render);
+  load();
+</script>
+</body>
+</html>
