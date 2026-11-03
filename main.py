@@ -3952,7 +3952,7 @@ _FCV_KEYS = ("fcv_gate_enabled", "fcv_gate_bands", "fcv_dir_enabled", "fcv_dir_m
              "fcv_allow_unknown", "fcv_route_enabled",
              "fcv_route_0", "fcv_route_1", "fcv_route_2", "fcv_route_3",
              "fcv_rotate_enabled", "fcv_rotate_list", "fcv_rotate_next",
-             "fcv_auto_enabled", "fcv_auto_min_n", "fcv_auto_margin")
+             "fcv_auto_enabled", "fcv_auto_min_n", "fcv_auto_margin", "fcv_auto_conf")
 # Strategies compared by the optional rotation test (a new trade takes the next one in turn).
 _FCV_ROTATE_DEFAULT = ("RSI_SIMPLE", "RSI_MOMENTUM", "FIRST5MIN_FIB", "EMA_SPOT_TRAIL")
 _FCV_STRATEGY_LABELS = {
@@ -4026,8 +4026,12 @@ def fcv_settings() -> dict:
         auto_margin = max(float(vals.get("fcv_auto_margin", "0.5") or 0.5), 0.0)
     except (TypeError, ValueError):
         auto_margin = 0.5
+    try:   # how clearly the best rule must lead the runner-up (0 = guard off)
+        auto_conf = max(float(vals.get("fcv_auto_conf", "2") if vals.get("fcv_auto_conf") not in (None, "") else 2.0), 0.0)
+    except (TypeError, ValueError):
+        auto_conf = 2.0
     return {
-        "auto_enabled": flag("fcv_auto_enabled"), "auto_min_n": auto_min_n, "auto_margin": auto_margin,
+        "auto_enabled": flag("fcv_auto_enabled"), "auto_min_n": auto_min_n, "auto_margin": auto_margin, "auto_conf": auto_conf,
         "rotate_enabled": flag("fcv_rotate_enabled"), "rotate_list": rotate_list, "rotate_next": rotate_next,
         "gate_enabled": flag("fcv_gate_enabled"), "bands": sorted(bands),
         "dir_enabled": flag("fcv_dir_enabled"), "dir_min_pct": min_pct,
@@ -4056,11 +4060,13 @@ def _fcv_pct_stats(vals: list) -> dict:
             "pf": round(sum(wins) / abs(sum(losses)), 2) if losses else None}
 
 
-def fcv_auto_build(min_n: int, margin: float) -> dict:
+def fcv_auto_build(min_n: int, margin: float, conf: float = 0.0) -> dict:
     """Scores every selectable exit rule inside each 9:15 volume band and decides which band gets which rule.
     A band gets a pick only if (a) it has at least min_n replayed trades, and (b) the best rule's average %
-    beats what actually ran on those same trades by at least `margin` points. Otherwise pick is None and the
-    band keeps the normal default strategy."""
+    beats what actually ran on those same trades by at least `margin` points, and (c) when conf > 0, the best
+    rule leads the runner-up CLEARLY: a paired t-score over the same trades (mean lead / its standard error) must
+    be at least `conf`, so a lead that rests on one or two big trades is treated as luck. Otherwise pick is None
+    and the band keeps the normal default strategy."""
     with get_db() as conn:
         rs = conn.execute(
             "SELECT r.results, t.entry_fc_ratio, t.pnl_pct FROM exit_replay r JOIN paper_trades t ON t.id = r.trade_id "
@@ -4089,7 +4095,7 @@ def fcv_auto_build(min_n: int, margin: float) -> dict:
         used += 1
     ist = datetime.utcnow() + IST_OFFSET
     out = {"built_at": ist.strftime("%Y-%m-%d %H:%M"), "built_date": ist.strftime("%Y-%m-%d"),
-           "min_n": min_n, "margin": margin, "trades": used, "bands": {}}
+           "min_n": min_n, "margin": margin, "conf": conf, "trades": used, "bands": {}}
     for i, (band_name, _lo, _hi) in enumerate(_FCV_BANDS):
         rules = {}
         for rid, name in _FCV_AUTO_RULES:
@@ -4098,7 +4104,7 @@ def fcv_auto_build(min_n: int, margin: float) -> dict:
                 rules[rid] = {"name": name, **_fcv_pct_stats(vals)}
         n = len(per[i]["rules"][_FCV_AUTO_RULES[0][0]])
         actual_avg = round(sum(per[i]["actual"]) / len(per[i]["actual"]), 2) if per[i]["actual"] else None
-        pick, why = None, ""
+        pick, why, t_out, second_name = None, "", None, None
         if n < min_n:
             why = f"only {n} replayed trades (needs {min_n})"
         elif rules:
@@ -4107,10 +4113,23 @@ def fcv_auto_build(min_n: int, margin: float) -> dict:
             if rules[best]["avg"] >= base + margin:
                 pick = best
                 why = f"best average of the rules ({rules[best]['avg']:+.2f}% vs {base:+.2f}% actually ran)"
+                ranked = sorted(rules, key=lambda k: -rules[k]["avg"])
+                if len(ranked) > 1:
+                    second = ranked[1]
+                    second_name = rules[second]["name"]
+                    diffs = [x - y for x, y in zip(per[i]["rules"][best], per[i]["rules"][second])]
+                    m = sum(diffs) / len(diffs)
+                    sd = (sum((x - m) ** 2 for x in diffs) / (len(diffs) - 1)) ** 0.5 if len(diffs) > 1 else 0.0
+                    t_stat = (m / (sd / len(diffs) ** 0.5)) if sd > 0 else (99.0 if m > 0 else 0.0)
+                    t_out = round(min(t_stat, 99.0), 2)
+                    if conf > 0 and t_stat < conf:
+                        pick = None
+                        why = (f"{rules[best]['name']} leads {second_name} by {m:+.2f}% on average, but not clearly enough "
+                               f"(confidence {t_out:g}, needs {conf:g}) - the lead may be luck")
             else:
                 why = (f"best rule {rules[best]['name']} {rules[best]['avg']:+.2f}% doesn't beat what actually "
                        f"ran ({base:+.2f}%) by {margin:g}")
-        out["bands"][str(i)] = {"band": band_name, "n": n, "pick": pick,
+        out["bands"][str(i)] = {"band": band_name, "n": n, "pick": pick, "t": t_out, "runner_up": second_name,
                                 "pick_name": _FCV_STRATEGY_LABELS.get(pick, pick) if pick else None,
                                 "actual_avg": actual_avg, "why": why, "rules": rules}
     return out
@@ -4127,11 +4146,12 @@ def fcv_auto_table(cfg: dict, force: bool = False):
         tbl = None
     today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
     stale = (tbl is None or tbl.get("built_date") != today
-             or tbl.get("min_n") != cfg["auto_min_n"] or tbl.get("margin") != cfg["auto_margin"])
+             or tbl.get("min_n") != cfg["auto_min_n"] or tbl.get("margin") != cfg["auto_margin"]
+             or tbl.get("conf") != cfg["auto_conf"])
     if force or stale:
         with _fcv_auto_lock:
             try:
-                tbl = fcv_auto_build(cfg["auto_min_n"], cfg["auto_margin"])
+                tbl = fcv_auto_build(cfg["auto_min_n"], cfg["auto_margin"], cfg["auto_conf"])
                 set_setting("fcv_auto_table", json.dumps(tbl, separators=(",", ":")))
             except Exception as e:
                 print(f"[fcv-auto] rebuild failed: {type(e).__name__}: {e}", flush=True)
@@ -4269,7 +4289,7 @@ def api_first_candle_gate():
                     pass
             if "auto_enabled" in d:
                 set_setting("fcv_auto_enabled", "true" if d["auto_enabled"] else "false")
-            for src, dst in (("auto_min_n", "fcv_auto_min_n"), ("auto_margin", "fcv_auto_margin")):
+            for src, dst in (("auto_min_n", "fcv_auto_min_n"), ("auto_margin", "fcv_auto_margin"), ("auto_conf", "fcv_auto_conf")):
                 if src in d:
                     try:
                         set_setting(dst, str(max(float(d[src]), 0.0)))
