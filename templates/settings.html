@@ -446,6 +446,22 @@
     {% endfor %}
     <hr style="border:none; border-top:1px solid var(--border); width:100%; margin:4px 0;">
     <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvAuto" {% if fcv.auto_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span style="font-weight:600;">Auto-pick the best exit strategy for each 9:15 volume band</span>
+      <span class="token-status" id="fcvAutoStatus">...</span>
+    </div>
+    <div class="token-status">Uses the Exit Compare replays: every past trade replayed through RSI Simple, RSI Momentum, 1st 5 Min FIB and the 5-EMA trail, grouped by 9:15 volume band. A band uses the rule with the best average % - but only if it has enough replayed trades and the rule beats what actually ran there by the margin below; otherwise that band keeps your default strategy. Recomputed once a day and when you press Rebuild now, from whatever Exit Compare has replayed so far (run "Replay new trades" there to add recent trades). Priority: a band chosen by hand above, then the rotation test below, then this. The 5-EMA trail has no live version of its own - live trades use the normal live exit rule when it is picked.</div>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <span>Minimum trades in a band</span>
+      <input type="text" id="fcvAutoMin" value="{{ fcv.auto_min_n }}" style="width:46px; text-align:center;" onchange="saveFcv()">
+      <span>Rule must beat what actually ran by</span>
+      <input type="text" id="fcvAutoMargin" value="{{ '%g' % fcv.auto_margin }}" style="width:46px; text-align:center;" onchange="saveFcv()">
+      <span>% average</span>
+      <button class="secondary" onclick="rebuildFcvAuto()">Rebuild now</button>
+    </div>
+    <div id="fcvAutoTable" class="token-status">Loading...</div>
+    <hr style="border:none; border-top:1px solid var(--border); width:100%; margin:4px 0;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
       <label class="switch"><input type="checkbox" id="fcvRot" {% if fcv.rotate_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
       <span style="font-weight:600;">Exit-strategy rotation test (paper and live)</span>
       <span class="token-status" id="fcvRotStatus">...</span>
@@ -806,13 +822,27 @@
       document.getElementById("fcvRotStatus").textContent = d.rotate_enabled
         ? (d.rotate_list && d.rotate_list.length ? "ON - " + d.rotate_list.length + " strategies in turn (paper and live)" : "ON but none ticked - nothing rotates")
         : "OFF";
+      document.getElementById("fcvAutoStatus").textContent = d.auto_enabled ? "ON" : "OFF - table below is for information only";
+      const at = d.auto_table, ael = document.getElementById("fcvAutoTable");
+      if (!at) {
+        ael.textContent = "Not built yet - switch it on or press Rebuild now. It needs trades replayed on the Exit Compare page.";
+      } else {
+        ael.innerHTML = `<div>Built ${escapeHtml(at.built_at)} from ${at.trades} replayed trades (minimum ${at.min_n} per band, margin ${at.margin}%)</div>` +
+          Object.keys(at.bands).map((k) => {
+            const b = at.bands[k];
+            const rules = Object.keys(b.rules).map((r) => b.rules[r]).sort((x, y) => y.avg - x.avg)
+              .map((r) => `${escapeHtml(r.name)} ${r.avg > 0 ? "+" : ""}${r.avg}% (win ${r.win}%)`).join(" | ");
+            const verdict = b.pick ? `<span style="color:var(--green); font-weight:600;">uses ${escapeHtml(b.pick_name)}</span>` : `<span style="color:var(--muted);">default strategy - ${escapeHtml(b.why)}</span>`;
+            return `<div style="margin-top:6px;"><b>${escapeHtml(b.band)}</b> (${b.n} trades): ${verdict}<div>${rules}</div></div>`;
+          }).join("");
+      }
       const el = document.getElementById("fcvLog");
       if (!d.log || !d.log.length) {
         el.textContent = (d.gate_enabled || d.route_enabled) ? "No alerts judged yet since the app last started." : "Nothing yet - both switches are off.";
         return;
       }
       el.innerHTML = d.log.slice(0, 20).map((x) => {
-        const colour = (x.outcome === "ALLOWED" || x.outcome === "ROUTED") ? "var(--green)" : (x.outcome === "error" ? "var(--red)" : "var(--muted)");
+        const colour = (x.outcome === "ALLOWED" || x.outcome === "ROUTED" || x.outcome === "AUTO-PICKED") ? "var(--green)" : (x.outcome === "error" ? "var(--red)" : "var(--muted)");
         return `<div><span style="color:${colour}; font-weight:600;">${escapeHtml(x.outcome)}</span> ${escapeHtml(x.at)} ${escapeHtml(x.symbol)} (${escapeHtml(x.category)}) - ${escapeHtml(x.detail)}</div>`;
       }).join("");
     }
@@ -828,6 +858,19 @@
       }
     }
 
+    async function rebuildFcvAuto() {
+      document.getElementById("fcvAutoTable").textContent = "Rebuilding...";
+      try {
+        const res = await fetch("/api/first-candle-gate", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ auto_rebuild: true }),
+        });
+        fcvRender(await res.json());
+      } catch (err) {
+        document.getElementById("fcvAutoTable").textContent = "Rebuild failed - see console";
+        console.error(err);
+      }
+    }
+
     async function saveFcv() {
       const route = {};
       document.querySelectorAll(".fcvRoute").forEach((sel) => { route[sel.dataset.band] = sel.value; });
@@ -839,6 +882,9 @@
         allow_unknown: document.getElementById("fcvUnknown").checked,
         route_enabled: document.getElementById("fcvRoute").checked,
         route: route,
+        auto_enabled: document.getElementById("fcvAuto").checked,
+        auto_min_n: parseFloat(document.getElementById("fcvAutoMin").value) || 10,
+        auto_margin: parseFloat(document.getElementById("fcvAutoMargin").value) || 0,
         rotate_enabled: document.getElementById("fcvRot").checked,
         rotate_list: Array.from(document.querySelectorAll(".fcvRotItem")).filter((x) => x.checked).map((x) => x.value),
       };
