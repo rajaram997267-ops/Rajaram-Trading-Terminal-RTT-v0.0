@@ -5280,6 +5280,15 @@ def place_live_order_checked(instrument_key: str, side: str, quantity: int, acce
 
 
 def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[str | None, str | None, float | None]:
+    """Same as _close_live_position_if_any_unlocked, but only one caller at a
+    time: the check-order-book-then-place-SELL step must not run twice in
+    parallel (background exit check + a manual exit), or both could place a
+    SELL before either shows up in the order book."""
+    with _live_close_lock:
+        return _close_live_position_if_any_unlocked(trade, access_token)
+
+
+def _close_live_position_if_any_unlocked(trade: dict, access_token: str | None) -> tuple[str | None, str | None, float | None]:
     """Closes this trade's live option position with ONE SELL, safely.
     Returns (order_id, error, fill_price). order_id is returned ONLY when the
     SELL is confirmed complete at Upstox - callers mark the trade CLOSED on a
@@ -5339,6 +5348,17 @@ def _close_live_position_if_any(trade: dict, access_token: str | None) -> tuple[
 EXIT_CHECK_INTERVAL_SECONDS = 5
 _exit_check_thread_started = False
 _exit_check_lock = threading.Lock()
+# Serialises the "look for an exit order, otherwise place one" step of closing a
+# live position, so the background check and a manual exit can never both SELL.
+_live_close_lock = threading.Lock()
+# Manual exits get priority over the background check: while one is waiting, no
+# new background pass starts. If a pass is still running after
+# MANUAL_EXIT_LOCK_WAIT_SECONDS (slow/hung Upstox call), the manual exit goes
+# ahead without the lock instead of failing - see paper_trading_manual_exit.
+_manual_exit_waiting = 0
+_manual_exit_waiting_lock = threading.Lock()
+MANUAL_EXIT_LOCK_WAIT_SECONDS = 12
+_pass_info = {"started": None, "stage": ""}   # what the running exit check is doing (diagnostics only)
 
 
 def _is_market_hours_ist() -> bool:
@@ -5412,11 +5432,16 @@ def run_paper_trade_check() -> dict:
     actually run in the near-totality of cases instead of routinely
     bouncing off an in-flight background poll. Still gives up (rather
     than queuing indefinitely) if something is genuinely stuck."""
+    if _manual_exit_waiting > 0:
+        return {"checked": 0, "closed": 0, "note": "A manual exit is in progress - this check was skipped."}
     if not _exit_check_lock.acquire(timeout=3):
         return {"checked": 0, "closed": 0, "note": "A check was already running and didn't finish in time - try again."}
     try:
+        _pass_info["started"] = time.monotonic()
+        _pass_info["stage"] = "starting"
         return _run_paper_trade_check_impl()
     finally:
+        _pass_info["started"] = None
         _exit_check_lock.release()
 
 
@@ -5435,6 +5460,7 @@ def _run_paper_trade_check_impl() -> dict:
             "SELECT * FROM paper_trades WHERE status = 'OPEN' OR live_status = 'OPEN'"
         ).fetchall()
 
+    _pass_info["stage"] = "websocket setup"
     ensure_websocket_started(access_token)
     # Same staleness/reconnect check api_websocket_stats now runs on its
     # own poll - see _ws_check_and_heal's docstring. This function fires
@@ -5489,6 +5515,7 @@ def _run_paper_trade_check_impl() -> dict:
     for trade in open_trades:
         checked += 1
         symbol = trade["symbol"]
+        _pass_info["stage"] = f"checking {symbol}"
         try:
             instrument_key = trade["paper_instrument_key"] or get_instrument_key(symbol)
             if not instrument_key:
@@ -6778,7 +6805,7 @@ def _run_paper_trade_check_impl() -> dict:
                         SET status = 'CLOSED', exit_price = ?, exit_time = ?,
                             pnl = ?, pnl_pct = ?, exit_reason = ?, last_checked_price = ?,
                             last_checked_time = ?, last_error = NULL, exit_rsi = ?, mae_pct = ?
-                        WHERE id = ?
+                        WHERE id = ? AND status = 'OPEN'
                         """,
                         (exit_price, now, total_pnl, pnl_pct, exit_reason, last_price, now,
                          exit_rsi_val, new_mae_pct, trade["id"]),
@@ -11247,15 +11274,34 @@ def paper_trading_reset():
 
 @app.route("/api/paper-trading/manual-exit/<int:trade_id>", methods=["POST"])
 def paper_trading_manual_exit(trade_id):
-    # Same lock the 5s exit loop holds: without it a manual click and an
-    # automatic exit could close the same trade at the same moment (double
-    # P&L write, and two competing live SELL attempts).
-    if not _exit_check_lock.acquire(timeout=20):
-        return jsonify({"status": "error", "message": "An exit check is still running - try again in a few seconds"}), 409
+    """Takes the same lock the 5s exit loop holds, so a manual click and an
+    automatic exit don't close the same trade at the same moment - but a manual
+    exit has priority and is never refused because of it:
+      1. While this request waits, no NEW background check starts, so the lock
+         frees up as soon as the check already running finishes.
+      2. If that check is still running after MANUAL_EXIT_LOCK_WAIT_SECONDS
+         (a slow or hung Upstox call - typically in a fast market, exactly when
+         you want out), the exit goes ahead WITHOUT the lock. That is safe
+         because the live SELL step is serialised by _live_close_lock and
+         checks the order book first, and both paper close writes only apply
+         to a trade that is still OPEN."""
+    global _manual_exit_waiting
+    with _manual_exit_waiting_lock:
+        _manual_exit_waiting += 1
+    got_lock = False
     try:
+        got_lock = _exit_check_lock.acquire(timeout=MANUAL_EXIT_LOCK_WAIT_SECONDS)
+        if not got_lock:
+            started = _pass_info.get("started")
+            running = f"{time.monotonic() - started:.0f}s" if started else "unknown time"
+            print(f"[manual-exit] exit check still running after {running} (stage: {_pass_info.get('stage')!r}) - "
+                  f"closing trade {trade_id} without waiting for it", flush=True)
         return _paper_trading_manual_exit_impl(trade_id)
     finally:
-        _exit_check_lock.release()
+        if got_lock:
+            _exit_check_lock.release()
+        with _manual_exit_waiting_lock:
+            _manual_exit_waiting -= 1
 
 
 def _paper_trading_manual_exit_impl(trade_id):
@@ -11323,7 +11369,7 @@ def _paper_trading_manual_exit_impl(trade_id):
         capital_used = entry_price * original_qty
         pnl_pct = round((pnl / capital_used) * 100, 2) if capital_used else 0
         with get_db() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE paper_trades
                 SET status = 'CLOSED', exit_price = ?, exit_time = ?,
@@ -11334,7 +11380,7 @@ def _paper_trading_manual_exit_impl(trade_id):
                     live_exit_reason = CASE WHEN ? THEN 'Manual exit' ELSE live_exit_reason END,
                     live_exit_price = CASE WHEN ? THEN COALESCE(?, live_exit_price) ELSE live_exit_price END,
                     live_exit_time = CASE WHEN ? THEN ? ELSE live_exit_time END
-                WHERE id = ?
+                WHERE id = ? AND status = 'OPEN'
                 """,
                 (
                     exit_price, now, pnl, pnl_pct, "Manual exit", now,
@@ -11349,7 +11395,31 @@ def _paper_trading_manual_exit_impl(trade_id):
                     trade_id,
                 ),
             )
+            closed_here = cur.rowcount > 0
             conn.commit()
+        if not closed_here:
+            # The background check closed the paper side in the same instant.
+            # Keep ITS result, but still record the live exit we just made.
+            with get_db() as conn:
+                conn.execute(
+                    """
+                    UPDATE paper_trades
+                    SET live_exit_order_id = COALESCE(?, live_exit_order_id),
+                        live_status = CASE WHEN ? THEN 'CLOSED' ELSE live_status END,
+                        live_error = COALESCE(?, live_error),
+                        live_exit_reason = CASE WHEN ? THEN 'Manual exit' ELSE live_exit_reason END,
+                        live_exit_price = CASE WHEN ? THEN COALESCE(?, live_exit_price) ELSE live_exit_price END,
+                        live_exit_time = CASE WHEN ? THEN ? ELSE live_exit_time END
+                    WHERE id = ?
+                    """,
+                    (live_exit_order_id, live_exit_order_id is not None, live_exit_error,
+                     live_exit_order_id is not None,
+                     live_exit_order_id is not None, live_fill_price,
+                     live_exit_order_id is not None, now, trade_id),
+                )
+                conn.commit()
+            return jsonify({"status": "ok", "exit_price": exit_price,
+                            "note": "The trade was closed automatically at the same moment; its result was kept."})
         _log_exit_volume_async(trade_id, trade["symbol"], trade["direction"], now)
         resp = {"status": "ok", "exit_price": exit_price, "pnl": pnl, "pnl_pct": pnl_pct}
         if trade["live_status"] == "OPEN" and live_exit_order_id is None:
