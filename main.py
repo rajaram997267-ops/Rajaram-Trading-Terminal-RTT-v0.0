@@ -1476,7 +1476,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     fc_cfg = None
     try:
         fc_cfg = fcv_settings()
-        if fc_cfg["gate_enabled"] or fc_cfg["route_enabled"]:
+        if fc_cfg["gate_enabled"] or fc_cfg["route_enabled"] or fc_cfg["auto_enabled"]:
             fc_info = get_first_candle_info(symbol, access_token)
         if fc_cfg["gate_enabled"]:
             _fc_ok, _fc_why = fcv_gate_decision(fc_info, category, fc_cfg)
@@ -1556,6 +1556,27 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     except Exception as e:
         fcv_rotate_pick = None
         _fcv_log_decision(symbol, category, "error", f"rotation: {type(e).__name__}"[:140])
+    # Auto-pick by 9:15 band from Exit Compare results (optional). Priority: a band
+    # chosen by hand > the rotation test > this > the old Auto > the default.
+    try:
+        if (fcv_route_info is None and fcv_rotate_pick is None and fc_cfg and fc_cfg["auto_enabled"]
+                and fc_info and fc_info.get("status") == "ok"):
+            _ab = fcv_band_index(fc_info["ratio"])
+            _apick, _ainfo = fcv_auto_pick(_ab, fc_cfg)
+            if _apick:
+                entry_strategy = _apick
+                fcv_route_info = {"ratio": fc_info["ratio"], "band": _FCV_BANDS[_ab][0], "strategy": _apick,
+                                  "auto": True, "n": _ainfo.get("n"), "avg": _ainfo.get("avg")}
+                _fcv_log_decision(symbol, category, "AUTO-PICKED",
+                                  f"9:15 volume {fc_info['ratio']}x ({_FCV_BANDS[_ab][0]}) -> "
+                                  f"{_FCV_STRATEGY_LABELS.get(_apick, _apick)} (past {_ainfo.get('n')} trades in this band, "
+                                  f"avg {_ainfo.get('avg'):+.2f}%)")
+            else:
+                _fcv_log_decision(symbol, category, "AUTO-DEFAULT",
+                                  f"9:15 volume {fc_info['ratio']}x ({_FCV_BANDS[_ab][0]}): {_ainfo.get('why')} - using the default strategy")
+    except Exception as e:
+        fcv_route_info = None
+        _fcv_log_decision(symbol, category, "error", f"auto-pick: {type(e).__name__}"[:140])
     if fcv_route_info is None and fcv_rotate_pick is None and entry_strategy == "AUTO_VOL":
         entry_strategy, auto_info = _auto_resolve_entry(symbol, category)
         auto_paper_only = get_setting("auto_vol_live_ok", "false") != "true"
@@ -3930,7 +3951,8 @@ _fcv_cache: dict = {}            # (SYMBOL, ist_date) -> a finished, successful 
 _FCV_KEYS = ("fcv_gate_enabled", "fcv_gate_bands", "fcv_dir_enabled", "fcv_dir_min_pct",
              "fcv_allow_unknown", "fcv_route_enabled",
              "fcv_route_0", "fcv_route_1", "fcv_route_2", "fcv_route_3",
-             "fcv_rotate_enabled", "fcv_rotate_list", "fcv_rotate_next")
+             "fcv_rotate_enabled", "fcv_rotate_list", "fcv_rotate_next",
+             "fcv_auto_enabled", "fcv_auto_min_n", "fcv_auto_margin")
 # Strategies compared by the optional rotation test (a new trade takes the next one in turn).
 _FCV_ROTATE_DEFAULT = ("RSI_SIMPLE", "RSI_MOMENTUM", "FIRST5MIN_FIB", "EMA_SPOT_TRAIL")
 _FCV_STRATEGY_LABELS = {
@@ -3996,13 +4018,137 @@ def fcv_settings() -> dict:
         rotate_next = max(int(vals.get("fcv_rotate_next", "0") or 0), 0)
     except (TypeError, ValueError):
         rotate_next = 0
+    try:
+        auto_min_n = max(int(float(vals.get("fcv_auto_min_n", "10") or 10)), 3)
+    except (TypeError, ValueError):
+        auto_min_n = 10
+    try:
+        auto_margin = max(float(vals.get("fcv_auto_margin", "0.5") or 0.5), 0.0)
+    except (TypeError, ValueError):
+        auto_margin = 0.5
     return {
+        "auto_enabled": flag("fcv_auto_enabled"), "auto_min_n": auto_min_n, "auto_margin": auto_margin,
         "rotate_enabled": flag("fcv_rotate_enabled"), "rotate_list": rotate_list, "rotate_next": rotate_next,
         "gate_enabled": flag("fcv_gate_enabled"), "bands": sorted(bands),
         "dir_enabled": flag("fcv_dir_enabled"), "dir_min_pct": min_pct,
         "allow_unknown": flag("fcv_allow_unknown"),
         "route_enabled": flag("fcv_route_enabled"), "route": route,
     }
+
+
+# ---------------------------------------------------------------------------
+# Auto-pick the best exit strategy per 9:15 volume band, from Exit Compare.
+# Exit Compare replays every closed trade through each exit rule, so within a
+# band EVERY rule has a result for the SAME trades - a much bigger and fairer
+# sample than the Stats table, where a strategy only has trades it actually ran.
+# Only rules that are also real, selectable strategies can be picked (the
+# "+ -2% stop" replay variants have nothing to run, so they are left out).
+# ---------------------------------------------------------------------------
+_FCV_AUTO_RULES = (("RSI_SIMPLE", "RSI Simple"), ("RSI_MOMENTUM", "RSI Momentum"),
+                   ("FIRST5MIN_FIB", "1st 5 Min FIB"), ("EMA_SPOT_TRAIL", "5-EMA trail"))
+_fcv_auto_lock = threading.Lock()
+
+
+def _fcv_pct_stats(vals: list) -> dict:
+    wins = [v for v in vals if v > 0]
+    losses = [v for v in vals if v < 0]
+    return {"n": len(vals), "avg": round(sum(vals) / len(vals), 2), "win": round(len(wins) / len(vals) * 100.0, 1),
+            "pf": round(sum(wins) / abs(sum(losses)), 2) if losses else None}
+
+
+def fcv_auto_build(min_n: int, margin: float) -> dict:
+    """Scores every selectable exit rule inside each 9:15 volume band and decides which band gets which rule.
+    A band gets a pick only if (a) it has at least min_n replayed trades, and (b) the best rule's average %
+    beats what actually ran on those same trades by at least `margin` points. Otherwise pick is None and the
+    band keeps the normal default strategy."""
+    with get_db() as conn:
+        rs = conn.execute(
+            "SELECT r.results, t.entry_fc_ratio, t.pnl_pct FROM exit_replay r JOIN paper_trades t ON t.id = r.trade_id "
+            "WHERE r.status = 'ok' AND t.entry_fc_ratio IS NOT NULL").fetchall()
+    per = {i: {"rules": {rid: [] for rid, _n in _FCV_AUTO_RULES}, "actual": []} for i in range(len(_FCV_BANDS))}
+    used = 0
+    for r in rs:
+        try:
+            res = json.loads(r["results"])
+        except Exception:
+            continue
+        got = {}
+        for rid, _name in _FCV_AUTO_RULES:
+            v = (res.get(rid) or {}).get("pct")
+            if v is None:
+                got = None
+                break
+            got[rid] = float(v)
+        if got is None:          # compare rules only on trades where every rule has a result
+            continue
+        b = fcv_band_index(r["entry_fc_ratio"])
+        for rid, v in got.items():
+            per[b]["rules"][rid].append(v)
+        if r["pnl_pct"] is not None:
+            per[b]["actual"].append(float(r["pnl_pct"]))
+        used += 1
+    ist = datetime.utcnow() + IST_OFFSET
+    out = {"built_at": ist.strftime("%Y-%m-%d %H:%M"), "built_date": ist.strftime("%Y-%m-%d"),
+           "min_n": min_n, "margin": margin, "trades": used, "bands": {}}
+    for i, (band_name, _lo, _hi) in enumerate(_FCV_BANDS):
+        rules = {}
+        for rid, name in _FCV_AUTO_RULES:
+            vals = per[i]["rules"][rid]
+            if vals:
+                rules[rid] = {"name": name, **_fcv_pct_stats(vals)}
+        n = len(per[i]["rules"][_FCV_AUTO_RULES[0][0]])
+        actual_avg = round(sum(per[i]["actual"]) / len(per[i]["actual"]), 2) if per[i]["actual"] else None
+        pick, why = None, ""
+        if n < min_n:
+            why = f"only {n} replayed trades (needs {min_n})"
+        elif rules:
+            best = max(rules, key=lambda k: rules[k]["avg"])
+            base = actual_avg if actual_avg is not None else 0.0
+            if rules[best]["avg"] >= base + margin:
+                pick = best
+                why = f"best average of the rules ({rules[best]['avg']:+.2f}% vs {base:+.2f}% actually ran)"
+            else:
+                why = (f"best rule {rules[best]['name']} {rules[best]['avg']:+.2f}% doesn't beat what actually "
+                       f"ran ({base:+.2f}%) by {margin:g}")
+        out["bands"][str(i)] = {"band": band_name, "n": n, "pick": pick,
+                                "pick_name": _FCV_STRATEGY_LABELS.get(pick, pick) if pick else None,
+                                "actual_avg": actual_avg, "why": why, "rules": rules}
+    return out
+
+
+def fcv_auto_table(cfg: dict, force: bool = False):
+    """The saved band->rule table, rebuilt (DB only, no Upstox calls) once per IST day, whenever the min-trades /
+    margin settings change, or on demand. If a rebuild fails, the previous table keeps being used."""
+    tbl = None
+    try:
+        raw = get_setting("fcv_auto_table", "")
+        tbl = json.loads(raw) if raw else None
+    except Exception:
+        tbl = None
+    today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    stale = (tbl is None or tbl.get("built_date") != today
+             or tbl.get("min_n") != cfg["auto_min_n"] or tbl.get("margin") != cfg["auto_margin"])
+    if force or stale:
+        with _fcv_auto_lock:
+            try:
+                tbl = fcv_auto_build(cfg["auto_min_n"], cfg["auto_margin"])
+                set_setting("fcv_auto_table", json.dumps(tbl, separators=(",", ":")))
+            except Exception as e:
+                print(f"[fcv-auto] rebuild failed: {type(e).__name__}: {e}", flush=True)
+    return tbl
+
+
+def fcv_auto_pick(band_idx: int, cfg: dict) -> tuple:
+    """(strategy id or "", info dict) for a stock in this 9:15 band."""
+    tbl = fcv_auto_table(cfg)
+    b = ((tbl or {}).get("bands") or {}).get(str(band_idx))
+    if not b:
+        return "", {"why": "no Exit Compare data yet"}
+    pick = b.get("pick")
+    if pick and pick in VALID_STRATEGIES:
+        st = (b.get("rules") or {}).get(pick) or {}
+        return pick, {"n": b.get("n"), "avg": st.get("avg"), "win": st.get("win"), "why": b.get("why", "")}
+    return "", {"why": b.get("why", "no clear winner")}
 
 
 def _fcv_log_decision(symbol: str, category: str, outcome: str, detail: str = "") -> None:
@@ -4121,6 +4267,14 @@ def api_first_candle_gate():
                     set_setting("fcv_dir_min_pct", str(min(max(float(d["dir_min_pct"]), 50.0), 100.0)))
                 except (TypeError, ValueError):
                     pass
+            if "auto_enabled" in d:
+                set_setting("fcv_auto_enabled", "true" if d["auto_enabled"] else "false")
+            for src, dst in (("auto_min_n", "fcv_auto_min_n"), ("auto_margin", "fcv_auto_margin")):
+                if src in d:
+                    try:
+                        set_setting(dst, str(max(float(d[src]), 0.0)))
+                    except (TypeError, ValueError):
+                        pass
             if "rotate_enabled" in d:
                 set_setting("fcv_rotate_enabled", "true" if d["rotate_enabled"] else "false")
             if isinstance(d.get("rotate_list"), list):
@@ -4131,10 +4285,20 @@ def api_first_candle_gate():
                     v = str(d["route"].get(str(i), d["route"].get(i, "")) or "")
                     set_setting(f"fcv_route_{i}", v if v in VALID_STRATEGIES else "")
         cfg = fcv_settings()
+        rebuild = request.method == "POST" and bool((request.get_json(silent=True) or {}).get("auto_rebuild"))
+        if cfg["auto_enabled"] or rebuild:
+            auto_table = fcv_auto_table(cfg, force=rebuild)
+        else:   # off: just show whatever was built last, never rebuild behind your back
+            try:
+                raw = get_setting("fcv_auto_table", "")
+                auto_table = json.loads(raw) if raw else None
+            except Exception:
+                auto_table = None
     except (psycopg2.Error, RuntimeError):
         return jsonify({"status": "error", "message": "database unavailable"}), 503
     return jsonify({"status": "ok", **cfg, "route": {str(k): v for k, v in cfg["route"].items()},
-                    "band_names": [b[0] for b in _FCV_BANDS], "log": list(reversed(_fcv_log))})
+                    "band_names": [b[0] for b in _FCV_BANDS], "log": list(reversed(_fcv_log)),
+                    "auto_table": auto_table})
 
 
 @app.route("/api/volume-entry/log")
@@ -10345,6 +10509,9 @@ def _rule_note(t: dict) -> str:
     fcv = st.get("fcv") if isinstance(st, dict) else None
     if fcv and fcv.get("rotation"):
         parts.append("Exit-strategy rotation test")
+    elif fcv and fcv.get("auto"):
+        parts.append(f"Auto-picked for 9:15 volume {fcv.get('ratio')}x ({fcv.get('band')}), "
+                     f"past {fcv.get('n')} trades avg {fcv.get('avg')}%")
     elif fcv:
         parts.append(f"Routed by 9:15 volume {fcv.get('ratio')}x ({fcv.get('band')})")
     if t.get("entry_fc_ratio") is not None:
