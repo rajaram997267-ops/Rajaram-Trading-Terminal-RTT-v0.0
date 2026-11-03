@@ -8330,7 +8330,7 @@ def _first_candle_stats(symbol: str, date_str: str, hist: list, raw_day: list, d
     return out
 
 
-def _first_candle_report(symbol: str, date_str: str, access_token: str) -> dict:
+def _first_candle_report(symbol: str, date_str: str, access_token: str, with_context: bool = True) -> dict:
     key = get_instrument_key(symbol)
     if not key:
         return {"symbol": symbol, "date": date_str, "status": "no_instrument"}
@@ -8343,6 +8343,8 @@ def _first_candle_report(symbol: str, date_str: str, access_token: str) -> dict:
             access_token)
         daily = None
         try:   # context only - a failure here must not lose the main report
+            if not with_context:
+                raise RuntimeError("context not requested")
             daily = _vol_fetch_candles(
                 f"{base_url}{q}/days/1/{(day - timedelta(days=1)).strftime('%Y-%m-%d')}/{(day - timedelta(days=100)).strftime('%Y-%m-%d')}",
                 access_token)
@@ -8490,6 +8492,87 @@ def api_first_candle_board():
         r["decision_reason"] = d["reason"] if d else None
     return jsonify({"date": date_str, "state": st["state"], "total": st["total"], "done": st["done"],
                     "total_alerted": st.get("alerted", st["total"]), "error": st["error"], "rows": rows})
+
+
+# ---------------------------------------------------------------------------
+# Back-fill of the 9:15 volume reading onto PAST trades, so the Stats page can
+# compare strategies by band on history too. Runs in a background thread (the
+# app has one worker; Upstox calls must never run inside a web request).
+# Only fills columns that are still empty and never touches anything else.
+# ---------------------------------------------------------------------------
+_fc_backfill_lock = threading.Lock()
+_fc_backfill: dict = {"state": "idle"}
+_FC_BACKFILL_MAX_TRADES = 800
+
+
+def _fc_backfill_worker(token: str, trades: list, include_early: bool) -> None:
+    st = _fc_backfill
+    cache: dict = {}
+    try:
+        for t in trades:
+            try:
+                at_ist = datetime.fromisoformat(t["entry_time"]) + IST_OFFSET
+                date_str = at_ist.strftime("%Y-%m-%d")
+                sym = (t["symbol"] or "").strip().upper()
+                if not include_early and at_ist.hour * 60 + at_ist.minute < 9 * 60 + 22:
+                    st["skipped_early"] += 1      # entered before the 9:15 candle was even known
+                    continue
+                key = (sym, date_str)
+                if key not in cache:
+                    cache[key] = _first_candle_report(sym, date_str, token, with_context=False)
+                    time.sleep(0.2)               # be gentle with Upstox's rate limit
+                rep_ = cache[key]
+                vs = rep_.get("volume_strength") or {}
+                if rep_.get("status") != "ok" or vs.get("ratio_vs_average") is None:
+                    st["no_data"] += 1
+                    continue
+                buy_share = vs.get("buy_share_of_candle_pct")
+                dir_share = None if buy_share is None else (buy_share if t["direction"] == "Buy" else round(100.0 - buy_share, 1))
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE paper_trades SET entry_fc_ratio = ?, entry_fc_dir_share = ? "
+                        "WHERE id = ? AND entry_fc_ratio IS NULL",
+                        (vs["ratio_vs_average"], dir_share, t["id"]))
+                    conn.commit()
+                st["filled"] += 1
+            except Exception:
+                st["no_data"] += 1
+            finally:
+                st["done"] += 1
+        st["state"] = "done"
+    except Exception as e:
+        st["state"] = "error"
+        st["error"] = f"{type(e).__name__}: {e}"[:200]
+
+
+@app.route("/api/first-candle-backfill", methods=["GET", "POST"])
+def api_first_candle_backfill():
+    """POST starts the back-fill (optionally {"include_early": true}); GET returns progress."""
+    if request.method == "POST":
+        token = get_setting("upstox_access_token")
+        if not token:
+            return jsonify({"status": "error", "message": "No Upstox token saved - log in to Upstox first"}), 400
+        include_early = bool((request.get_json(silent=True) or {}).get("include_early"))
+        with _fc_backfill_lock:
+            if _fc_backfill.get("state") == "running":
+                return jsonify(dict(_fc_backfill))
+            try:
+                with get_db() as conn:
+                    trades = [dict(r) for r in conn.execute(
+                        "SELECT id, symbol, direction, entry_time FROM paper_trades "
+                        "WHERE entry_fc_ratio IS NULL AND entry_time IS NOT NULL "
+                        "AND direction IN ('Buy', 'Sell') ORDER BY id DESC LIMIT ?",
+                        (_FC_BACKFILL_MAX_TRADES,)).fetchall()]
+            except (psycopg2.Error, RuntimeError):
+                return jsonify({"status": "error", "message": "database unavailable"}), 503
+            _fc_backfill.clear()
+            _fc_backfill.update({"state": "running", "total": len(trades), "done": 0, "filled": 0,
+                                 "no_data": 0, "skipped_early": 0, "error": None})
+            if not trades:
+                _fc_backfill["state"] = "done"
+            else:
+                threading.Thread(target=_fc_backfill_worker, args=(token, trades, include_early), daemon=True).start()
+    return jsonify(dict(_fc_backfill))
 
 
 @app.route("/first-candle")
