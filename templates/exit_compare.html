@@ -70,7 +70,7 @@
   <h3>Result</h3>
   <div class="sub" id="sumNote"></div>
   <div class="wrap"><table>
-    <thead><tr><th>Exit rule</th><th>Trades</th><th>Win rate</th><th>Avg %</th><th>Median %</th><th>Total %</th><th>Profit factor</th><th>Total P&amp;L (Rs)</th><th>Best on</th></tr></thead>
+    <thead><tr><th>Exit rule</th><th>Trades</th><th>Win rate</th><th>Avg %</th><th>Median %</th><th>Avg win %</th><th>Avg loss %</th><th>Worst trade %</th><th>Total %</th><th>Profit factor</th><th>Total P&amp;L (Rs)</th><th>Best on</th></tr></thead>
     <tbody id="sumBody"></tbody>
   </table></div>
 
@@ -82,6 +82,7 @@
 
   <div class="foot">
     <b>How to read it:</b> every row of the Result table uses the same trades (when the box above is ticked), so the numbers are directly comparable. "Best on" counts the trades where that rule had the highest % (ties count for each). "What actually ran" is what your trades really made, which mixes in whatever strategy was active on each day.
+    "+ -2% stop" rows are the same rule with the 5-EMA trail's hard -2% stop-loss on the option added underneath: whichever fires first wins. Comparing a rule with its "+ -2% stop" row shows how much of the 5-EMA result is just the stop.
     <b>Approximations:</b> each exit is priced at the option's 1-minute close at the signal time, with no slippage or charges. FIB touches use the underlying's 1-minute highs/lows. The RSI/EMA settings used are the ones currently in Settings, not necessarily those active on the day. Trades whose option contract has expired may have no price data and are listed as "no data" in the count above.
     A rule needs roughly 30 or more trades before its numbers mean much.
   </div>
@@ -113,7 +114,10 @@
   function stats(vals, rupees) {
     const n = vals.length, wins = vals.filter(v => v > 0).length;
     const gain = vals.filter(v => v > 0).reduce((a, b) => a + b, 0), loss = -vals.filter(v => v < 0).reduce((a, b) => a + b, 0);
+    const winsArr = vals.filter(v => v > 0), lossArr = vals.filter(v => v < 0);
     return { n, wr: n ? wins / n * 100 : null, avg: n ? vals.reduce((a, b) => a + b, 0) / n : null, med: median(vals),
+             avgWin: winsArr.length ? gain / winsArr.length : null, avgLoss: lossArr.length ? -loss / lossArr.length : null,
+             worst: n ? Math.min.apply(null, vals) : null,
              tot: vals.reduce((a, b) => a + b, 0), pf: loss > 0 ? gain / loss : null, rs: rupees.reduce((a, b) => a + b, 0) };
   }
 
@@ -155,7 +159,7 @@
 
   function rowHtml(name, st, bestN, isActual) {
     return '<tr class="' + (isActual ? "actual" : "") + '"><td>' + esc(name) + '</td><td>' + st.n + '</td><td>' + (st.wr === null ? "-" : st.wr.toFixed(1) + "%") +
-      '</td><td>' + pctTxt(st.avg) + '</td><td>' + pctTxt(st.med) + '</td><td>' + pctTxt(st.n ? st.tot : null) + '</td><td>' + (st.pf === null ? "-" : st.pf.toFixed(2)) +
+      '</td><td>' + pctTxt(st.avg) + '</td><td>' + pctTxt(st.med) + '</td><td>' + pctTxt(st.avgWin) + '</td><td>' + pctTxt(st.avgLoss) + '</td><td>' + pctTxt(st.worst) + '</td><td>' + pctTxt(st.n ? st.tot : null) + '</td><td>' + (st.pf === null ? "-" : st.pf.toFixed(2)) +
       '</td><td class="' + cls(st.rs) + '">' + inr(st.n ? st.rs : null) + '</td><td>' + (bestN === null ? '<span class="mut">-</span>' : bestN) + '</td></tr>';
   }
 
@@ -168,7 +172,8 @@
     sel.innerHTML = '<option value="">All bands</option>' + d.bands.map(b => '<option value="' + esc(b) + '">' + esc(b) + '</option>').join("") + '<option value="__none">No 9:15 data</option>';
     sel.value = keep;
     const c = d.coverage || {};
-    document.getElementById("cov").textContent = (c.ok || 0) + " trades replayed" + (c.no_data ? ", " + c.no_data + " had no usable data (often an expired option contract)" : "") + ".";
+    document.getElementById("cov").textContent = (c.ok || 0) + " trades replayed" + (c.no_data ? ", " + c.no_data + " had no usable data (often an expired option contract)" : "") + "." +
+      (d.outdated ? " " + d.outdated + " older results lack the newer '+ -2% stop' rules - press Replay new trades to upgrade them (they are left out of the paired view until then)." : "");
     render();
   }
 
