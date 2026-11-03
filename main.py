@@ -8736,11 +8736,11 @@ def api_exit_compare_run():
                     "paper_instrument_key, paper_strike FROM paper_trades "
                     "WHERE status = 'CLOSED' AND direction IN ('Buy', 'Sell') AND entry_time IS NOT NULL "
                     "AND entry_price IS NOT NULL AND paper_instrument_key IS NOT NULL "
-                    "AND COALESCE(paper_option_label, '') NOT LIKE 'EQUITY%' "
+                    "AND COALESCE(paper_option_label, '') NOT LIKE ? "
                     f"AND id NOT IN (SELECT trade_id FROM exit_replay WHERE status IN {skip_status}) "
-                    "ORDER BY id DESC LIMIT ?", (_EC_MAX_TRADES,)).fetchall()]
-        except (psycopg2.Error, RuntimeError):
-            return jsonify({"status": "error", "message": "database unavailable"}), 503
+                    "ORDER BY id DESC LIMIT ?", ("EQUITY%", _EC_MAX_TRADES)).fetchall()]
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"could not list trades: {type(e).__name__}"}), 500
         _ec_job.clear()
         _ec_job.update({"state": "running", "total": len(trades), "checked": 0, "done_ok": 0, "no_data": 0,
                         "waiting": 0, "error": None})
