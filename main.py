@@ -4412,7 +4412,7 @@ _ws_debug: dict = {
     "status": "not_started", "error": None, "last_message_at": None,
     "sdk_available": None, "connect_attempts": 0,
     "connected_since": None, "reconnect_count": 0, "stale_reconnect_count": 0,
-    "total_ticks": 0,
+    "total_ticks": 0, "fail_streak": 0,
 }
 # Rolling tick-timing history for the WebSocket Speed Statistics page -
 # kept separate from _ws_debug since these are lists, not simple values.
@@ -4483,6 +4483,7 @@ def _ws_on_message(message) -> None:
         _ws_debug["last_message_at"] = now.isoformat()
         _ws_debug["status"] = "streaming"
         _ws_debug["error"] = None
+        _ws_debug["fail_streak"] = 0      # a real tick: the back-off starts over
         # A successfully received tick is definitive proof the connection
         # is healthy right now, regardless of what a PRIOR attempt did -
         # without this, an error from an earlier failed reconnect (or a
@@ -4618,7 +4619,14 @@ def _ws_run(access_token: str) -> None:
             _ws_debug["status"] = "error"
             _ws_debug["error"] = str(e)
             _ws_streamer = None
-            time.sleep(5)
+            # Wait longer after every consecutive failure instead of retrying every 5s
+            # forever - hammering Upstox is what turns one refused handshake (403) into
+            # "429 Too Many Requests" that then lasts for as long as the retries continue.
+            _ws_debug["fail_streak"] = _ws_debug.get("fail_streak", 0) + 1
+            wait = min(5 * 2 ** min(_ws_debug["fail_streak"] - 1, 6), _WS_MAX_BACKOFF_SECONDS)
+            if "429" in str(e):
+                wait = max(wait, _WS_429_BACKOFF_SECONDS)
+            time.sleep(wait)
             continue
 
         # NOTE: the staleness watchdog used to live here, as a loop right
@@ -4640,6 +4648,8 @@ def _ws_run(access_token: str) -> None:
 
 _WS_STALE_AFTER_SECONDS = 90
 _WS_MIN_SECONDS_BETWEEN_KICKS = 15  # debounce for _ws_check_and_heal being called from request threads
+_WS_MAX_BACKOFF_SECONDS = 600        # the wait between reconnect tries never grows beyond this
+_WS_429_BACKOFF_SECONDS = 300        # "Too Many Requests": stay quiet at least this long
 
 
 def _ws_check_and_heal() -> None:
@@ -4685,11 +4695,20 @@ def _ws_check_and_heal() -> None:
         # any of them finishes starting a replacement thread, and each
         # would spawn its own, right back into the multiple-streamers
         # problem _ws_start_lock was added to prevent.
+        # Back-off: the wait before the next forced reconnect doubles with every
+        # consecutive failure (15s, 30s, 60s ... up to 10 minutes) and is at
+        # least 5 minutes after a 429. Without this the watchdog opened a new
+        # connection every ~15s all day, which kept Upstox refusing us.
+        streak = _ws_debug.get("fail_streak", 0)
+        min_gap = min(_WS_MIN_SECONDS_BETWEEN_KICKS * (2 ** min(streak, 6)), _WS_MAX_BACKOFF_SECONDS)
+        if "429" in str(_ws_debug.get("error") or ""):
+            min_gap = max(min_gap, _WS_429_BACKOFF_SECONDS)
         last_kick = _ws_debug.get("last_kick_at")
         if last_kick:
             since_kick = (now - datetime.fromisoformat(last_kick)).total_seconds()
-            if since_kick < _WS_MIN_SECONDS_BETWEEN_KICKS:
+            if since_kick < min_gap:
                 return
+        _ws_debug["fail_streak"] = streak + 1
         _ws_debug["last_kick_at"] = now.isoformat()
         _ws_debug["status"] = "stale_reconnecting"
         _ws_debug["stale_reconnect_count"] = _ws_debug.get("stale_reconnect_count", 0) + 1
@@ -4699,6 +4718,10 @@ def _ws_check_and_heal() -> None:
         )
         try:
             if _ws_streamer is not None:
+                try:   # stop the old streamer's own auto-reconnect so it cannot keep retrying behind our back
+                    _ws_streamer.auto_reconnect(False, 10, 0)
+                except Exception:
+                    pass
                 _ws_streamer.disconnect()
         except Exception:
             pass
