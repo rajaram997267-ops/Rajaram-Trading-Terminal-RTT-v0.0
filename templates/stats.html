@@ -393,7 +393,8 @@
       const st = document.getElementById("fcBackfillStatus");
       try {
         const res = await fetch("/api/first-candle-backfill", first ? { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" } : undefined);
-        const d = await res.json();
+        let d;
+        try { d = await res.json(); } catch (e) { st.textContent = "Server error (HTTP " + res.status + ") - check the Render logs"; return; }
         if (!res.ok) { st.textContent = d.message || "Could not start"; return; }
         if (d.state === "running") {
           st.textContent = "Working... " + d.done + " of " + d.total + " trades checked, " + d.filled + " filled";

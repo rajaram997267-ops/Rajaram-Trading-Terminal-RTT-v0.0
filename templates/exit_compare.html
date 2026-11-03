@@ -176,7 +176,8 @@
     const st = document.getElementById("status");
     try {
       const res = await fetch("/api/exit-compare/" + (first ? "run" : "status"), first ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ retry: document.getElementById("retryBox").checked }) } : undefined);
-      const d = await res.json();
+      let d;
+      try { d = await res.json(); } catch (e) { st.textContent = "Server error (HTTP " + res.status + ") - check the Render logs"; return; }
       if (!res.ok) { st.textContent = d.message || "Could not start"; return; }
       if (d.state === "running") {
         st.textContent = "Working... " + d.checked + " of " + d.total + " trades checked, " + d.done_ok + " replayed";
