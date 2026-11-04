@@ -93,6 +93,7 @@
         <option value="first_candle_ratio">9:15 ratio</option>
         <option value="day_volume_ratio">Day volume ratio</option>
         <option value="dir_pressure_ratio">Directional pressure ratio</option>
+        <option value="dir_share_pct">9:15 buy share (selling share for Sell alerts)</option>
       </select>
     </label>
     <label>Measure move
@@ -124,7 +125,7 @@
   <div class="foot">
     Covers stocks with a Buy or Sell alert on the chosen day. <b>9:15 ratio</b> = first 5-min candle volume &divide; its average over the previous 10 sessions.
     <b>Day vol</b> = whole-day volume so far &divide; the average at the same clock time. <b>Below 20d high</b> = previous close vs the highest high of the last 20 sessions.
-    <b>After 9:15 %</b> = move from the 9:15 candle&#39;s close to the latest close - the part you could actually trade (the benchmark uses this by default; &quot;from previous close&quot; also counts the overnight gap). &quot;Best swing&quot; is the peak after 9:15, so it is optimistic. <b>9:15 buy share</b> and <b>Dir. pressure</b> estimate buying vs selling from where the candle closed in its range (not true buy/sell volume); Dir. pressure is the side matching the alert (buying for Buy, selling for Sell) vs its 10-session average. A day still in progress shows partial numbers. Click a column heading to sort.
+    <b>After 9:15 %</b> = move from the 9:15 candle&#39;s close to the latest close - the part you could actually trade (the benchmark uses this by default; &quot;from previous close&quot; also counts the overnight gap). &quot;Best swing&quot; is the peak after 9:15, so it is optimistic. <b>9:15 buy share</b> (the benchmark can group by it - for a Sell alert it uses the selling share) and <b>Dir. pressure</b> estimate buying vs selling from where the candle closed in its range (not true buy/sell volume); Dir. pressure is the side matching the alert (buying for Buy, selling for Sell) vs its 10-session average. A day still in progress shows partial numbers. Click a column heading to sort.
   </div>
 
 <script>
@@ -230,7 +231,13 @@
   const BANDS = ["Under 1.5\u00d7", "1.5\u00d7 to 3\u00d7", "3\u00d7 to 5\u00d7", "5\u00d7 and above"];
   let benchRows = [], benchToken = 0;
 
-  function bandOf(x) { return x < 1.5 ? 0 : x < 3 ? 1 : x < 5 ? 2 : 3; }
+  const SHARE_BANDS = ["Under 50%", "50% to 70%", "70% to 90%", "90% and above"];
+  const isShare = key => key === "dir_share_pct";
+  function bandsFor(key) { return isShare(key) ? SHARE_BANDS : BANDS; }
+  function bandOf(x, key) {
+    if (isShare(key)) return x < 50 ? 0 : x < 70 ? 1 : x < 90 ? 2 : 3;
+    return x < 1.5 ? 0 : x < 3 ? 1 : x < 5 ? 2 : 3;
+  }
   // Buy alerts want the stock up, Sell alerts want it down.
   function dirMove(r) {
     const mode = document.getElementById("benchMetric").value;
@@ -268,10 +275,11 @@
       (!dirOnly || (r.dir_share_pct !== null && r.dir_share_pct !== undefined && r.dir_share_pct >= dirMin)));
     const all = stat(usable, hitAt);
     let html = "";
-    for (let b = 0; b < BANDS.length; b++) {
-      const st = stat(usable.filter(r => bandOf(r[key]) === b), hitAt);
+    const bandNames = bandsFor(key);
+    for (let b = 0; b < bandNames.length; b++) {
+      const st = stat(usable.filter(r => bandOf(r[key], key) === b), hitAt);
       const diff = (st.rate !== null && all.rate !== null) ? st.rate - all.rate : null;
-      html += '<tr><td>' + BANDS[b] + '</td><td>' + st.n + '</td><td>' + st.hits + '</td><td>' + (st.rate === null ? "-" : f1(st.rate) + "%") +
+      html += '<tr><td>' + bandNames[b] + '</td><td>' + st.n + '</td><td>' + st.hits + '</td><td>' + (st.rate === null ? "-" : f1(st.rate) + "%") +
         '</td><td>' + (diff === null ? '<span class="mut">-</span>' : '<span class="' + (diff > 0 ? "pos" : diff < 0 ? "neg" : "") + '">' + (diff > 0 ? "+" : "") + f1(diff) + ' pts</span>') +
         '</td><td>' + signed(st.avg) + '</td><td>' + signed(st.med) + '</td></tr>';
     }
