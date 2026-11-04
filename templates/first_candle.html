@@ -122,6 +122,15 @@
   </table></div>
   <div class="foot" id="benchDates"></div>
 
+  <div id="benchDayWrap" style="display:none;">
+    <h3 style="margin:18px 0 6px; font-size:15px;">Exactly 100% buy share, day by day</h3>
+    <div class="foot" style="margin-top:0;">The 9:15 candle closed exactly at its high (at its low for a Sell alert). Compare each day with all stocks of that same day: on a strong market day nearly everything rises, so only a gap against the same-day numbers means anything.</div>
+    <div class="wrap"><table>
+      <thead><tr><th>DAY</th><th>100% STOCKS</th><th>HITS</th><th>HIT RATE</th><th>AVG MOVE</th><th>ALL STOCKS</th><th>THEIR HIT RATE</th><th>THEIR AVG MOVE</th></tr></thead>
+      <tbody id="benchDayBody"></tbody>
+    </table></div>
+  </div>
+
   <div class="foot">
     Covers stocks with a Buy or Sell alert on the chosen day. <b>9:15 ratio</b> = first 5-min candle volume &divide; its average over the previous 10 sessions.
     <b>Day vol</b> = whole-day volume so far &divide; the average at the same clock time. <b>Below 20d high</b> = previous close vs the highest high of the last 20 sessions.
@@ -231,11 +240,11 @@
   const BANDS = ["Under 1.5\u00d7", "1.5\u00d7 to 3\u00d7", "3\u00d7 to 5\u00d7", "5\u00d7 and above"];
   let benchRows = [], benchToken = 0;
 
-  const SHARE_BANDS = ["Under 50%", "50% to 70%", "70% to 90%", "90% and above"];
+  const SHARE_BANDS = ["Under 50%", "50% to 70%", "70% to 90%", "90% to under 100%", "Exactly 100%"];
   const isShare = key => key === "dir_share_pct";
   function bandsFor(key) { return isShare(key) ? SHARE_BANDS : BANDS; }
   function bandOf(x, key) {
-    if (isShare(key)) return x < 50 ? 0 : x < 70 ? 1 : x < 90 ? 2 : 3;
+    if (isShare(key)) return x < 50 ? 0 : x < 70 ? 1 : x < 90 ? 2 : x < 99.95 ? 3 : 4;   // 100 = closed exactly at its high (low, for Sell)
     return x < 1.5 ? 0 : x < 3 ? 1 : x < 5 ? 2 : 3;
   }
   // Buy alerts want the stock up, Sell alerts want it down.
@@ -286,6 +295,28 @@
     html += '<tr class="allrow"><td>All stocks</td><td>' + all.n + '</td><td>' + all.hits + '</td><td>' + (all.rate === null ? "-" : f1(all.rate) + "%") +
       '</td><td><span class="mut">-</span></td><td>' + signed(all.avg) + '</td><td>' + signed(all.med) + '</td></tr>';
     document.getElementById("benchBody").innerHTML = html;
+
+    // Buy-share view only: the "Exactly 100%" stocks day by day, next to ALL stocks of the same day,
+    // so a strong market day can't be mistaken for a buy-share edge.
+    const dayWrap = document.getElementById("benchDayWrap");
+    if (isShare(key)) {
+      const top = usable.filter(r => bandOf(r[key], key) === 4);
+      const days = Array.from(new Set(usable.map(r => r.date))).sort().reverse();
+      let dh = "";
+      days.forEach(d => {
+        const sd = stat(top.filter(r => r.date === d), hitAt), sa = stat(usable.filter(r => r.date === d), hitAt);
+        dh += '<tr><td>' + d + '</td><td>' + sd.n + '</td><td>' + sd.hits + '</td><td>' + (sd.rate === null ? "-" : f1(sd.rate) + "%") +
+          '</td><td>' + signed(sd.avg) + '</td><td>' + sa.n + '</td><td>' + (sa.rate === null ? "-" : f1(sa.rate) + "%") +
+          '</td><td>' + signed(sa.avg) + '</td></tr>';
+      });
+      const st100 = stat(top, hitAt);
+      dh += '<tr class="allrow"><td>All days</td><td>' + st100.n + '</td><td>' + st100.hits + '</td><td>' + (st100.rate === null ? "-" : f1(st100.rate) + "%") +
+        '</td><td>' + signed(st100.avg) + '</td><td>' + all.n + '</td><td>' + (all.rate === null ? "-" : f1(all.rate) + "%") + '</td><td>' + signed(all.avg) + '</td></tr>';
+      document.getElementById("benchDayBody").innerHTML = dh;
+      dayWrap.style.display = "";
+    } else {
+      dayWrap.style.display = "none";
+    }
   }
 
   function weekdaysBack(endStr, count) {
