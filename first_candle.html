@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - First Candle</title>
+  <style>
+    :root { --bg:#0b0e14; --panel:#131722; --border:#1e222d; --text:#e6e9f0; --muted:#6b7280; --green:#00c896; --gold:#ffb800; --red:#ff5370; }
+    :root[data-theme="light-gray"] { --red:#dc2626; --bg:#e9ebee; --panel:#ffffff; --border:#d0d4da; --text:#1a1d23; --muted:#6b7280; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="sky-blue"] { --red:#dc2626; --bg:#eaf4fb; --panel:#ffffff; --border:#bfe0f2; --text:#10222c; --muted:#4a6572; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="off-white"] { --red:#dc2626; --bg:#f7f5f0; --panel:#ffffff; --border:#e2ddd2; --text:#1f1c16; --muted:#6b6455; --green:#0e9f6e; --gold:#b45309; }
+    * { box-sizing: border-box; }
+    body { font-family:'Segoe UI',Arial,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px 32px 48px; }
+    a { color: var(--green); }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .tabbar { display:flex; gap:4px; border-bottom:1px solid var(--border); margin:18px 0 20px; overflow-x:auto; }
+    .tabbar a { padding:10px 14px; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; white-space:nowrap; }
+    .tabbar a.active { color:var(--text); border-bottom-color:var(--green); }
+    .tabbar a:hover { color:var(--text); }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:0 0 14px; font-size:13px; color:var(--muted); }
+    .controls input { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:13px; }
+    .controls input[type=number] { width:70px; }
+    .controls button { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
+    .controls button:hover { border-color:var(--green); }
+    #status { font-size:13px; color:var(--muted); margin:0 0 12px; min-height:18px; }
+    .wrap { overflow-x:auto; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
+    table { border-collapse:collapse; width:100%; font-size:12px; }
+    th, td { border-bottom:1px solid var(--border); padding:8px 10px; text-align:left; white-space:nowrap; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; cursor:pointer; user-select:none; }
+    th:hover { color:var(--text); }
+    tr:last-child td { border-bottom:none; }
+    tr.hot td { background:rgba(0,200,150,0.10); }
+    .pos { color:var(--green); } .neg { color:var(--red); } .mut { color:var(--muted); }
+    .tag { font-size:10px; padding:1px 6px; border-radius:8px; border:1px solid var(--border); }
+    .tag.Buy { color:var(--green); border-color:var(--green); } .tag.Sell { color:var(--red); border-color:var(--red); }
+    h3 { margin:28px 0 4px; font-size:16px; }
+    .bench-controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:10px 0 12px; font-size:13px; color:var(--muted); }
+    .bench-controls input, .bench-controls select { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:13px; }
+    .bench-controls input[type=number] { width:70px; }
+    .bench-controls button { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
+    .bench-controls button:hover { border-color:var(--green); }
+    #benchStatus { font-size:13px; color:var(--muted); margin:0 0 10px; min-height:18px; }
+    tr.allrow td { font-weight:600; border-top:2px solid var(--border); }
+    .foot { margin-top:14px; font-size:11px; color:var(--muted); line-height:1.5; }
+  </style>
+</head>
+<body>
+  <h2 style="margin:0">First Candle <span style="color:var(--muted);font-weight:400;font-size:14px">RTT v0.0</span></h2>
+  <div class="sub">How strong was each alerted stock's 9:15 candle volume compared with its own last 10 sessions, and what did the stock do afterwards. Read-only.</div>
+
+  <div class="tabbar">
+    <a href="/">Dashboard</a>
+    <a href="/paper-trading">Paper Trading</a>
+    <a href="/live-trading">Live Trading</a>
+    <a href="/stats">Stats</a>
+    <a href="/websocket-stats">WS Speed</a>
+    <a href="/settings">Settings</a>
+    <a href="/shadow">Manual vs RSI</a>
+    <a href="/exit-lab">Exit Lab</a>
+    <a href="/first-candle" class="active">First Candle</a>
+    <a href="/exit-compare">Exit Compare</a>
+  </div>
+
+  <div class="controls">
+    <label>Date <input type="date" id="dateInput" value="{{ date }}"></label>
+    <button id="loadBtn">Load</button>
+    <button id="refreshBtn">Re-run</button>
+    <label>Highlight 9:15 ratio &ge; <input type="number" id="hotInput" value="3" min="0" step="0.5">&times;</label>
+    <label>Show
+      <select id="showSel">
+        <option value="all">All alerts</option>
+        <option value="traded">Traded</option>
+        <option value="skipped">Skipped</option>
+        <option value="norecord">No record</option>
+      </select>
+    </label>
+  </div>
+  <div id="status"></div>
+
+  <div class="wrap"><table id="tbl">
+    <thead><tr id="head"></tr></thead>
+    <tbody id="body"></tbody>
+  </table></div>
+
+  <h3>Benchmark</h3>
+  <div class="sub">Groups every stock from several days by its volume ratio and shows how often it actually moved. Compare each row with the "All stocks" row - that is the normal hit rate.</div>
+  <div class="bench-controls">
+    <label>Days (ending at the date above) <input type="number" id="benchDays" value="5" min="1" max="15"></label>
+    <label>Hit = moved &ge; <input type="number" id="benchMove" value="3" min="0.5" step="0.5">% in the alert's direction</label>
+    <label>Group by
+      <select id="benchKey">
+        <option value="first_candle_ratio">9:15 ratio</option>
+        <option value="day_volume_ratio">Day volume ratio</option>
+        <option value="dir_pressure_ratio">Directional pressure ratio</option>
+        <option value="dir_share_pct">9:15 buy share (selling share for Sell alerts)</option>
+      </select>
+    </label>
+    <label>Measure move
+      <select id="benchMetric">
+        <option value="after">From 9:15 close to last close (tradable)</option>
+        <option value="best">Best swing after 9:15 (high for Buy, low for Sell)</option>
+        <option value="prev">From previous close (includes the gap)</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="benchDirOnly"> only where the 9:15 candle agrees with the alert, at least
+      <input type="number" id="benchDirMin" value="55" min="50" max="100" step="1">% buying (Buy) / selling (Sell)</label>
+    <label>Include
+      <select id="benchInclude">
+        <option value="all">all alerts</option>
+        <option value="traded">only alerts that became trades</option>
+        <option value="skipped">only skipped alerts</option>
+      </select>
+    </label>
+    <button id="benchBtn">Build benchmark</button>
+    <button id="benchStop">Stop</button>
+  </div>
+  <div id="benchStatus"></div>
+  <div class="wrap"><table>
+    <thead><tr><th>Group</th><th>Stocks</th><th>Hits</th><th>Hit rate</th><th>vs all stocks</th><th>Avg move</th><th>Median move</th></tr></thead>
+    <tbody id="benchBody"></tbody>
+  </table></div>
+  <div class="foot" id="benchDates"></div>
+
+  <div class="foot">
+    Covers stocks with a Buy or Sell alert on the chosen day. <b>9:15 ratio</b> = first 5-min candle volume &divide; its average over the previous 10 sessions.
+    <b>Day vol</b> = whole-day volume so far &divide; the average at the same clock time. <b>Below 20d high</b> = previous close vs the highest high of the last 20 sessions.
+    <b>After 9:15 %</b> = move from the 9:15 candle&#39;s close to the latest close - the part you could actually trade (the benchmark uses this by default; &quot;from previous close&quot; also counts the overnight gap). &quot;Best swing&quot; is the peak after 9:15, so it is optimistic. <b>9:15 buy share</b> (the benchmark can group by it - for a Sell alert it uses the selling share) and <b>Dir. pressure</b> estimate buying vs selling from where the candle closed in its range (not true buy/sell volume); Dir. pressure is the side matching the alert (buying for Buy, selling for Sell) vs its 10-session average. A day still in progress shows partial numbers. Click a column heading to sort.
+  </div>
+
+<script>
+  const COLS = [
+    ["symbol", "Symbol"], ["category", "Alert"], ["decision", "Decision"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
+    ["pct_of_avg_day_volume", "9:15 % of day"], ["first_candle_body_pct", "9:15 body %"], ["gap_open_pct", "Gap %"],
+    ["day_volume_ratio", "Day vol"], ["below_20d_high_pct", "Below 20d high %"],
+    ["day_high_vs_prev_close_pct", "Day high %"], ["last_close_vs_prev_close_pct", "Last %"],
+    ["after_first_pct", "After 9:15 %"], ["buy_share_pct", "9:15 buy share"], ["dir_pressure_ratio", "Dir. pressure"]
+  ];
+  const PCT = new Set(["first_candle_body_pct","gap_open_pct","below_20d_high_pct","day_high_vs_prev_close_pct","last_close_vs_prev_close_pct","after_first_pct"]);
+  let rows = [], sortKey = "first_candle_ratio", sortDir = -1, timer = null;
+
+  // Direction-aware fields: for a Buy alert "directional" = the buying side of the 9:15 candle, for a Sell alert the selling side.
+  function decorate(r) {
+    if (r && r.status === "ok") {
+      const sell = r.category === "Sell";
+      r.dir_pressure_ratio = sell ? r.sell_pressure_ratio : r.buy_pressure_ratio;
+      const b = r.buy_share_pct;
+      r.dir_share_pct = (b === null || b === undefined) ? null : (sell ? Math.round((100 - b) * 10) / 10 : b);
+    }
+    return r;
+  }
+
+  function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+  function cell(k, r) {
+    const v = r[k];
+    if (v === null || v === undefined) return '<span class="mut">-</span>';
+    if (k === "symbol") return esc(v);
+    if (k === "category") return '<span class="tag ' + esc(v) + '">' + esc(v) + '</span>';
+    if (k === "decision") {
+      const why = r.decision_reason ? esc(r.decision_reason) : "";
+      if (v === "TRADED") return '<span class="tag Buy" title="' + why + '">Traded</span>';
+      const short = r.decision_reason ? esc(r.decision_reason.length > 46 ? r.decision_reason.slice(0, 46) + "..." : r.decision_reason) : "";
+      return '<span class="tag" title="' + why + '">' + (v === "ERROR" ? "Error" : "Skipped") + '</span> <span class="mut">' + short + '</span>';
+    }
+    if (k === "beats_sessions") return esc(v);
+    if (PCT.has(k)) return '<span class="' + (v > 0 ? "pos" : v < 0 ? "neg" : "") + '">' + (v > 0 ? "+" : "") + v + '%</span>';
+    if (k === "first_candle_ratio" || k === "day_volume_ratio" || k === "dir_pressure_ratio") return v + "&times;";
+    if (k === "buy_share_pct") return v + "%";
+    if (k === "pct_of_avg_day_volume") return v + "%";
+    return esc(v);
+  }
+
+  function render() {
+    const hot = parseFloat(document.getElementById("hotInput").value) || 0;
+    document.getElementById("head").innerHTML = COLS.map(c =>
+      '<th data-k="' + c[0] + '">' + c[1] + (c[0] === sortKey ? (sortDir < 0 ? " &darr;" : " &uarr;") : "") + '</th>').join("");
+    document.querySelectorAll("#head th").forEach(th => th.onclick = () => {
+      const k = th.dataset.k;
+      if (k === sortKey) sortDir = -sortDir; else { sortKey = k; sortDir = -1; }
+      render();
+    });
+    const show = document.getElementById("showSel").value;
+    const shown = rows.filter(r => show === "all" ||
+      (show === "traded" && r.decision === "TRADED") ||
+      (show === "skipped" && r.decision && r.decision !== "TRADED") ||
+      (show === "norecord" && !r.decision));
+    const sorted = shown.slice().sort((a, b) => {
+      const x = a[sortKey], y = b[sortKey];
+      if (x === null || x === undefined) return 1;
+      if (y === null || y === undefined) return -1;
+      if (typeof x === "string") return sortDir * (x < y ? -1 : x > y ? 1 : 0);
+      return sortDir * (x - y);
+    });
+    document.getElementById("body").innerHTML = sorted.map(r => {
+      const isHot = hot > 0 && r.first_candle_ratio !== null && r.first_candle_ratio >= hot;
+      if (r.status !== "ok") {
+        return '<tr><td>' + esc(r.symbol) + '</td><td>' + cell("category", r) + '</td><td colspan="' + (COLS.length - 2) + '" class="mut">no data (' + esc(r.status) + ')</td></tr>';
+      }
+      return '<tr class="' + (isHot ? "hot" : "") + '">' + COLS.map(c => '<td>' + cell(c[0], r) + '</td>').join("") + '</tr>';
+    }).join("");
+  }
+
+  async function load(refresh) {
+    clearTimeout(timer);
+    const date = document.getElementById("dateInput").value;
+    const st = document.getElementById("status");
+    try {
+      const res = await fetch("/api/first-candle-board?date=" + encodeURIComponent(date) + (refresh ? "&refresh=1" : ""));
+      const d = await res.json();
+      if (!res.ok) { st.textContent = d.error || "Could not load"; return; }
+      rows = (d.rows || []).map(decorate);
+      render();
+      if (d.state === "running") {
+        st.textContent = "Working... " + d.done + " of " + d.total + " stocks";
+        timer = setTimeout(() => load(false), 2500);
+      } else if (d.state === "error") {
+        st.textContent = "Stopped early: " + (d.error || "error") + " (showing " + rows.length + " stocks)";
+      } else {
+        st.textContent = rows.length
+          ? (rows.length + " stocks for " + d.date + (d.total_alerted > rows.length ? " (" + (d.total_alerted - rows.length) + " more alerted stocks not shown - list capped)" : "") +
+             ". Decision is recorded from the day this feature went live; earlier days show '-'.")
+          : "No Buy/Sell alerts found for " + d.date;
+      }
+    } catch (e) {
+      st.textContent = "Could not reach the server";
+    }
+  }
+
+  // ---------- Benchmark ----------
+  const BANDS = ["Under 1.5\u00d7", "1.5\u00d7 to 3\u00d7", "3\u00d7 to 5\u00d7", "5\u00d7 and above"];
+  let benchRows = [], benchToken = 0;
+
+  const SHARE_BANDS = ["Under 50%", "50% to 70%", "70% to 90%", "90% and above"];
+  const isShare = key => key === "dir_share_pct";
+  function bandsFor(key) { return isShare(key) ? SHARE_BANDS : BANDS; }
+  function bandOf(x, key) {
+    if (isShare(key)) return x < 50 ? 0 : x < 70 ? 1 : x < 90 ? 2 : 3;
+    return x < 1.5 ? 0 : x < 3 ? 1 : x < 5 ? 2 : 3;
+  }
+  // Buy alerts want the stock up, Sell alerts want it down.
+  function dirMove(r) {
+    const mode = document.getElementById("benchMetric").value;
+    const sell = r.category === "Sell";
+    const has = x => x !== null && x !== undefined;
+    if (mode === "best") {
+      const m = sell ? r.after_first_down_pct : r.after_first_up_pct;   // Sell: how far it fell (negative number)
+      return has(m) ? (sell ? -m : m) : null;
+    }
+    const m = mode === "prev" ? r.last_close_vs_prev_close_pct : r.after_first_pct;
+    if (!has(m)) return null;
+    return sell ? -m : m;
+  }
+  function median(a) {
+    const s = a.slice().sort((x, y) => x - y), n = s.length;
+    return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : null;
+  }
+  function stat(list, hitAt) {
+    const mv = list.map(dirMove).filter(m => m !== null);
+    const hits = mv.filter(m => m >= hitAt).length;
+    return { n: mv.length, hits: hits, rate: mv.length ? hits / mv.length * 100 : null,
+             avg: mv.length ? mv.reduce((a, b) => a + b, 0) / mv.length : null, med: median(mv) };
+  }
+  function f1(x) { return x === null || x === undefined ? "-" : (Math.round(x * 10) / 10).toString(); }
+  function signed(x) { return x === null ? '<span class="mut">-</span>' : '<span class="' + (x > 0 ? "pos" : x < 0 ? "neg" : "") + '">' + (x > 0 ? "+" : "") + f1(x) + '%</span>'; }
+
+  function renderBench() {
+    const key = document.getElementById("benchKey").value;
+    const hitAt = parseFloat(document.getElementById("benchMove").value) || 3;
+    const dirOnly = document.getElementById("benchDirOnly").checked;
+    const dirMin = parseFloat(document.getElementById("benchDirMin").value) || 55;
+    const inc = document.getElementById("benchInclude").value;
+    const usable = benchRows.filter(r => r.status === "ok" && r[key] !== null && r[key] !== undefined &&
+      (inc === "all" || (inc === "traded" && r.decision === "TRADED") || (inc === "skipped" && r.decision && r.decision !== "TRADED")) &&
+      (!dirOnly || (r.dir_share_pct !== null && r.dir_share_pct !== undefined && r.dir_share_pct >= dirMin)));
+    const all = stat(usable, hitAt);
+    let html = "";
+    const bandNames = bandsFor(key);
+    for (let b = 0; b < bandNames.length; b++) {
+      const st = stat(usable.filter(r => bandOf(r[key], key) === b), hitAt);
+      const diff = (st.rate !== null && all.rate !== null) ? st.rate - all.rate : null;
+      html += '<tr><td>' + bandNames[b] + '</td><td>' + st.n + '</td><td>' + st.hits + '</td><td>' + (st.rate === null ? "-" : f1(st.rate) + "%") +
+        '</td><td>' + (diff === null ? '<span class="mut">-</span>' : '<span class="' + (diff > 0 ? "pos" : diff < 0 ? "neg" : "") + '">' + (diff > 0 ? "+" : "") + f1(diff) + ' pts</span>') +
+        '</td><td>' + signed(st.avg) + '</td><td>' + signed(st.med) + '</td></tr>';
+    }
+    html += '<tr class="allrow"><td>All stocks</td><td>' + all.n + '</td><td>' + all.hits + '</td><td>' + (all.rate === null ? "-" : f1(all.rate) + "%") +
+      '</td><td><span class="mut">-</span></td><td>' + signed(all.avg) + '</td><td>' + signed(all.med) + '</td></tr>';
+    document.getElementById("benchBody").innerHTML = html;
+  }
+
+  function weekdaysBack(endStr, count) {
+    const out = [], d = new Date(endStr + "T12:00:00Z");
+    while (out.length < count) {
+      const wd = d.getUTCDay();
+      if (wd !== 0 && wd !== 6) out.push(d.toISOString().slice(0, 10));
+      d.setUTCDate(d.getUTCDate() - 1);
+    }
+    return out;
+  }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  async function boardFor(date, token) {
+    for (;;) {
+      const res = await fetch("/api/first-candle-board?date=" + encodeURIComponent(date));
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || "failed");
+      if (token !== benchToken) return null;
+      if (d.state !== "running") return d;
+      document.getElementById("benchStatus").dataset.sub = d.done + " of " + d.total;
+      await sleep(2500);
+    }
+  }
+
+  async function buildBench() {
+    const token = ++benchToken;
+    const st = document.getElementById("benchStatus");
+    const days = Math.max(1, Math.min(parseInt(document.getElementById("benchDays").value) || 5, 15));
+    const dates = weekdaysBack(document.getElementById("dateInput").value, days);
+    benchRows = [];
+    const used = [];
+    renderBench();
+    for (let i = 0; i < dates.length; i++) {
+      st.textContent = "Day " + (i + 1) + " of " + dates.length + " (" + dates[i] + ")...";
+      try {
+        const d = await boardFor(dates[i], token);
+        if (d === null) return;
+        const rows = (d.rows || []).map(r => decorate(Object.assign({ date: dates[i] }, r)));
+        benchRows = benchRows.concat(rows);
+        used.push(dates[i] + " (" + rows.filter(r => r.status === "ok").length + ")");
+        renderBench();
+      } catch (e) {
+        used.push(dates[i] + " (failed)");
+      }
+    }
+    if (token !== benchToken) return;
+    st.textContent = "Done. " + benchRows.filter(r => r.status === "ok").length + " stock-days analysed.";
+    document.getElementById("benchDates").textContent = "Days used (stocks with data): " + used.join(", ") +
+      ". A day with no alerts, or today before 15:30 IST, gives partial or no numbers.";
+  }
+
+  document.getElementById("benchBtn").onclick = buildBench;
+  document.getElementById("benchStop").onclick = () => { benchToken++; document.getElementById("benchStatus").textContent = "Stopped."; };
+  document.getElementById("benchKey").onchange = renderBench;
+  document.getElementById("benchMove").oninput = renderBench;
+  document.getElementById("benchMetric").onchange = renderBench;
+  document.getElementById("benchDirOnly").onchange = renderBench;
+  document.getElementById("benchInclude").onchange = renderBench;
+  document.getElementById("showSel").onchange = render;
+  document.getElementById("benchDirMin").oninput = renderBench;
+
+  document.getElementById("loadBtn").onclick = () => load(false);
+  document.getElementById("refreshBtn").onclick = () => load(true);
+  document.getElementById("hotInput").oninput = render;
+  load(false);
+</script>
+</body>
+</html>
