@@ -43,7 +43,15 @@
     #benchStatus { font-size:13px; color:var(--muted); margin:0 0 10px; min-height:18px; }
     tr.allrow td { font-weight:600; border-top:2px solid var(--border); }
     .foot { margin-top:14px; font-size:11px; color:var(--muted); line-height:1.5; }
-  </style>
+    .movers { margin: 10px 0 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
+  .movers-head { margin-bottom: 6px; font-size: 13px; }
+  .movers-row { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
+  .mv-label { font-weight: 700; font-size: 12px; min-width: 62px; }
+  .mv-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border); font-size: 12px; white-space: nowrap; }
+  .mv-chip.pos { color: var(--green); }
+  .mv-chip.neg { color: var(--red); }
+  .mv-chip.alerted { border-color: currentColor; font-weight: 700; }
+</style>
 </head>
 <body>
   <h2 style="margin:0">First Candle <span style="color:var(--muted);font-weight:400;font-size:14px">RTT v0.0</span></h2>
@@ -77,6 +85,12 @@
     </label>
   </div>
   <div id="status"></div>
+
+  <div id="moversWrap" class="movers" style="display:none;">
+    <div class="movers-head"><b>Top 10 F&amp;O movers</b> <span id="moversMeta" class="mut"></span></div>
+    <div class="movers-row"><span class="mv-label pos">Gainers</span><span id="mvGain"></span></div>
+    <div class="movers-row"><span class="mv-label neg">Losers</span><span id="mvLose"></span></div>
+  </div>
 
   <div class="wrap"><table id="tbl">
     <thead><tr id="head"></tr></thead>
@@ -139,7 +153,7 @@
 
 <script>
   const COLS = [
-    ["symbol", "Symbol"], ["category", "Alert"], ["decision", "Decision"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
+    ["symbol", "Symbol"], ["category", "Alert"], ["decision", "Decision"], ["fno_mover", "F&O mover"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
     ["pct_of_avg_day_volume", "9:15 % of day"], ["first_candle_body_pct", "9:15 body %"], ["gap_open_pct", "Gap %"],
     ["day_volume_ratio", "Day vol"], ["below_20d_high_pct", "Below 20d high %"],
     ["day_high_vs_prev_close_pct", "Day high %"], ["last_close_vs_prev_close_pct", "Last %"],
@@ -171,6 +185,13 @@
       if (v === "TRADED") return '<span class="tag Buy" title="' + why + '">Traded</span>';
       const short = r.decision_reason ? esc(r.decision_reason.length > 46 ? r.decision_reason.slice(0, 46) + "..." : r.decision_reason) : "";
       return '<span class="tag" title="' + why + '">' + (v === "ERROR" ? "Error" : "Skipped") + '</span> <span class="mut">' + short + '</span>';
+    }
+    if (k === "fno_mover") {
+      const m = r.fno_info;
+      if (!m) return '<span class="mut">-</span>';
+      const up = m.type === "gain";
+      return '<span class="mv-chip ' + (up ? "pos" : "neg") + '" title="' + (up ? "Top F&O gainer" : "Top F&O loser") + ' #' + m.rank + ' vs the previous close, as of ' + esc(m.as_of) + '">' +
+             (up ? "&uarr; " : "&darr; ") + '#' + m.rank + ' ' + (m.pct > 0 ? "+" : "") + m.pct + '%</span>';
     }
     if (k === "beats_sessions") return esc(v);
     if (PCT.has(k)) return '<span class="' + (v > 0 ? "pos" : v < 0 ? "neg" : "") + '">' + (v > 0 ? "+" : "") + v + '%</span>';
@@ -219,6 +240,7 @@
       const d = await res.json();
       if (!res.ok) { st.textContent = d.error || "Could not load"; return; }
       rows = (d.rows || []).map(decorate);
+      applyMovers();
       render();
       if (d.state === "running") {
         st.textContent = "Working... " + d.done + " of " + d.total + " stocks";
@@ -235,6 +257,54 @@
       st.textContent = "Could not reach the server";
     }
   }
+
+  // ---------- Top F&O movers (live, today only; the server refreshes it once per 5-minute candle close) ----------
+  let moversData = null, moversAsOf = null;
+  function isTodayView() {
+    const ist = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+    return document.getElementById("dateInput").value === ist;
+  }
+  // Sets r.fno_info (shown in the column) and r.fno_mover (signed % - what the column sorts by) on every row.
+  function applyMovers() {
+    const map = {};
+    if (moversData && moversData.status === "ok" && isTodayView()) {
+      (moversData.gainers || []).forEach(g => { map[g.symbol] = { type: "gain", rank: g.rank, pct: g.pct, as_of: moversData.as_of }; });
+      (moversData.losers || []).forEach(l => { map[l.symbol] = { type: "lose", rank: l.rank, pct: l.pct, as_of: moversData.as_of }; });
+    }
+    rows.forEach(r => { const m = map[r.symbol]; r.fno_info = m || null; r.fno_mover = m ? m.pct : null; });
+  }
+  function moversPanel() {
+    const wrap = document.getElementById("moversWrap");
+    const d = moversData;
+    if (!isTodayView() || !d || d.status !== "ok") { wrap.style.display = "none"; return; }
+    const alerted = new Set(rows.map(r => r.symbol));
+    const chip = (m, cls) => '<span class="mv-chip ' + cls + (alerted.has(m.symbol) ? " alerted" : "") + '" title="' +
+      (alerted.has(m.symbol) ? "Has a Buy/Sell alert today" : "No alert today") + '">' + m.rank + ' ' + esc(m.symbol) + ' ' + (m.pct > 0 ? "+" : "") + m.pct + '%</span>';
+    document.getElementById("mvGain").innerHTML = (d.gainers || []).map(m => chip(m, "pos")).join("") || '<span class="mut">none</span>';
+    document.getElementById("mvLose").innerHTML = (d.losers || []).map(m => chip(m, "neg")).join("") || '<span class="mut">none</span>';
+    document.getElementById("moversMeta").textContent = (d.market_open ? "as of the " + d.as_of + " candle close" : "market closed - latest as of " + d.as_of) +
+      " (" + d.count + " of " + d.universe + " stocks ranked; refreshes every 5 min). Outlined = has an alert today.";
+    wrap.style.display = "";
+  }
+  async function loadMovers() {
+    if (document.hidden) return;
+    if (!isTodayView()) { moversPanel(); return; }
+    try {
+      const res = await fetch("/api/fno-movers");
+      const d = await res.json();
+      if (d.status === "ok") {
+        const stamp = d.slot + "|" + d.fetched_at;
+        const changed = stamp !== moversAsOf;
+        moversData = d; moversAsOf = stamp;
+        if (changed) { applyMovers(); render(); }
+      }
+      moversPanel();
+    } catch (e) { /* keep showing the last snapshot */ }
+  }
+  document.getElementById("dateInput").addEventListener("change", () => { applyMovers(); moversPanel(); });
+  setInterval(loadMovers, 30000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) loadMovers(); });
+  loadMovers();
 
   // ---------- Benchmark ----------
   const BANDS = ["Under 1.5\u00d7", "1.5\u00d7 to 3\u00d7", "3\u00d7 to 5\u00d7", "5\u00d7 and above"];

@@ -541,6 +541,10 @@
           <option value="{{ today_str }}" selected>{{ today_str }} (today)</option>
         {% endif %}
       </select>
+      <select id="sortSelect" title="How alerts are ordered inside each column. 9:15 buy share = how much of the 9:15 candle agreed with the alert (highest first). Today only." onchange="setSortMode(this.value)">
+        <option value="volume">Sort: volume strength</option>
+        <option value="share">Sort: 9:15 buy share</option>
+      </select>
       <div class="count">alerts this day: <b id="dayCount">{{ alerts_count }}</b></div>
       <form method="post" action="/clear" onsubmit="return confirm('Clear all saved alerts (all days)?');">
         <button type="submit">Clear All</button>
@@ -838,6 +842,34 @@
     // Poll for new alerts every 5 seconds and re-render, without a full
     // page reload. Only auto-refreshes while viewing today - a past day's
     // list won't change, so there's no need to keep polling for it.
+    // Sort choice for the alert columns. "volume" = the server's order (Strong volume first);
+    // "share" = highest 9:15 buy share first (selling share for Sell alerts), alerts with no
+    // reading yet last, ties keeping the server order. Remembered in this browser.
+    let sortMode = "volume";
+    try { if (localStorage.getItem("rtt_dash_sort") === "share") sortMode = "share"; } catch (e) {}
+    function shareOf(a) { return (a && a.fc && typeof a.fc.share === "number") ? a.fc.share : null; }
+    function sortAlerts(list) {
+      if (sortMode !== "share") return list;
+      return list.map((a, i) => [a, i]).sort((x, y) => {
+        const sx = shareOf(x[0]), sy = shareOf(y[0]);
+        if (sx === null && sy === null) return x[1] - y[1];
+        if (sx === null) return 1;
+        if (sy === null) return -1;
+        return (sy - sx) || (x[1] - y[1]);
+      }).map(p => p[0]);
+    }
+    function setSortMode(v) {
+      sortMode = (v === "share") ? "share" : "volume";
+      try { localStorage.setItem("rtt_dash_sort", sortMode); } catch (e) {}
+      refreshAlerts();
+    }
+    (function initSort() {
+      const sel = document.getElementById("sortSelect");
+      if (!sel) return;
+      sel.value = sortMode;
+      if (SELECTED_DATE !== TODAY_STR) { sel.disabled = true; sel.title = "Sorting by 9:15 buy share works on today's alerts only."; }
+    })();
+
     async function refreshAlerts() {
       if (SELECTED_DATE !== TODAY_STR) return;
       if (document.hidden) return;   // no polling from a background tab
@@ -855,7 +887,7 @@
         alerts.forEach(a => buckets[categorize(a)].push(a));
         const columns = CATEGORY_ORDER
           .filter(cat => buckets[cat].length > 0)
-          .map(cat => sectionHTML(cat, buckets[cat]))
+          .map(cat => sectionHTML(cat, sortAlerts(buckets[cat])))
           .join("");
         container.innerHTML = `<div class="categories-row">${columns}</div>`;
         applyGlobalFilter();
@@ -864,6 +896,7 @@
       }
     }
     setInterval(refreshAlerts, 10000);
+    if (sortMode === "share") refreshAlerts();   // the first paint is the server's volume order; re-sort right away
     document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshAlerts(); });
 
     async function manualEnterAlert(id, symbol, category) {
