@@ -2712,6 +2712,114 @@ def get_sector_performance_cached(access_token: str | None) -> dict | None:
     return value
 
 
+# ---------------------------------------------------------------------------
+# Top F&O gainers / losers, refreshed once per 5-minute candle close.
+# Uses the same universe, previous-close cache and batched LTP call as the
+# sector panel (SECTOR_MAP, ~210 symbols - the F&O stocks; indices excluded),
+# so it adds one Upstox call per 5 minutes however many tabs are open.
+# % change = latest price vs the previous session's close.
+# ---------------------------------------------------------------------------
+FNO_MOVERS_TOP_N = 10
+_fno_movers_cache: dict = {"slot": None, "data": None, "retry_after": 0.0}
+_fno_movers_lock = threading.Lock()
+
+
+def _fno_movers_slot(now_ist: datetime) -> str:
+    """Which 5-minute candle close a snapshot belongs to. The slot flips 3 seconds after each
+    boundary (a request at 10:05:01 still belongs to the 10:00 slot) so the snapshot is taken
+    once the candle has really closed. Outside market hours there is one slot per day."""
+    eff = now_ist - timedelta(seconds=3)
+    day = eff.strftime("%Y-%m-%d")
+    if not _is_market_hours_ist():
+        return day + " closed"
+    return f"{day} {eff.hour:02d}:{(eff.minute // 5) * 5:02d}"
+
+
+def _fetch_fno_movers(access_token: str) -> dict | None:
+    """Ranks the F&O stocks by % change vs the previous close. None = couldn't be computed yet."""
+    prev_closes = _get_prev_closes(access_token)
+    if not prev_closes:
+        return None
+    key_to_symbol: dict[str, str] = {}
+    universe = 0
+    for symbol in SECTOR_MAP:
+        key = get_instrument_key(symbol)
+        if not key or not key.startswith("NSE_EQ|"):    # NIFTY / BANKNIFTY etc. are not stocks
+            continue
+        universe += 1
+        if symbol in prev_closes:
+            key_to_symbol[key] = symbol
+    if not key_to_symbol:
+        return None
+    url = ("https://api.upstox.com/v3/market-quote/ltp?instrument_key="
+           + urllib.parse.quote(",".join(key_to_symbol), safe=",|"))
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {access_token}", "Accept": "application/json", "User-Agent": BROWSER_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        payload = json.loads(resp.read().decode())
+    rows = []
+    for entry in (payload.get("data") or {}).values():
+        sym = key_to_symbol.get(entry.get("instrument_token"))
+        ltp, pc = entry.get("last_price"), prev_closes.get(sym) if sym else None
+        if not sym or not ltp or not pc:
+            continue
+        rows.append({"symbol": sym, "ltp": round(float(ltp), 2), "pct": round((float(ltp) - pc) / pc * 100.0, 2)})
+    if not rows:
+        return None
+    gainers = [dict(r) for r in sorted((r for r in rows if r["pct"] > 0), key=lambda r: -r["pct"])[:FNO_MOVERS_TOP_N]]
+    losers = [dict(r) for r in sorted((r for r in rows if r["pct"] < 0), key=lambda r: r["pct"])[:FNO_MOVERS_TOP_N]]
+    for i, r in enumerate(gainers, 1):
+        r["rank"] = i
+    for i, r in enumerate(losers, 1):
+        r["rank"] = i
+    now_ist = datetime.utcnow() + IST_OFFSET
+    return {"status": "ok", "fetched_at": now_ist.strftime("%H:%M:%S"), "count": len(rows), "universe": universe,
+            "gainers": gainers, "losers": losers}
+
+
+def get_fno_movers_cached(access_token: str | None) -> dict | None:
+    """The movers snapshot for the current 5-minute slot: served from memory, rebuilt (one Upstox call)
+    by the first request after each candle close. If a rebuild fails, the previous snapshot keeps
+    being served and the next try waits 20 seconds."""
+    c = _fno_movers_cache
+    if not access_token:
+        return c["data"]
+    now_ist = datetime.utcnow() + IST_OFFSET
+    slot = _fno_movers_slot(now_ist)
+    if c["data"] is not None and c["slot"] == slot:
+        return c["data"]
+    if time.time() < c["retry_after"]:
+        return c["data"]
+    with _fno_movers_lock:
+        if c["data"] is not None and c["slot"] == slot:
+            return c["data"]
+        data = None
+        try:
+            data = _fetch_fno_movers(access_token)
+        except Exception as e:
+            print(f"[fno-movers] fetch failed: {type(e).__name__}: {e}", flush=True)
+        if data:
+            data["slot"] = slot
+            data["market_open"] = not slot.endswith("closed")
+            data["as_of"] = slot[-5:] if data["market_open"] else data["fetched_at"][:5]
+            c["slot"], c["data"], c["retry_after"] = slot, data, 0.0
+        else:
+            c["retry_after"] = time.time() + 20
+        return c["data"]
+
+
+@app.route("/api/fno-movers")
+def api_fno_movers():
+    """Top 10 F&O gainers and losers (live, today only). Always HTTP 200; look at "status"."""
+    token = get_setting("upstox_access_token")
+    data = get_fno_movers_cached(token)
+    if not data:
+        return jsonify({"status": "unavailable",
+                        "reason": "No Upstox token saved" if not token else
+                                  "Previous closes are still loading, or Upstox could not be reached - retrying"})
+    return jsonify(data)
+
+
 def resample_1min_to_5min(candles_1min: list) -> list[tuple[float, float, float, float]]:
     """candles_1min: list of (timestamp_str, open, high, low, close, volume, oi),
     oldest first. Groups consecutive 1-min candles into 5-min buckets aligned
