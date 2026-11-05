@@ -241,6 +241,15 @@
     .vol-pill.moderate { color: var(--gold); border-color: var(--gold); }
     .vol-pill.weak { color: var(--muted); }
     .vol-pill.fc { color: var(--text); }
+    .row-fc { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 10px; color: var(--muted); margin-top: 2px; }
+    .fc-share { font-size: 11px; font-weight: 700; padding: 0 7px; border-radius: 8px; border: 1px solid var(--border); color: var(--text); white-space: nowrap; cursor: help; }
+    .fc-share.hot { background: var(--green); border-color: var(--green); color: #04130e; }
+    .fc-share.good { color: var(--green); border-color: var(--green); }
+    .fc-share.low { color: var(--red); border-color: var(--red); }
+    .fc-stat { white-space: nowrap; cursor: help; }
+    .fc-stat b { font-weight: 600; }
+    .fc-stat b.pos { color: var(--green); }
+    .fc-stat b.neg { color: var(--red); }
     .pct-change {
       font-size: 11px;
       font-weight: 600;
@@ -596,6 +605,9 @@
                   {% if alert.get("volume") %}
                   <div class="row-vol"><span class="vol-pill {{ alert['volume']['label']|lower }}" title="{{ 'Buy' if category == 'Buy' else 'Sell' }}-side directional volume is {{ alert['volume']['ratio'] }}x its usual level for this time of day{% if alert['volume']['prev_ratio'] is not none %} (previous candle: {{ alert['volume']['prev_ratio'] }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ alert['volume']['asof'] }}.">Vol {{ alert['volume']['label'] }} &middot; {{ alert['volume']['ratio'] }}&times;</span>{% if alert['volume'].get('first_ratio') is not none %}<span class="vol-pill fc" title="First 5-min candle (9:15) volume is {{ alert['volume']['first_ratio'] }}x its average over the previous 10 sessions.">9:15 vol {{ alert['volume']['first_ratio'] }}&times;</span>{% endif %}<span>as of {{ alert['volume']['asof'] }}</span></div>
                   {% endif %}
+                  {% if alert.get("fc") %}{% set fc = alert["fc"] %}
+                  <div class="row-fc"><span class="fc-share{% if fc['share'] >= 95 %} hot{% elif fc['share'] >= 70 %} good{% elif fc['share'] < 50 %} low{% endif %}" title="The 9:15 candle closed at {{ fc['share'] }}% of its range in the alert's direction - an estimated {{ fc['side'] }} share of its volume (100% = closed exactly at its {{ 'high' if fc['side'] == 'buy' else 'low' }}). Estimated from candle structure, not true buy/sell volume.">9:15 {{ fc['side'] }} {{ "%.1f"|format(fc['share']) }}%</span>{% if fc['after_pct'] is not none %}<span class="fc-stat" title="Move from the 9:15 candle's close to the latest price (as of {{ fc['last_at'] }})">After 9:15 <b class="{{ 'pos' if fc['after_pct'] > 0 else 'neg' if fc['after_pct'] < 0 else '' }}">{{ "%+.2f"|format(fc['after_pct']) }}%</b></span>{% endif %}{% if fc['extreme_pct'] is not none %}<span class="fc-stat" title="{{ fc['extreme_label'] }} so far today vs the previous close">{{ fc['extreme_label'] }} <b class="{{ 'pos' if fc['extreme_pct'] > 0 else 'neg' if fc['extreme_pct'] < 0 else '' }}">{{ "%+.2f"|format(fc['extreme_pct']) }}%</b></span>{% endif %}{% if fc['last_pct'] is not none %}<span class="fc-stat" title="Latest price vs the previous close (as of {{ fc['last_at'] }})">Last <b class="{{ 'pos' if fc['last_pct'] > 0 else 'neg' if fc['last_pct'] < 0 else '' }}">{{ "%+.2f"|format(fc['last_pct']) }}%</b></span>{% endif %}</div>
+                  {% endif %}
                   <div class="row-bottom">
                     <span class="badges-inline">
                       {% for sn in alert.get("scan_names", [alert.get("scan_name", "Scan alert")]) %}
@@ -686,6 +698,7 @@
         const tip = `${side}-side directional volume is ${v.ratio}x its usual level for this time of day${prevTxt}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of ${v.asof}.`;
         volHtml = `<div class="row-vol"><span class="vol-pill ${escapeHtml(v.label.toLowerCase())}" title="${escapeHtml(tip)}">Vol ${escapeHtml(v.label)} &middot; ${v.ratio}&times;</span>${(v.first_ratio !== null && v.first_ratio !== undefined) ? `<span class="vol-pill fc" title="First 5-min candle (9:15) volume is ${v.first_ratio}x its average over the previous 10 sessions.">9:15 vol ${v.first_ratio}&times;</span>` : ""}<span>as of ${escapeHtml(v.asof)}</span></div>`;
       }
+      const fcHtml = fcLineHtml(a.fc);
       return `
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
@@ -693,6 +706,7 @@
             <span class="price-wrap"><span class="price">${escapeHtml(String(inr(a.trigger_price || "-")))}</span>${pctBadge}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '${escapeHtml(a.symbol || "")}')" title="Fetch live price">&#8635;</button>
           </div>
           ${volHtml}
+          ${fcHtml}
           <div class="row-bottom">
             <span class="badges-inline">${badgesHtml}</span>
             <span class="time-inline">${escapeHtml(timeText)}</span>
@@ -701,6 +715,22 @@
           </div>
         </div>
       `;
+    }
+
+    // The first-candle line under an alert: 9:15 buy/sell share (the important one), the move
+    // since the 9:15 candle, the day's extreme and the latest price, all vs the previous close.
+    function fcLineHtml(fc) {
+      if (!fc || fc.share === null || fc.share === undefined) return "";
+      const sg = (v) => (v > 0 ? "+" : "") + v.toFixed(2) + "%";
+      const cl = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "");
+      const have = (v) => v !== null && v !== undefined;
+      const shareCls = fc.share >= 95 ? " hot" : fc.share >= 70 ? " good" : fc.share < 50 ? " low" : "";
+      const tipShare = `The 9:15 candle closed at ${fc.share}% of its range in the alert's direction - an estimated ${fc.side} share of its volume (100% = closed exactly at its ${fc.side === "buy" ? "high" : "low"}). Estimated from candle structure, not true buy/sell volume.`;
+      let h = `<div class="row-fc"><span class="fc-share${shareCls}" title="${escapeHtml(tipShare)}">9:15 ${escapeHtml(fc.side)} ${fc.share.toFixed(1)}%</span>`;
+      if (have(fc.after_pct)) h += `<span class="fc-stat" title="Move from the 9:15 candle's close to the latest price (as of ${escapeHtml(fc.last_at || "")})">After 9:15 <b class="${cl(fc.after_pct)}">${sg(fc.after_pct)}</b></span>`;
+      if (have(fc.extreme_pct)) h += `<span class="fc-stat" title="${escapeHtml(fc.extreme_label)} so far today vs the previous close">${escapeHtml(fc.extreme_label)} <b class="${cl(fc.extreme_pct)}">${sg(fc.extreme_pct)}</b></span>`;
+      if (have(fc.last_pct)) h += `<span class="fc-stat" title="Latest price vs the previous close (as of ${escapeHtml(fc.last_at || "")})">Last <b class="${cl(fc.last_pct)}">${sg(fc.last_pct)}</b></span>`;
+      return h + "</div>";
     }
 
     function sectionHTML(category, items) {
