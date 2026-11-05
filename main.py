@@ -3353,6 +3353,16 @@ def _volume_slots_from_raw(raw: list) -> dict:
 
 
 _vol_history_cache_past: dict = {}
+_vol_prev_close_cache: dict = {}   # instrument_key -> (IST date, previous session's last close)
+
+
+def _prev_close_from_raw(raw: list, before_date: str):
+    """Close of the last candle of the most recent session earlier than before_date."""
+    last = None
+    for c in raw:
+        if c[0][:10] < before_date:
+            last = c
+    return float(last[4]) if last else None
 
 
 def _get_volume_history_before(instrument_key: str, access_token: str, as_of_date: str) -> dict:
@@ -3397,6 +3407,9 @@ def _get_volume_history(instrument_key: str, access_token: str) -> dict:
         )
         raw = _vol_fetch_candles(url, access_token)
         slots = _volume_slots_from_raw(raw)
+        pc = _prev_close_from_raw(raw, today)
+        if pc:
+            _vol_prev_close_cache[instrument_key] = (today, pc)
     except Exception:
         slots = {}
     _vol_history_cache[instrument_key] = {
@@ -3492,6 +3505,37 @@ def _build_volume_reading(symbol: str, access_token: str, as_of_ist: datetime | 
     if (first_c is not None and base_first and base_first["n"] >= _VOL_MIN_HISTORY_SESSIONS
             and base_first["vol"] > 0):
         out["first_candle"] = {"ratio": round(float(first_c[5] or 0) / base_first["vol"], 2)}
+    if as_of_ist is None:      # the dashboard's live reading, not the entry logger's as-of replay
+        try:
+            pc = _vol_prev_close_cache.get(key)
+            prev_close = pc[1] if pc and pc[0] == _ist_today_str() else None
+            today_all = [c for c in raw if c[0][:10] == today]
+            info = _fc_dashboard_info(prev_close, today_all, first_c)
+            if info:
+                out["fc_info"] = info
+        except Exception:
+            pass
+    return out
+
+
+def _fc_dashboard_info(prev_close, today_candles: list, first_c) -> dict | None:
+    """What the dashboard's first-candle line shows for one stock. Pure calculation.
+    today_candles = today's 5-min candles in time order (the forming one included, so
+    'last' is as current as the data); first_c = the closed 09:15 candle."""
+    if first_c is None or not today_candles:
+        return None
+    vol = float(first_c[5] or 0)
+    buy, _sell = _directional_pressure(first_c[2], first_c[3], first_c[4], vol)
+    last = float(today_candles[-1][4])
+    out = {
+        "buy_share": round(buy / vol * 100.0, 1) if vol > 0 else None,
+        "after_pct": _fc_pct(last, first_c[4]),
+        "last_at": today_candles[-1][0][11:16],
+    }
+    if prev_close:
+        out["day_high_pct"] = _fc_pct(max(float(x[2]) for x in today_candles), prev_close)
+        out["day_low_pct"] = _fc_pct(min(float(x[3]) for x in today_candles), prev_close)
+        out["last_pct"] = _fc_pct(last, prev_close)
     return out
 
 
@@ -3570,6 +3614,28 @@ def _volume_for_alert(symbol: str | None, category: str) -> dict | None:
             "first_ratio": (r.get("first_candle") or {}).get("ratio")}
 
 
+def _fc_for_alert(symbol: str | None, category: str) -> dict | None:
+    """The first-candle line for one Buy/Sell alert. The share is the side that matches
+    the alert (buying for Buy, selling for Sell), so a high number always means the 9:15
+    candle agreed with the alert. Moves keep their real sign."""
+    r = _vol_reading_cache.get((symbol or "").strip().upper())
+    if not r or r.get("status") not in ("ok", "no_baseline"):
+        return None
+    info = r.get("fc_info")
+    if not info or info.get("buy_share") is None:
+        return None
+    is_buy = category == "Buy"
+    return {
+        "side": "buy" if is_buy else "sell",
+        "share": info["buy_share"] if is_buy else round(100.0 - info["buy_share"], 1),
+        "after_pct": info.get("after_pct"),
+        "extreme_label": "Day high" if is_buy else "Day low",
+        "extreme_pct": info.get("day_high_pct") if is_buy else info.get("day_low_pct"),
+        "last_pct": info.get("last_pct"),
+        "last_at": info.get("last_at"),
+    }
+
+
 def _attach_volume_readings(items: list[dict], access_token: str | None, is_today: bool) -> None:
     """Adds a 'volume' key to each Buy/Sell alert dict. Today's alerts only -
     a past day's dashboard has no live candles to compare against."""
@@ -3583,6 +3649,7 @@ def _attach_volume_readings(items: list[dict], access_token: str | None, is_toda
     for a in items:
         if a.get("category") in ("Buy", "Sell"):
             a["volume"] = _volume_for_alert(a.get("symbol"), a["category"])
+            a["fc"] = _fc_for_alert(a.get("symbol"), a["category"])
 
 
 def _volume_rank(a: dict) -> tuple:
