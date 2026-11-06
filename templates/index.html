@@ -208,6 +208,8 @@
     .sym-wrap { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden; }
     .sec-chip { font-size: 10px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       max-width: 170px; padding: 1px 6px; border-radius: 8px; background: rgba(127,127,127,0.14); color: var(--muted); }
+    .dp-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--border); color: var(--muted); cursor: help; }
+    .dp-chip.good { color: var(--green); border-color: var(--green); }
     .sec-chip.pos { color: var(--green); }
     .sec-chip.neg { color: #ff5370; }
     .row-top .sym {
@@ -546,9 +548,10 @@
           <option value="{{ today_str }}" selected>{{ today_str }} (today)</option>
         {% endif %}
       </select>
-      <select id="sortSelect" title="How alerts are ordered inside each column. 9:15 buy share = how much of the 9:15 candle agreed with the alert (highest first). Today only." onchange="setSortMode(this.value)">
+      <select id="sortSelect" title="How alerts are ordered inside each column. 9:15 buy share = how much of the 9:15 candle agreed with the alert (highest first). Direction pressure = the 9:15 candle's buying (selling for Sell) volume vs its 10-session average (highest first). Today only." onchange="setSortMode(this.value)">
         <option value="volume">Sort: volume strength</option>
         <option value="share">Sort: 9:15 buy share</option>
+        <option value="pressure">Sort: direction pressure</option>
       </select>
       <div class="count">alerts this day: <b id="dayCount">{{ alerts_count }}</b></div>
       <form method="post" action="/clear" onsubmit="return confirm('Clear all saved alerts (all days)?');">
@@ -608,7 +611,7 @@
                 {% for alert in items %}
                 <div class="list-row{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}{% if alert['confirmed_count'] and alert['confirmed_count'] >= 3 %} triple-confirmed{% endif %}" data-sector="{{ alert['sector'] }}" {% if alert["alert_name"] %}title="{{ alert['alert_name'] }}"{% endif %}>
                   <div class="row-top">
-                    <span class="sym-wrap"><span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>{% if alert.get("sector") and alert.get("sector") != "Unclassified" %}<span class="sec-chip{% if alert.get('sector_0925') is not none %}{{ ' pos' if alert['sector_0925'] > 0 else (' neg' if alert['sector_0925'] < 0 else '') }}{% endif %}" title="Sector {{ alert['sector'] }}{% if alert.get('sector_0925') is not none %}: {{ '%+.2f'|format(alert['sector_0925']) }}% at 09:25 IST (fixed for the day){% else %}: 09:25 value not available yet{% endif %}">{{ alert['sector'] }}{% if alert.get('sector_0925') is not none %} {{ '%+.2f'|format(alert['sector_0925']) }}%{% endif %}</span>{% endif %}</span>
+                    <span class="sym-wrap"><span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>{% if alert.get("sector") and alert.get("sector") != "Unclassified" %}<span class="sec-chip{% if alert.get('sector_0925') is not none %}{{ ' pos' if alert['sector_0925'] > 0 else (' neg' if alert['sector_0925'] < 0 else '') }}{% endif %}" title="Sector {{ alert['sector'] }}{% if alert.get('sector_0925') is not none %}: {{ '%+.2f'|format(alert['sector_0925']) }}% at 09:25 IST (fixed for the day){% else %}: 09:25 value not available yet{% endif %}">{{ alert['sector'] }}{% if alert.get('sector_0925') is not none %} {{ '%+.2f'|format(alert['sector_0925']) }}%{% endif %}</span>{% endif %}{% set _fcp = alert.get("fc") %}{% if _fcp and _fcp.get("pressure") is not none %}<span class="dp-chip{{ ' good' if _fcp['pressure'] >= 3 else '' }}" title="Dir. pressure {{ '%.2f'|format(_fcp['pressure']) }}x: estimated {{ _fcp['side'] }}ing volume of the 9:15 candle vs its 10-session average">Pressure {{ '%.1f'|format(_fcp['pressure']) }}&times;</span>{% endif %}</span>
                     <span class="price-wrap"><span class="price">{{ (alert["trigger_price"] or "-")|inr }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '{{ (alert['symbol'] or '')|escape }}')" title="Fetch live price">&#8635;</button>
                   </div>
                   {% if alert.get("volume") %}
@@ -711,7 +714,7 @@
       return `
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
-            <span class="sym-wrap"><span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>${secChipHtml(a)}</span>
+            <span class="sym-wrap"><span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>${secChipHtml(a)}${dirChipHtml(a)}</span>
             <span class="price-wrap"><span class="price">${escapeHtml(String(inr(a.trigger_price || "-")))}</span>${pctBadge}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '${escapeHtml(a.symbol || "")}')" title="Fetch live price">&#8635;</button>
           </div>
           ${volHtml}
@@ -736,6 +739,14 @@
       const cls = has ? (p > 0 ? " pos" : p < 0 ? " neg" : "") : "";
       const tip = "Sector " + a.sector + (has ? ": " + (p > 0 ? "+" : "") + Number(p).toFixed(2) + "% at 09:25 IST (fixed for the day)" : ": 09:25 value not available yet");
       return `<span class="sec-chip${cls}" title="${escapeHtml(tip)}">${escapeHtml(a.sector)}${has ? " " + (p > 0 ? "+" : "") + Number(p).toFixed(2) + "%" : ""}</span>`;
+    }
+
+    // Direction pressure of the 9:15 candle: buying (Buy alert) or selling (Sell alert) volume vs its 10-session average.
+    function dirChipHtml(a) {
+      const p = a.fc && a.fc.pressure;
+      if (p === null || p === undefined) return "";
+      const tip = "Dir. pressure " + Number(p).toFixed(2) + "x: estimated " + a.fc.side + "ing volume of the 9:15 candle vs its 10-session average (from where the candle closed in its range)";
+      return `<span class="dp-chip${p >= 3 ? " good" : ""}" title="${escapeHtml(tip)}">Pressure ${Number(p).toFixed(1)}&times;</span>`;
     }
 
     function fcLineHtml(fc) {
@@ -861,12 +872,14 @@
     // "share" = highest 9:15 buy share first (selling share for Sell alerts), alerts with no
     // reading yet last, ties keeping the server order. Remembered in this browser.
     let sortMode = "volume";
-    try { if (localStorage.getItem("rtt_dash_sort") === "share") sortMode = "share"; } catch (e) {}
+    try { const sv = localStorage.getItem("rtt_dash_sort"); if (sv === "share" || sv === "pressure") sortMode = sv; } catch (e) {}
     function shareOf(a) { return (a && a.fc && typeof a.fc.share === "number") ? a.fc.share : null; }
+    function pressureOf(a) { return (a && a.fc && typeof a.fc.pressure === "number") ? a.fc.pressure : null; }
     function sortAlerts(list) {
-      if (sortMode !== "share") return list;
+      if (sortMode !== "share" && sortMode !== "pressure") return list;
+      const keyOf = sortMode === "pressure" ? pressureOf : shareOf;
       return list.map((a, i) => [a, i]).sort((x, y) => {
-        const sx = shareOf(x[0]), sy = shareOf(y[0]);
+        const sx = keyOf(x[0]), sy = keyOf(y[0]);
         if (sx === null && sy === null) return x[1] - y[1];
         if (sx === null) return 1;
         if (sy === null) return -1;
@@ -874,7 +887,7 @@
       }).map(p => p[0]);
     }
     function setSortMode(v) {
-      sortMode = (v === "share") ? "share" : "volume";
+      sortMode = (v === "share" || v === "pressure") ? v : "volume";
       try { localStorage.setItem("rtt_dash_sort", sortMode); } catch (e) {}
       refreshAlerts();
     }
@@ -882,7 +895,7 @@
       const sel = document.getElementById("sortSelect");
       if (!sel) return;
       sel.value = sortMode;
-      if (SELECTED_DATE !== TODAY_STR) { sel.disabled = true; sel.title = "Sorting by 9:15 buy share works on today's alerts only."; }
+      if (SELECTED_DATE !== TODAY_STR) { sel.disabled = true; sel.title = "Sorting by 9:15 buy share or direction pressure works on today's alerts only."; }
     })();
 
     async function refreshAlerts() {
@@ -911,7 +924,7 @@
       }
     }
     setInterval(refreshAlerts, 10000);
-    if (sortMode === "share") refreshAlerts();   // the first paint is the server's volume order; re-sort right away
+    if (sortMode !== "volume") refreshAlerts();   // the first paint is the server's volume order; re-sort right away
     document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshAlerts(); });
 
     async function manualEnterAlert(id, symbol, category) {
