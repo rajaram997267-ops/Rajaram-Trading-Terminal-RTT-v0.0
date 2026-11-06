@@ -2843,7 +2843,8 @@ def api_fno_movers():
 # ---------------------------------------------------------------------------
 FNO_RANK_KEEP_TOP = 30           # ranks above this are not returned (the study offers Top 10/15/20/30)
 FNO_RANK_FINAL_AFTER = (15, 45)  # today's daily candle is only final after this IST time
-_fno_rank_state: dict = {"state": "idle", "done": 0, "total": 0, "error": None, "attempted": set()}
+_fno_rank_state: dict = {"state": "idle", "done": 0, "total": 0, "error": None, "attempted": set(),
+                         "ok": 0, "failed": 0, "last_error": None}
 _fno_rank_lock = threading.Lock()
 
 
@@ -2868,6 +2869,9 @@ def _fno_rank_worker(token: str, from_date: str, dates_wanted: list) -> None:
         today_final = now_ist.weekday() >= 5 or _fno_rank_final_cutoff_ok(now_ist)
         universe = _fno_universe()
         st["total"], st["done"] = len(universe), 0
+        st["ok"], st["failed"], st["last_error"] = 0, 0, None
+        if not universe:
+            st["last_error"] = "no F&O symbols resolved to an Upstox instrument key (instrument master not loaded?)"
         fetch_from = (datetime.strptime(from_date, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
         for symbol, key in universe:
             url = (f"https://api.upstox.com/v3/historical-candle/{urllib.parse.quote(key, safe='|')}"
@@ -2877,6 +2881,7 @@ def _fno_rank_worker(token: str, from_date: str, dates_wanted: list) -> None:
                     "Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": BROWSER_USER_AGENT})
                 with urllib.request.urlopen(req, timeout=15) as resp:
                     candles = ((json.loads(resp.read().decode()).get("data") or {}).get("candles")) or []
+                st["ok"] += 1
                 candles = sorted(candles, key=lambda c: c[0])
                 rows = []
                 for prev, cur in zip(candles, candles[1:]):
@@ -2895,10 +2900,23 @@ def _fno_rank_worker(token: str, from_date: str, dates_wanted: list) -> None:
                                 "ON CONFLICT (date, symbol) DO UPDATE SET pct = excluded.pct, close = excluded.close, "
                                 "prev_close = excluded.prev_close", r)
                         conn.commit()
+            except urllib.error.HTTPError as e:
+                st["failed"] += 1
+                try:
+                    body = e.read().decode()[:160]
+                except Exception:
+                    body = ""
+                st["last_error"] = f"{symbol}: HTTP {e.code} {body}"
+                print(f"[fno-rank] {st['last_error']}", flush=True)
+                if e.code == 429:
+                    time.sleep(2.0)                   # rate limited - back off a little
             except Exception as e:
-                print(f"[fno-rank] {symbol}: {type(e).__name__}", flush=True)
+                st["failed"] += 1
+                st["last_error"] = f"{symbol}: {type(e).__name__}: {e}"
+                print(f"[fno-rank] {st['last_error']}", flush=True)
             st["done"] += 1
-        st["attempted"].update(dates_wanted)
+        if st["ok"] > 0:                              # only remember a day as tried if Upstox actually answered
+            st["attempted"].update(dates_wanted)
         st["state"], st["error"] = "done", None
     except Exception as e:
         st["state"], st["error"] = "error", f"{type(e).__name__}: {e}"
@@ -2986,7 +3004,8 @@ def api_fno_rank_history():
         if missing and st["state"] != "running":
             st.update(state="running", done=0, total=0, error=None)
             threading.Thread(target=_fno_rank_worker, args=(token, min(missing), list(missing)), daemon=True).start()
-    return jsonify({"state": st["state"], "done": st["done"], "total": st["total"], "error": st["error"], "days": days})
+    return jsonify({"state": st["state"], "done": st["done"], "total": st["total"], "error": st["error"], "days": days,
+                    "ok": st["ok"], "failed": st["failed"], "last_error": st["last_error"]})
 
 
 def resample_1min_to_5min(candles_1min: list) -> list[tuple[float, float, float, float]]:
