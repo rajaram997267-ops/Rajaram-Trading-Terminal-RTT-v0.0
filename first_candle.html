@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - First Candle</title>
+  <style>
+    :root { --bg:#0b0e14; --panel:#131722; --border:#1e222d; --text:#e6e9f0; --muted:#6b7280; --green:#00c896; --gold:#ffb800; --red:#ff5370; }
+    :root[data-theme="light-gray"] { --red:#dc2626; --bg:#e9ebee; --panel:#ffffff; --border:#d0d4da; --text:#1a1d23; --muted:#6b7280; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="sky-blue"] { --red:#dc2626; --bg:#eaf4fb; --panel:#ffffff; --border:#bfe0f2; --text:#10222c; --muted:#4a6572; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="off-white"] { --red:#dc2626; --bg:#f7f5f0; --panel:#ffffff; --border:#e2ddd2; --text:#1f1c16; --muted:#6b6455; --green:#0e9f6e; --gold:#b45309; }
+    * { box-sizing: border-box; }
+    body { font-family:'Segoe UI',Arial,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px 32px 48px; }
+    a { color: var(--green); }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .tabbar { display:flex; gap:4px; border-bottom:1px solid var(--border); margin:18px 0 20px; overflow-x:auto; }
+    .tabbar a { padding:10px 14px; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; white-space:nowrap; }
+    .tabbar a.active { color:var(--text); border-bottom-color:var(--green); }
+    .tabbar a:hover { color:var(--text); }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:0 0 14px; font-size:13px; color:var(--muted); }
+    .controls input { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:13px; }
+    .controls input[type=number] { width:70px; }
+    .controls button { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
+    .controls button:hover { border-color:var(--green); }
+    #status { font-size:13px; color:var(--muted); margin:0 0 12px; min-height:18px; }
+    .wrap { overflow-x:auto; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
+    table { border-collapse:collapse; width:100%; font-size:12px; }
+    th, td { border-bottom:1px solid var(--border); padding:8px 10px; text-align:left; white-space:nowrap; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; cursor:pointer; user-select:none; }
+    th:hover { color:var(--text); }
+    tr:last-child td { border-bottom:none; }
+    tr.hot td { background:rgba(0,200,150,0.10); }
+    .pos { color:var(--green); } .neg { color:var(--red); } .mut { color:var(--muted); }
+    .tag { font-size:10px; padding:1px 6px; border-radius:8px; border:1px solid var(--border); }
+    .tag.Buy { color:var(--green); border-color:var(--green); } .tag.Sell { color:var(--red); border-color:var(--red); }
+    h3 { margin:28px 0 4px; font-size:16px; }
+    .bench-controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:10px 0 12px; font-size:13px; color:var(--muted); }
+    .bench-controls input, .bench-controls select { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:13px; }
+    .bench-controls input[type=number] { width:70px; }
+    .bench-controls button { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
+    .bench-controls button:hover { border-color:var(--green); }
+    #benchStatus { font-size:13px; color:var(--muted); margin:0 0 10px; min-height:18px; }
+    tr.allrow td { font-weight:600; border-top:2px solid var(--border); }
+    .foot { margin-top:14px; font-size:11px; color:var(--muted); line-height:1.5; }
+    .movers { margin: 10px 0 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
+  .movers-head { margin-bottom: 6px; font-size: 13px; }
+  .movers-row { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
+  .mv-label { font-weight: 700; font-size: 12px; min-width: 62px; }
+  .mv-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border); font-size: 12px; white-space: nowrap; }
+  .mv-chip.pos { color: var(--green); }
+  .mv-chip.neg { color: var(--red); }
+  .mv-chip.alerted { border-color: currentColor; font-weight: 700; }
+</style>
+</head>
+<body>
+  <h2 style="margin:0">First Candle <span style="color:var(--muted);font-weight:400;font-size:14px">RTT v0.0</span></h2>
+  <div class="sub">How strong was each alerted stock's 9:15 candle volume compared with its own last 10 sessions, and what did the stock do afterwards. Read-only.</div>
+
+  <div class="tabbar">
+    <a href="/">Dashboard</a>
+    <a href="/paper-trading">Paper Trading</a>
+    <a href="/live-trading">Live Trading</a>
+    <a href="/stats">Stats</a>
+    <a href="/websocket-stats">WS Speed</a>
+    <a href="/settings">Settings</a>
+    <a href="/shadow">Manual vs RSI</a>
+    <a href="/exit-lab">Exit Lab</a>
+    <a href="/first-candle" class="active">First Candle</a>
+    <a href="/exit-compare">Exit Compare</a>
+  </div>
+
+  <div class="controls">
+    <label>Date <input type="date" id="dateInput" value="{{ date }}"></label>
+    <button id="loadBtn">Load</button>
+    <button id="refreshBtn">Re-run</button>
+    <label>Highlight 9:15 ratio &ge; <input type="number" id="hotInput" value="3" min="0" step="0.5">&times;</label>
+    <label>Show
+      <select id="showSel">
+        <option value="all">All alerts</option>
+        <option value="traded">Traded</option>
+        <option value="skipped">Skipped</option>
+        <option value="norecord">No record</option>
+      </select>
+    </label>
+  </div>
+  <div id="status"></div>
+
+  <div id="moversWrap" class="movers" style="display:none;">
+    <div class="movers-head"><b>Top 10 F&amp;O movers</b> <span id="moversMeta" class="mut"></span></div>
+    <div class="movers-row"><span class="mv-label pos">Gainers</span><span id="mvGain"></span></div>
+    <div class="movers-row"><span class="mv-label neg">Losers</span><span id="mvLose"></span></div>
+  </div>
+
+  <div class="wrap"><table id="tbl">
+    <thead><tr id="head"></tr></thead>
+    <tbody id="body"></tbody>
+  </table></div>
+
+  <h3>Benchmark</h3>
+  <div class="sub">Groups every stock from several days by its volume ratio and shows how often it actually moved. Compare each row with the "All stocks" row - that is the normal hit rate.</div>
+  <div class="bench-controls">
+    <label>Days (ending at the date above) <input type="number" id="benchDays" value="5" min="1" max="15"></label>
+    <label>Hit = moved &ge; <input type="number" id="benchMove" value="3" min="0.5" step="0.5">% in the alert's direction</label>
+    <label>Group by
+      <select id="benchKey">
+        <option value="first_candle_ratio">9:15 ratio</option>
+        <option value="day_volume_ratio">Day volume ratio</option>
+        <option value="dir_pressure_ratio">Directional pressure ratio</option>
+        <option value="dir_share_pct">9:15 buy share (selling share for Sell alerts)</option>
+      </select>
+    </label>
+    <label>Measure move
+      <select id="benchMetric">
+        <option value="after">From 9:15 close to last close (tradable)</option>
+        <option value="best">Best swing after 9:15 (high for Buy, low for Sell)</option>
+        <option value="prev">From previous close (includes the gap)</option>
+      </select>
+    </label>
+    <label><input type="checkbox" id="benchDirOnly"> only where the 9:15 candle agrees with the alert, at least
+      <input type="number" id="benchDirMin" value="55" min="50" max="100" step="1">% buying (Buy) / selling (Sell)</label>
+    <label>Include
+      <select id="benchInclude">
+        <option value="all">all alerts</option>
+        <option value="traded">only alerts that became trades</option>
+        <option value="skipped">only skipped alerts</option>
+      </select>
+    </label>
+    <button id="benchBtn">Build benchmark</button>
+    <button id="benchStop">Stop</button>
+  </div>
+  <div id="benchStatus"></div>
+  <div class="wrap"><table>
+    <thead><tr><th>Group</th><th>Stocks</th><th>Hits</th><th>Hit rate</th><th>vs all stocks</th><th>Avg move</th><th>Median move</th></tr></thead>
+    <tbody id="benchBody"></tbody>
+  </table></div>
+  <div class="foot" id="benchDates"></div>
+
+  <div id="benchDayWrap" style="display:none;">
+    <h3 style="margin:18px 0 6px; font-size:15px;">Exactly 100% buy share, day by day</h3>
+    <div class="foot" style="margin-top:0;">The 9:15 candle closed exactly at its high (at its low for a Sell alert). Compare each day with all stocks of that same day: on a strong market day nearly everything rises, so only a gap against the same-day numbers means anything.</div>
+    <div class="wrap"><table>
+      <thead><tr><th>DAY</th><th>100% STOCKS</th><th>HITS</th><th>HIT RATE</th><th>AVG MOVE</th><th>ALL STOCKS</th><th>THEIR HIT RATE</th><th>THEIR AVG MOVE</th></tr></thead>
+      <tbody id="benchDayBody"></tbody>
+    </table></div>
+  </div>
+
+  <h3 style="margin-top:28px;">Top movers study</h3>
+  <div class="foot" style="margin-top:0;">
+    Which alerts end the day among the F&amp;O stocks' biggest <b>gainers</b> (for Buy alerts) or <b>losers</b> (for Sell alerts), and what do they have in common?
+    It uses the days loaded by the Benchmark above, so press <b>Build benchmark</b> first, then <b>Run study</b>.
+    <b>Chance</b> = how often a random F&amp;O stock would land in the top N. <b>Lift</b> = hits &divide; what chance alone would give (1.0&times; = no better than random).
+  </div>
+  <div class="controls">
+    <label>Top <select id="msTop"><option value="10">10</option><option value="15">15</option><option value="20">20</option><option value="30">30</option></select> movers</label>
+    <label>Min stocks per row <input type="number" id="msMin" value="8" min="1" step="1" style="width:60px;"></label>
+    <label><input type="checkbox" id="msF1" checked> 9:15 ratio</label>
+    <label><input type="checkbox" id="msF2" checked> 9:15 buy share</label>
+    <label><input type="checkbox" id="msF3" checked> Day volume</label>
+    <label><input type="checkbox" id="msF4"> alert name</label>
+    <label title="The sector's full-day move vs the market (without the stock itself)"><input type="checkbox" id="msF5"> sector strength</label>
+    <button id="msRun">Run study</button>
+  </div>
+  <div id="msStatus" class="foot"></div>
+  <div id="msOut"></div>
+  <div class="foot">
+    The combinations table uses the factors ticked above (tick &quot;alert name&quot; to split each combination by the alert that fired). Day volume and sector strength are only known at the end of the day,
+    so they help explain what makes movers but cannot be used to decide an entry at 9:20 (sector strength = the sector's average move without the stock itself, minus the market's median move; ticking it makes the combinations much smaller, so use it with a lower minimum or more days). &quot;Avg move&quot; follows the &quot;Measure move&quot; choice in the Benchmark.
+    Rows with fewer stocks than the minimum are greyed out or hidden - small samples are mostly luck.
+  </div>
+
+  <div class="foot">
+    Covers stocks with a Buy or Sell alert on the chosen day. <b>9:15 ratio</b> = first 5-min candle volume &divide; its average over the previous 10 sessions.
+    <b>Day vol</b> = whole-day volume so far &divide; the average at the same clock time. <b>Below 20d high</b> = previous close vs the highest high of the last 20 sessions.
+    <b>After 9:15 %</b> = move from the 9:15 candle&#39;s close to the latest close - the part you could actually trade (the benchmark uses this by default; &quot;from previous close&quot; also counts the overnight gap). &quot;Best swing&quot; is the peak after 9:15, so it is optimistic. <b>9:15 buy share</b> (the benchmark can group by it - for a Sell alert it uses the selling share) and <b>Dir. pressure</b> estimate buying vs selling from where the candle closed in its range (not true buy/sell volume); Dir. pressure is the side matching the alert (buying for Buy, selling for Sell) vs its 10-session average. A day still in progress shows partial numbers. Click a column heading to sort.
+  </div>
+
+<script>
+  const COLS = [
+    ["symbol", "Symbol"], ["category", "Alert"], ["decision", "Decision"], ["fno_mover", "F&O mover"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
+    ["pct_of_avg_day_volume", "9:15 % of day"], ["first_candle_body_pct", "9:15 body %"], ["gap_open_pct", "Gap %"],
+    ["day_volume_ratio", "Day vol"], ["below_20d_high_pct", "Below 20d high %"],
+    ["day_high_vs_prev_close_pct", "Day high %"], ["last_close_vs_prev_close_pct", "Last %"],
+    ["after_first_pct", "After 9:15 %"], ["buy_share_pct", "9:15 buy share"], ["dir_pressure_ratio", "Dir. pressure"]
+  ];
+  const PCT = new Set(["first_candle_body_pct","gap_open_pct","below_20d_high_pct","day_high_vs_prev_close_pct","last_close_vs_prev_close_pct","after_first_pct"]);
+  let rows = [], sortKey = "first_candle_ratio", sortDir = -1, timer = null;
+
+  // Direction-aware fields: for a Buy alert "directional" = the buying side of the 9:15 candle, for a Sell alert the selling side.
+  function decorate(r) {
+    if (r && r.status === "ok") {
+      const sell = r.category === "Sell";
+      r.dir_pressure_ratio = sell ? r.sell_pressure_ratio : r.buy_pressure_ratio;
+      const b = r.buy_share_pct;
+      r.dir_share_pct = (b === null || b === undefined) ? null : (sell ? Math.round((100 - b) * 10) / 10 : b);
+    }
+    return r;
+  }
+
+  function esc(s) { return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+
+  function cell(k, r) {
+    const v = r[k];
+    if (v === null || v === undefined) return '<span class="mut">-</span>';
+    if (k === "symbol") return esc(v);
+    if (k === "category") return '<span class="tag ' + esc(v) + '">' + esc(v) + '</span>';
+    if (k === "decision") {
+      const why = r.decision_reason ? esc(r.decision_reason) : "";
+      if (v === "TRADED") return '<span class="tag Buy" title="' + why + '">Traded</span>';
+      const short = r.decision_reason ? esc(r.decision_reason.length > 46 ? r.decision_reason.slice(0, 46) + "..." : r.decision_reason) : "";
+      return '<span class="tag" title="' + why + '">' + (v === "ERROR" ? "Error" : "Skipped") + '</span> <span class="mut">' + short + '</span>';
+    }
+    if (k === "fno_mover") {
+      const m = r.fno_info;
+      if (!m) return '<span class="mut">-</span>';
+      const up = m.type === "gain";
+      return '<span class="mv-chip ' + (up ? "pos" : "neg") + '" title="' + (up ? "Top F&O gainer" : "Top F&O loser") + ' #' + m.rank + ' vs the previous close, as of ' + esc(m.as_of) + '">' +
+             (up ? "&uarr; " : "&darr; ") + '#' + m.rank + ' ' + (m.pct > 0 ? "+" : "") + m.pct + '%</span>';
+    }
+    if (k === "beats_sessions") return esc(v);
+    if (PCT.has(k)) return '<span class="' + (v > 0 ? "pos" : v < 0 ? "neg" : "") + '">' + (v > 0 ? "+" : "") + v + '%</span>';
+    if (k === "first_candle_ratio" || k === "day_volume_ratio" || k === "dir_pressure_ratio") return v + "&times;";
+    if (k === "buy_share_pct") return v + "%";
+    if (k === "pct_of_avg_day_volume") return v + "%";
+    return esc(v);
+  }
+
+  function render() {
+    const hot = parseFloat(document.getElementById("hotInput").value) || 0;
+    document.getElementById("head").innerHTML = COLS.map(c =>
+      '<th data-k="' + c[0] + '">' + c[1] + (c[0] === sortKey ? (sortDir < 0 ? " &darr;" : " &uarr;") : "") + '</th>').join("");
+    document.querySelectorAll("#head th").forEach(th => th.onclick = () => {
+      const k = th.dataset.k;
+      if (k === sortKey) sortDir = -sortDir; else { sortKey = k; sortDir = -1; }
+      render();
+    });
+    const show = document.getElementById("showSel").value;
+    const shown = rows.filter(r => show === "all" ||
+      (show === "traded" && r.decision === "TRADED") ||
+      (show === "skipped" && r.decision && r.decision !== "TRADED") ||
+      (show === "norecord" && !r.decision));
+    const sorted = shown.slice().sort((a, b) => {
+      const x = a[sortKey], y = b[sortKey];
+      if (x === null || x === undefined) return 1;
+      if (y === null || y === undefined) return -1;
+      if (typeof x === "string") return sortDir * (x < y ? -1 : x > y ? 1 : 0);
+      return sortDir * (x - y);
+    });
+    document.getElementById("body").innerHTML = sorted.map(r => {
+      const isHot = hot > 0 && r.first_candle_ratio !== null && r.first_candle_ratio >= hot;
+      if (r.status !== "ok") {
+        return '<tr><td>' + esc(r.symbol) + '</td><td>' + cell("category", r) + '</td><td colspan="' + (COLS.length - 2) + '" class="mut">no data (' + esc(r.status) + ')</td></tr>';
+      }
+      return '<tr class="' + (isHot ? "hot" : "") + '">' + COLS.map(c => '<td>' + cell(c[0], r) + '</td>').join("") + '</tr>';
+    }).join("");
+  }
+
+  async function load(refresh) {
+    clearTimeout(timer);
+    const date = document.getElementById("dateInput").value;
+    const st = document.getElementById("status");
+    try {
+      const res = await fetch("/api/first-candle-board?date=" + encodeURIComponent(date) + (refresh ? "&refresh=1" : ""));
+      const d = await res.json();
+      if (!res.ok) { st.textContent = d.error || "Could not load"; return; }
+      rows = (d.rows || []).map(decorate);
+      applyMovers();
+      render();
+      if (d.state === "running") {
+        st.textContent = "Working... " + d.done + " of " + d.total + " stocks";
+        timer = setTimeout(() => load(false), 2500);
+      } else if (d.state === "error") {
+        st.textContent = "Stopped early: " + (d.error || "error") + " (showing " + rows.length + " stocks)";
+      } else {
+        st.textContent = rows.length
+          ? (rows.length + " stocks for " + d.date + (d.total_alerted > rows.length ? " (" + (d.total_alerted - rows.length) + " more alerted stocks not shown - list capped)" : "") +
+             ". Decision is recorded from the day this feature went live; earlier days show '-'.")
+          : "No Buy/Sell alerts found for " + d.date;
+      }
+    } catch (e) {
+      st.textContent = "Could not reach the server";
+    }
+  }
+
+  // ---------- Top F&O movers (live, today only; the server refreshes it once per 5-minute candle close) ----------
+  let moversData = null, moversAsOf = null;
+  function isTodayView() {
+    const ist = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+    return document.getElementById("dateInput").value === ist;
+  }
+  // Sets r.fno_info (shown in the column) and r.fno_mover (signed % - what the column sorts by) on every row.
+  function applyMovers() {
+    const map = {};
+    if (moversData && moversData.status === "ok" && isTodayView()) {
+      (moversData.gainers || []).forEach(g => { map[g.symbol] = { type: "gain", rank: g.rank, pct: g.pct, as_of: moversData.as_of }; });
+      (moversData.losers || []).forEach(l => { map[l.symbol] = { type: "lose", rank: l.rank, pct: l.pct, as_of: moversData.as_of }; });
+    }
+    rows.forEach(r => { const m = map[r.symbol]; r.fno_info = m || null; r.fno_mover = m ? m.pct : null; });
+  }
+  function moversPanel() {
+    const wrap = document.getElementById("moversWrap");
+    const d = moversData;
+    if (!isTodayView() || !d || d.status !== "ok") { wrap.style.display = "none"; return; }
+    const alerted = new Set(rows.map(r => r.symbol));
+    const chip = (m, cls) => '<span class="mv-chip ' + cls + (alerted.has(m.symbol) ? " alerted" : "") + '" title="' +
+      (alerted.has(m.symbol) ? "Has a Buy/Sell alert today" : "No alert today") + '">' + m.rank + ' ' + esc(m.symbol) + ' ' + (m.pct > 0 ? "+" : "") + m.pct + '%</span>';
+    document.getElementById("mvGain").innerHTML = (d.gainers || []).map(m => chip(m, "pos")).join("") || '<span class="mut">none</span>';
+    document.getElementById("mvLose").innerHTML = (d.losers || []).map(m => chip(m, "neg")).join("") || '<span class="mut">none</span>';
+    document.getElementById("moversMeta").textContent = (d.market_open ? "as of the " + d.as_of + " candle close" : "market closed - latest as of " + d.as_of) +
+      " (" + d.count + " of " + d.universe + " stocks ranked; refreshes every 5 min). Outlined = has an alert today.";
+    wrap.style.display = "";
+  }
+  async function loadMovers() {
+    if (document.hidden) return;
+    if (!isTodayView()) { moversPanel(); return; }
+    try {
+      const res = await fetch("/api/fno-movers");
+      const d = await res.json();
+      if (d.status === "ok") {
+        const stamp = d.slot + "|" + d.fetched_at;
+        const changed = stamp !== moversAsOf;
+        moversData = d; moversAsOf = stamp;
+        if (changed) { applyMovers(); render(); }
+      }
+      moversPanel();
+    } catch (e) { /* keep showing the last snapshot */ }
+  }
+  document.getElementById("dateInput").addEventListener("change", () => { applyMovers(); moversPanel(); });
+  setInterval(loadMovers, 30000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) loadMovers(); });
+  loadMovers();
+
+  // ---------- Benchmark ----------
+  const BANDS = ["Under 1.5\u00d7", "1.5\u00d7 to 3\u00d7", "3\u00d7 to 5\u00d7", "5\u00d7 and above"];
+  let benchRows = [], benchToken = 0;
+
+  const SHARE_BANDS = ["Under 50%", "50% to 70%", "70% to 90%", "90% to under 100%", "Exactly 100%"];
+  const isShare = key => key === "dir_share_pct";
+  function bandsFor(key) { return isShare(key) ? SHARE_BANDS : BANDS; }
+  function bandOf(x, key) {
+    if (isShare(key)) return x < 50 ? 0 : x < 70 ? 1 : x < 90 ? 2 : x < 99.95 ? 3 : 4;   // 100 = closed exactly at its high (low, for Sell)
+    return x < 1.5 ? 0 : x < 3 ? 1 : x < 5 ? 2 : 3;
+  }
+  // Buy alerts want the stock up, Sell alerts want it down.
+  function dirMove(r) {
+    const mode = document.getElementById("benchMetric").value;
+    const sell = r.category === "Sell";
+    const has = x => x !== null && x !== undefined;
+    if (mode === "best") {
+      const m = sell ? r.after_first_down_pct : r.after_first_up_pct;   // Sell: how far it fell (negative number)
+      return has(m) ? (sell ? -m : m) : null;
+    }
+    const m = mode === "prev" ? r.last_close_vs_prev_close_pct : r.after_first_pct;
+    if (!has(m)) return null;
+    return sell ? -m : m;
+  }
+  function median(a) {
+    const s = a.slice().sort((x, y) => x - y), n = s.length;
+    return n ? (n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2) : null;
+  }
+  function stat(list, hitAt) {
+    const mv = list.map(dirMove).filter(m => m !== null);
+    const hits = mv.filter(m => m >= hitAt).length;
+    return { n: mv.length, hits: hits, rate: mv.length ? hits / mv.length * 100 : null,
+             avg: mv.length ? mv.reduce((a, b) => a + b, 0) / mv.length : null, med: median(mv) };
+  }
+  function f1(x) { return x === null || x === undefined ? "-" : (Math.round(x * 10) / 10).toString(); }
+  function signed(x) { return x === null ? '<span class="mut">-</span>' : '<span class="' + (x > 0 ? "pos" : x < 0 ? "neg" : "") + '">' + (x > 0 ? "+" : "") + f1(x) + '%</span>'; }
+
+  function renderBench() {
+    const key = document.getElementById("benchKey").value;
+    const hitAt = parseFloat(document.getElementById("benchMove").value) || 3;
+    const dirOnly = document.getElementById("benchDirOnly").checked;
+    const dirMin = parseFloat(document.getElementById("benchDirMin").value) || 55;
+    const inc = document.getElementById("benchInclude").value;
+    const usable = benchRows.filter(r => r.status === "ok" && r[key] !== null && r[key] !== undefined &&
+      (inc === "all" || (inc === "traded" && r.decision === "TRADED") || (inc === "skipped" && r.decision && r.decision !== "TRADED")) &&
+      (!dirOnly || (r.dir_share_pct !== null && r.dir_share_pct !== undefined && r.dir_share_pct >= dirMin)));
+    const all = stat(usable, hitAt);
+    let html = "";
+    const bandNames = bandsFor(key);
+    for (let b = 0; b < bandNames.length; b++) {
+      const st = stat(usable.filter(r => bandOf(r[key], key) === b), hitAt);
+      const diff = (st.rate !== null && all.rate !== null) ? st.rate - all.rate : null;
+      html += '<tr><td>' + bandNames[b] + '</td><td>' + st.n + '</td><td>' + st.hits + '</td><td>' + (st.rate === null ? "-" : f1(st.rate) + "%") +
+        '</td><td>' + (diff === null ? '<span class="mut">-</span>' : '<span class="' + (diff > 0 ? "pos" : diff < 0 ? "neg" : "") + '">' + (diff > 0 ? "+" : "") + f1(diff) + ' pts</span>') +
+        '</td><td>' + signed(st.avg) + '</td><td>' + signed(st.med) + '</td></tr>';
+    }
+    html += '<tr class="allrow"><td>All stocks</td><td>' + all.n + '</td><td>' + all.hits + '</td><td>' + (all.rate === null ? "-" : f1(all.rate) + "%") +
+      '</td><td><span class="mut">-</span></td><td>' + signed(all.avg) + '</td><td>' + signed(all.med) + '</td></tr>';
+    document.getElementById("benchBody").innerHTML = html;
+
+    // Buy-share view only: the "Exactly 100%" stocks day by day, next to ALL stocks of the same day,
+    // so a strong market day can't be mistaken for a buy-share edge.
+    const dayWrap = document.getElementById("benchDayWrap");
+    if (isShare(key)) {
+      const top = usable.filter(r => bandOf(r[key], key) === 4);
+      const days = Array.from(new Set(usable.map(r => r.date))).sort().reverse();
+      let dh = "";
+      days.forEach(d => {
+        const sd = stat(top.filter(r => r.date === d), hitAt), sa = stat(usable.filter(r => r.date === d), hitAt);
+        dh += '<tr><td>' + d + '</td><td>' + sd.n + '</td><td>' + sd.hits + '</td><td>' + (sd.rate === null ? "-" : f1(sd.rate) + "%") +
+          '</td><td>' + signed(sd.avg) + '</td><td>' + sa.n + '</td><td>' + (sa.rate === null ? "-" : f1(sa.rate) + "%") +
+          '</td><td>' + signed(sa.avg) + '</td></tr>';
+      });
+      const st100 = stat(top, hitAt);
+      dh += '<tr class="allrow"><td>All days</td><td>' + st100.n + '</td><td>' + st100.hits + '</td><td>' + (st100.rate === null ? "-" : f1(st100.rate) + "%") +
+        '</td><td>' + signed(st100.avg) + '</td><td>' + all.n + '</td><td>' + (all.rate === null ? "-" : f1(all.rate) + "%") + '</td><td>' + signed(all.avg) + '</td></tr>';
+      document.getElementById("benchDayBody").innerHTML = dh;
+      dayWrap.style.display = "";
+    } else {
+      dayWrap.style.display = "none";
+    }
+  }
+
+  function weekdaysBack(endStr, count) {
+    const out = [], d = new Date(endStr + "T12:00:00Z");
+    while (out.length < count) {
+      const wd = d.getUTCDay();
+      if (wd !== 0 && wd !== 6) out.push(d.toISOString().slice(0, 10));
+      d.setUTCDate(d.getUTCDate() - 1);
+    }
+    return out;
+  }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  async function boardFor(date, token) {
+    for (;;) {
+      const res = await fetch("/api/first-candle-board?date=" + encodeURIComponent(date));
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || "failed");
+      if (token !== benchToken) return null;
+      if (d.state !== "running") return d;
+      document.getElementById("benchStatus").dataset.sub = d.done + " of " + d.total;
+      await sleep(2500);
+    }
+  }
+
+  async function buildBench() {
+    const token = ++benchToken;
+    const st = document.getElementById("benchStatus");
+    const days = Math.max(1, Math.min(parseInt(document.getElementById("benchDays").value) || 5, 15));
+    const dates = weekdaysBack(document.getElementById("dateInput").value, days);
+    benchRows = [];
+    const used = [];
+    renderBench();
+    for (let i = 0; i < dates.length; i++) {
+      st.textContent = "Day " + (i + 1) + " of " + dates.length + " (" + dates[i] + ")...";
+      try {
+        const d = await boardFor(dates[i], token);
+        if (d === null) return;
+        const rows = (d.rows || []).map(r => decorate(Object.assign({ date: dates[i] }, r)));
+        benchRows = benchRows.concat(rows);
+        used.push(dates[i] + " (" + rows.filter(r => r.status === "ok").length + ")");
+        renderBench();
+      } catch (e) {
+        used.push(dates[i] + " (failed)");
+      }
+    }
+    if (token !== benchToken) return;
+    st.textContent = "Done. " + benchRows.filter(r => r.status === "ok").length + " stock-days analysed.";
+    document.getElementById("benchDates").textContent = "Days used (stocks with data): " + used.join(", ") +
+      ". A day with no alerts, or today before 15:30 IST, gives partial or no numbers.";
+  }
+
+  document.getElementById("benchBtn").onclick = buildBench;
+  document.getElementById("benchStop").onclick = () => { benchToken++; document.getElementById("benchStatus").textContent = "Stopped."; };
+  document.getElementById("benchKey").onchange = renderBench;
+  document.getElementById("benchMove").oninput = renderBench;
+  document.getElementById("benchMetric").onchange = renderBench;
+  document.getElementById("benchDirOnly").onchange = renderBench;
+  document.getElementById("benchInclude").onchange = renderBench;
+  document.getElementById("showSel").onchange = render;
+  document.getElementById("benchDirMin").oninput = renderBench;
+
+
+  // ---------- Top movers study ----------
+  // For every alerted stock-day loaded by the benchmark: did a Buy alert end among that day's top N F&O gainers
+  // (a Sell alert: top N losers)? Then which alert names / volume bands / buy-share bands do that most often.
+  const DAYVOL_BANDS = ["Under 1\u00d7", "1\u00d7 to 1.5\u00d7", "1.5\u00d7 to 2.5\u00d7", "2.5\u00d7 and above"];
+  function dayVolBand(x) { return x < 1 ? 0 : x < 1.5 ? 1 : x < 2.5 ? 2 : 3; }
+  // Sector strength = the stock's sector (without the stock itself) vs the whole F&O market that day, in percentage
+  // points. For a Sell alert the sign is flipped, so "with the alert" always means the sector moved the alert's way.
+  const SECTOR_BANDS = ["Sector with the alert (0.5+ pt)", "Sector in line", "Sector against the alert (0.5+ pt)"];
+  function sectorBand(rel, category) { const x = category === "Sell" ? -rel : rel; return x >= 0.5 ? 0 : x > -0.5 ? 1 : 2; }
+  let msRank = {}, msToken = 0;
+  const msEl = id => document.getElementById(id);
+  const msSleep = ms => new Promise(res => setTimeout(res, ms));
+
+  async function msFetchRanks(dates, token) {
+    for (;;) {
+      const res = await fetch("/api/fno-rank-history?dates=" + encodeURIComponent(dates.join(",")));
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || "request failed");
+      if (token !== msToken) return null;
+      if (d.state === "running") {
+        msEl("msStatus").textContent = "Loading the F&O history from Upstox (one-time per day, " + (d.done || 0) + " of " + (d.total || "?") + " stocks)...";
+        await msSleep(2000);
+        continue;
+      }
+      return d.days || {};
+    }
+  }
+
+  function msLabel(r, top) {
+    const day = msRank[r.date];
+    if (!day || !day.covered) return null;
+    const rank = (r.category === "Sell" ? day.lose : day.gain)[r.symbol];
+    return { hit: rank !== undefined && rank <= top, chance: top / day.universe };
+  }
+
+  function msStat(list) {
+    let n = 0, hits = 0, exp = 0, mv = 0, mvN = 0;
+    list.forEach(r => {
+      n++; if (r._lab.hit) hits++; exp += r._lab.chance;
+      const m = dirMove(r);
+      if (m !== null && m !== undefined) { mv += m; mvN++; }
+    });
+    return { n, hits, rate: n ? hits / n * 100 : null, chance: n ? exp / n * 100 : null,
+             lift: exp > 0 ? hits / exp : null, avg: mvN ? mv / mvN : null };
+  }
+
+  function msTable(title, groups, minN, opts) {
+    opts = opts || {};
+    let h = '<h4 style="margin:16px 0 6px;">' + title + '</h4><div class="wrap"><table><thead><tr><th>' + (opts.first || "Group") +
+      '</th><th>Stocks</th><th>Top-N hits</th><th>Hit rate</th><th>Chance</th><th>Lift</th><th>Avg move</th></tr></thead><tbody>';
+    groups.forEach(g => {
+      const st = g.st, small = st.n < minN;
+      const liftCls = (!small && st.lift !== null) ? (st.lift >= 1.5 ? "pos" : st.lift < 0.8 ? "neg" : "") : "";
+      h += '<tr' + (small ? ' style="opacity:.5;"' : '') + '><td>' + esc(g.name) + '</td><td>' + st.n + '</td><td>' + st.hits + '</td><td>' +
+        (st.rate === null ? "-" : f1(st.rate) + "%") + '</td><td>' + (st.chance === null ? "-" : f1(st.chance) + "%") + '</td><td class="' + liftCls + '">' +
+        (st.lift === null ? "-" : st.lift.toFixed(2) + "&times;") + '</td><td>' + signed(st.avg) + '</td></tr>';
+    });
+    return h + '</tbody></table></div>';
+  }
+
+  function msRender() {
+    const top = parseInt(msEl("msTop").value, 10) || 10;
+    const minN = Math.max(parseInt(msEl("msMin").value, 10) || 1, 1);
+    const f = [msEl("msF1").checked, msEl("msF2").checked, msEl("msF3").checked, msEl("msF4").checked, msEl("msF5").checked];
+    const base = benchRows.filter(r => r.status === "ok");
+    const rows = [];
+    base.forEach(r => {
+      const lab = msLabel(r, top);
+      if (!lab) return;
+      const sec = (msRank[r.date] && msRank[r.date].sector) ? msRank[r.date].sector[r.symbol] : undefined;
+      rows.push(Object.assign({}, r, { _lab: lab, sector_rel: (sec === undefined ? null : sec) }));
+    });
+    const uncovered = Array.from(new Set(base.map(r => r.date))).filter(d => !(msRank[d] && msRank[d].covered)).sort();
+    const days = new Set(rows.map(r => r.date)).size;
+    msEl("msStatus").textContent = rows.length
+      ? (rows.length + " alerted stock-days over " + days + " days ranked against the F&O universe." +
+         (uncovered.length ? " No ranking available for: " + uncovered.join(", ") + " (today before 15:45 IST, or no market data)." : ""))
+      : "No ranked days. " + (uncovered.length ? "Could not rank: " + uncovered.join(", ") : "");
+    if (!rows.length) { msEl("msOut").innerHTML = ""; return; }
+
+    const byCat = c => rows.filter(r => r.category === c);
+    let html = msTable("Overall - did the alert's stock end in the day's top " + top + "?", [
+      { name: "Buy alerts -> top " + top + " gainers", st: msStat(byCat("Buy")) },
+      { name: "Sell alerts -> top " + top + " losers", st: msStat(byCat("Sell")) },
+      { name: "All alerts", st: msStat(rows) }], minN, { first: "Alerts" });
+
+    // by alert name (a stock that fired two alerts counts under each)
+    const nameMap = {};
+    rows.forEach(r => { (r.alert_names && r.alert_names.length ? r.alert_names : ["(no alert name)"]).forEach(nm => { (nameMap[nm] = nameMap[nm] || []).push(r); }); });
+    const nameGroups = Object.keys(nameMap).map(nm => ({ name: nm, st: msStat(nameMap[nm]) }));
+    nameGroups.sort((a, b) => ((b.st.n >= minN) - (a.st.n >= minN)) || ((b.st.lift || 0) - (a.st.lift || 0)) || (b.st.n - a.st.n));
+    html += msTable("By alert name", nameGroups, minN, { first: "Alert" });
+
+    // one factor at a time
+    const one = (title, key, names, bandFn, first) => {
+      const groups = names.map((nm, i) => ({ name: nm, st: msStat(rows.filter(r => r[key] !== null && r[key] !== undefined && bandFn(r[key]) === i)) }));
+      return msTable(title, groups, minN, { first });
+    };
+    html += one("By 9:15 volume ratio", "first_candle_ratio", BANDS, x => bandOf(x), "9:15 ratio");
+    html += one("By 9:15 buy share (selling share for Sell alerts)", "dir_share_pct", SHARE_BANDS, x => bandOf(x, "dir_share_pct"), "Buy share");
+    html += one("By day volume (whole day vs its usual level)", "day_volume_ratio", DAYVOL_BANDS, dayVolBand, "Day volume");
+    {
+      const groups = SECTOR_BANDS.map((nm, i) => ({ name: nm, st: msStat(rows.filter(r => r.sector_rel !== null && sectorBand(r.sector_rel, r.category) === i)) }));
+      html += msTable("By sector strength (the sector's full-day move vs the market, without the stock itself)", groups, minN, { first: "Sector" });
+    }
+
+    // combinations of the ticked factors
+    const combos = {};
+    rows.forEach(r => {
+      const parts = [];
+      if (f[0]) { if (r.first_candle_ratio == null) return; parts.push("9:15 vol " + BANDS[bandOf(r.first_candle_ratio)]); }
+      if (f[1]) { if (r.dir_share_pct == null) return; parts.push("buy share " + SHARE_BANDS[bandOf(r.dir_share_pct, "dir_share_pct")]); }
+      if (f[2]) { if (r.day_volume_ratio == null) return; parts.push("day vol " + DAYVOL_BANDS[dayVolBand(r.day_volume_ratio)]); }
+      if (f[4]) { if (r.sector_rel == null) return; parts.push(SECTOR_BANDS[sectorBand(r.sector_rel, r.category)]); }
+      const names = f[3] ? (r.alert_names && r.alert_names.length ? r.alert_names : ["(no alert name)"]) : [null];
+      names.forEach(nm => { const key = (nm ? [nm].concat(parts) : parts).join("  |  "); if (key) (combos[key] = combos[key] || []).push(r); });
+    });
+    let cg = Object.keys(combos).map(k => ({ name: k, st: msStat(combos[k]) })).filter(g => g.st.n >= minN);
+    cg.sort((a, b) => ((b.st.lift || 0) - (a.st.lift || 0)) || (b.st.n - a.st.n));
+    cg = cg.slice(0, 25);
+    html += cg.length
+      ? msTable("Best combinations (at least " + minN + " stocks each, best lift first)", cg, minN, { first: "Combination" })
+      : '<h4 style="margin:16px 0 6px;">Best combinations</h4><div class="foot">No combination has at least ' + minN + ' stocks yet - lower the minimum, untick a factor, or load more days in the Benchmark.</div>';
+    msEl("msOut").innerHTML = html;
+  }
+
+  async function runStudy() {
+    const st = msEl("msStatus");
+    const base = benchRows.filter(r => r.status === "ok");
+    if (!base.length) { st.textContent = "Press Build benchmark first (it loads the days), then Run study."; return; }
+    const token = ++msToken;
+    const dates = Array.from(new Set(base.map(r => r.date))).sort();
+    st.textContent = "Loading each day's F&O gainers and losers...";
+    let ranks;
+    try { ranks = await msFetchRanks(dates, token); } catch (e) { st.textContent = "Could not load the F&O history: " + e.message; return; }
+    if (ranks === null) return;
+    msRank = ranks;
+    msRender();
+  }
+  msEl("msRun").onclick = runStudy;
+  ["msTop", "msMin", "msF1", "msF2", "msF3", "msF4", "msF5"].forEach(id => { msEl(id).onchange = () => { if (Object.keys(msRank).length) msRender(); }; });
+
+  document.getElementById("loadBtn").onclick = () => load(false);
+  document.getElementById("refreshBtn").onclick = () => load(true);
+  document.getElementById("hotInput").oninput = render;
+  load(false);
+</script>
+</body>
+</html>
