@@ -3148,6 +3148,32 @@ def _sector_0925_for_dates(dates: list, token: str | None) -> dict:
     return out
 
 
+def _attach_fno_rank(items: list, token: str | None, is_today: bool) -> None:
+    """Adds 'fno_rank' = {type: gain|lose, rank, pct, as_of} to alerts whose stock is among today's top F&O
+    gainers / losers (same snapshot as the First Candle page). Uses the cached snapshot and refreshes it in a
+    background thread, so a dashboard poll never waits on Upstox."""
+    if not is_today:
+        return
+    c = _fno_movers_cache
+    try:
+        now_ist = datetime.utcnow() + IST_OFFSET
+        if (token and (c["data"] is None or c["slot"] != _fno_movers_slot(now_ist))
+                and time.time() >= c["retry_after"] and not _fno_movers_lock.locked()):
+            threading.Thread(target=get_fno_movers_cached, args=(token,), daemon=True).start()
+    except Exception:
+        pass
+    data = c["data"]
+    if not data or data.get("status") != "ok":
+        return
+    m = {}
+    for g in data.get("gainers") or []:
+        m[g["symbol"]] = {"type": "gain", "rank": g["rank"], "pct": g["pct"], "as_of": data.get("as_of")}
+    for l in data.get("losers") or []:
+        m[l["symbol"]] = {"type": "lose", "rank": l["rank"], "pct": l["pct"], "as_of": data.get("as_of")}
+    for a in items:
+        a["fno_rank"] = m.get((a.get("symbol") or "").strip().upper())
+
+
 def _attach_sector_0925(items: list, date_str: str, token: str | None) -> None:
     """Adds 'sector_0925' (the sector's fixed % at 09:25 IST) to each alert dict that has a sector."""
     try:
@@ -7666,6 +7692,7 @@ def index():
         for _, _items in grouped:
             _attach_volume_readings(_items, access_token, selected_date == today_str)
             _attach_sector_0925(_items, selected_date, access_token)
+            _attach_fno_rank(_items, access_token, selected_date == today_str)
             _items.sort(key=_volume_rank)   # Strong volume first (stable)
 
         html = render_template(
@@ -7751,6 +7778,7 @@ def api_alerts():
     # no per-alert API calls to this request - see _attach_volume_readings.
     _attach_volume_readings(merged_alerts, access_token, selected_date == today_str)
     _attach_sector_0925(merged_alerts, selected_date, access_token)
+    _attach_fno_rank(merged_alerts, access_token, selected_date == today_str)
     # Strong volume first within each column (stable: newest-first kept within a rank)
     _cat_pos = {name: i for i, name in enumerate(CATEGORY_ORDER)}
     merged_alerts.sort(key=lambda a: (_cat_pos.get(a.get("category"), len(_cat_pos)), _volume_rank(a)))
