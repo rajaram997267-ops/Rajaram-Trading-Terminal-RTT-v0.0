@@ -728,6 +728,20 @@ def init_db():
             )
             """
         )
+        # One row per F&O stock per trading day: close vs previous close. Feeds the
+        # "top movers study" (which alerts end up among the day's biggest gainers/losers).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fno_daily_change (
+                date TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                pct DOUBLE PRECISION,
+                close DOUBLE PRECISION,
+                prev_close DOUBLE PRECISION,
+                PRIMARY KEY (date, symbol)
+            )
+            """
+        )
         # Funds added to / removed from the PAPER account, kept apart from the
         # trades themselves so topping up never touches (or re-bases) the
         # trade history - see get_current_capital / attach_running_balance.
@@ -2818,6 +2832,161 @@ def api_fno_movers():
                         "reason": "No Upstox token saved" if not token else
                                   "Previous closes are still loading, or Upstox could not be reached - retrying"})
     return jsonify(data)
+
+
+# ---------------------------------------------------------------------------
+# F&O daily gainers / losers HISTORY, for the top-movers study. For every F&O stock
+# and trading day: close vs previous close, from Upstox daily candles (one call per
+# stock covers all days), stored in fno_daily_change. Ranks are computed from that
+# table, so past days need no snapshot taken at the time. Same universe as the live
+# movers panel (SECTOR_MAP stocks, indices excluded).
+# ---------------------------------------------------------------------------
+FNO_RANK_KEEP_TOP = 30           # ranks above this are not returned (the study offers Top 10/15/20/30)
+FNO_RANK_FINAL_AFTER = (15, 45)  # today's daily candle is only final after this IST time
+_fno_rank_state: dict = {"state": "idle", "done": 0, "total": 0, "error": None, "attempted": set()}
+_fno_rank_lock = threading.Lock()
+
+
+def _fno_universe() -> list[tuple[str, str]]:
+    out = []
+    for symbol in SECTOR_MAP:
+        key = get_instrument_key(symbol)
+        if key and key.startswith("NSE_EQ|"):
+            out.append((symbol, key))
+    return out
+
+
+def _fno_rank_final_cutoff_ok(now_ist: datetime) -> bool:
+    return (now_ist.hour, now_ist.minute) >= FNO_RANK_FINAL_AFTER
+
+
+def _fno_rank_worker(token: str, from_date: str, dates_wanted: list) -> None:
+    st = _fno_rank_state
+    try:
+        now_ist = datetime.utcnow() + IST_OFFSET
+        today = now_ist.strftime("%Y-%m-%d")
+        today_final = now_ist.weekday() >= 5 or _fno_rank_final_cutoff_ok(now_ist)
+        universe = _fno_universe()
+        st["total"], st["done"] = len(universe), 0
+        fetch_from = (datetime.strptime(from_date, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
+        for symbol, key in universe:
+            url = (f"https://api.upstox.com/v3/historical-candle/{urllib.parse.quote(key, safe='|')}"
+                   f"/days/1/{today}/{fetch_from}")
+            try:
+                req = urllib.request.Request(url, headers={
+                    "Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": BROWSER_USER_AGENT})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    candles = ((json.loads(resp.read().decode()).get("data") or {}).get("candles")) or []
+                candles = sorted(candles, key=lambda c: c[0])
+                rows = []
+                for prev, cur in zip(candles, candles[1:]):
+                    d = cur[0][:10]
+                    pc, cl = float(prev[4] or 0), float(cur[4] or 0)
+                    if d < from_date or pc <= 0 or cl <= 0:
+                        continue
+                    if d == today and not today_final:
+                        continue                      # today's candle is still forming
+                    rows.append((d, symbol, round((cl - pc) / pc * 100.0, 4), cl, pc))
+                if rows:
+                    with get_db() as conn:
+                        for r in rows:
+                            conn.execute(
+                                "INSERT INTO fno_daily_change (date, symbol, pct, close, prev_close) VALUES (?, ?, ?, ?, ?) "
+                                "ON CONFLICT (date, symbol) DO UPDATE SET pct = excluded.pct, close = excluded.close, "
+                                "prev_close = excluded.prev_close", r)
+                        conn.commit()
+            except Exception as e:
+                print(f"[fno-rank] {symbol}: {type(e).__name__}", flush=True)
+            st["done"] += 1
+        st["attempted"].update(dates_wanted)
+        st["state"], st["error"] = "done", None
+    except Exception as e:
+        st["state"], st["error"] = "error", f"{type(e).__name__}: {e}"
+        print(f"[fno-rank] job failed: {e}", flush=True)
+
+
+def _fno_ranks_for_date(date_str: str):
+    """(universe_size, {symbol: gain_rank<=30}, {symbol: lose_rank<=30}, {symbol: sector strength}) from the stored table, or None."""
+    with get_db() as conn:
+        rows = conn.execute("SELECT symbol, pct FROM fno_daily_change WHERE date = ?", (date_str,)).fetchall()
+    data = [(r["symbol"], float(r["pct"])) for r in rows if r["pct"] is not None]
+    if len(data) < 0.85 * max(len(SECTOR_MAP) - 2, 1):     # too few stocks stored: not a usable ranking
+        return None
+    by_gain = sorted(data, key=lambda x: -x[1])
+    by_lose = sorted(data, key=lambda x: x[1])
+    return (len(data),
+            {sym: i for i, (sym, _p) in enumerate(by_gain[:FNO_RANK_KEEP_TOP], 1)},
+            {sym: i for i, (sym, _p) in enumerate(by_lose[:FNO_RANK_KEEP_TOP], 1)},
+            _fno_sector_strength(data))
+
+
+def _fno_sector_strength(data: list) -> dict:
+    """{symbol: sector strength in percentage points} for one day. Strength = the average % change of the stock's
+    sector WITHOUT the stock itself (a big mover would otherwise lift its own sector), minus the median % change
+    of all F&O stocks that day, so +1.0 means the sector beat the market by one point. Sectors with a single
+    stock have no value. Uses the full-day move, so it explains the day after the fact - it is not known at 9:20."""
+    pcts = sorted(p for _s, p in data)
+    n = len(pcts)
+    if not n:
+        return {}
+    median = pcts[n // 2] if n % 2 else (pcts[n // 2 - 1] + pcts[n // 2]) / 2.0
+    tot: dict[str, float] = {}
+    cnt: dict[str, int] = {}
+    for sym, p in data:
+        sec = SECTOR_MAP.get(sym)
+        if sec:
+            tot[sec] = tot.get(sec, 0.0) + p
+            cnt[sec] = cnt.get(sec, 0) + 1
+    out = {}
+    for sym, p in data:
+        sec = SECTOR_MAP.get(sym)
+        if sec and cnt.get(sec, 0) > 1:
+            out[sym] = round((tot[sec] - p) / (cnt[sec] - 1) - median, 2)
+    return out
+
+
+@app.route("/api/fno-rank-history")
+def api_fno_rank_history():
+    """?dates=YYYY-MM-DD,YYYY-MM-DD,...  For each date: how every F&O stock ranked that day (top 30 gainers /
+    losers, close vs previous close). Days not stored yet are fetched by a background job - poll until
+    state != "running". Days that cannot be ranked (today before the close, holidays) come back covered=false."""
+    token = get_setting("upstox_access_token")
+    if not token:
+        return jsonify({"error": "No Upstox token saved"}), 400
+    raw = [d.strip() for d in (request.args.get("dates") or "").split(",") if d.strip()]
+    dates = []
+    for d in raw[:40]:
+        try:
+            datetime.strptime(d, "%Y-%m-%d")
+            dates.append(d)
+        except ValueError:
+            pass
+    if not dates:
+        return jsonify({"error": "dates must be a comma-separated list of YYYY-MM-DD"}), 400
+    now_ist = datetime.utcnow() + IST_OFFSET
+    today = now_ist.strftime("%Y-%m-%d")
+    today_final = now_ist.weekday() >= 5 or _fno_rank_final_cutoff_ok(now_ist)
+    st = _fno_rank_state
+    try:
+        days, missing = {}, []
+        for d in dates:
+            if d == today and not today_final:
+                days[d] = {"covered": False, "reason": "today's ranking is final after 15:45 IST"}
+                continue
+            got = _fno_ranks_for_date(d)
+            if got:
+                days[d] = {"covered": True, "universe": got[0], "gain": got[1], "lose": got[2], "sector": got[3]}
+            else:
+                days[d] = {"covered": False, "reason": "not loaded yet"}
+                if d not in st["attempted"]:
+                    missing.append(d)
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    with _fno_rank_lock:
+        if missing and st["state"] != "running":
+            st.update(state="running", done=0, total=0, error=None)
+            threading.Thread(target=_fno_rank_worker, args=(token, min(missing), list(missing)), daemon=True).start()
+    return jsonify({"state": st["state"], "done": st["done"], "total": st["total"], "error": st["error"], "days": days})
 
 
 def resample_1min_to_5min(candles_1min: list) -> list[tuple[float, float, float, float]]:
@@ -8877,11 +9046,20 @@ def api_first_candle_board():
         if stale:
             try:
                 cats: dict[str, str] = {}
-                for a in _alerts_for_ist_date(date_str):
+                day_alerts = _alerts_for_ist_date(date_str)
+                for a in day_alerts:
                     sym = (a.get("symbol") or "").strip().upper()
                     cat = categorize(a)
                     if sym and sym not in cats and cat in ("Buy", "Sell"):
                         cats[sym] = cat
+                # Which alert(s) fired for each stock, in the category the stock is listed under.
+                names: dict[str, set] = {}
+                for a in day_alerts:
+                    sym = (a.get("symbol") or "").strip().upper()
+                    nm = (a.get("alert_name") or a.get("scan_name") or "").strip()
+                    if sym in cats and categorize(a) == cats[sym] and nm:
+                        names.setdefault(sym, set()).add(nm)
+                alert_names = {k: sorted(v) for k, v in names.items()}
             except (psycopg2.Error, RuntimeError):
                 return jsonify({"error": "database unavailable"}), 503
             symbols = list(cats)[:_FC_BOARD_MAX_SYMBOLS]
@@ -8890,7 +9068,7 @@ def api_first_candle_board():
                 for k in old_dates[:len(_fc_board) - 29]:
                     _fc_board.pop(k, None)
             st = {"state": "running", "started": now_m, "finished": None, "total": len(symbols), "alerted": len(cats),
-                  "done": 0, "reports": [], "error": None}
+                  "done": 0, "reports": [], "error": None, "names": alert_names}
             _fc_board[date_str] = st
             if not symbols:
                 st["state"] = "done"
@@ -8904,6 +9082,7 @@ def api_first_candle_board():
         d = decisions.get(r["symbol"])
         r["decision"] = d["decision"] if d else None
         r["decision_reason"] = d["reason"] if d else None
+        r["alert_names"] = (st.get("names") or {}).get(r["symbol"], [])
     return jsonify({"date": date_str, "state": st["state"], "total": st["total"], "done": st["done"],
                     "total_alerted": st.get("alerted", st["total"]), "error": st["error"], "rows": rows})
 
