@@ -163,6 +163,23 @@
   </div>
   <div id="msStatus" class="foot"></div>
   <div id="msOut"></div>
+
+  <h3 style="margin:26px 0 4px;">Recipe tester</h3>
+  <div class="foot" style="margin-bottom:8px;">
+    Test one exact recipe: pick the alert type(s), then switch on the conditions you want. Press <b>Run study</b> first (it loads the days). The funnel adds one condition at a time so you can see which one helps and which one only shrinks the sample.
+    Conditions marked <b>(end of day)</b> are only known after the close, so they cannot be used to decide an entry at 9:20.
+  </div>
+  <div class="controls">
+    <span>Alerts (none ticked = any):</span> <span id="rcNames"></span>
+  </div>
+  <div class="controls">
+    <label><input type="checkbox" id="rcOnRatio" checked> 9:15 ratio &ge; <input type="number" id="rcRatio" value="3" min="0" step="0.5" style="width:60px;">&times;</label>
+    <label><input type="checkbox" id="rcOnShare" checked> 9:15 buy share &ge; <input type="number" id="rcShare" value="70" min="0" max="100" step="5" style="width:60px;">%</label>
+    <label><input type="checkbox" id="rcOnDay" checked> Day volume (end of day) &ge; <input type="number" id="rcDay" value="1.5" min="0" step="0.5" style="width:60px;">&times;</label>
+    <label><input type="checkbox" id="rcOnSec" checked> Sector (end of day)
+      <select id="rcSec"><option value="with">with the alert (0.5+ pt)</option><option value="notagainst">with or in line</option></select></label>
+  </div>
+  <div id="rcOut"></div>
   <div class="foot">
     The combinations table uses the factors ticked above (tick &quot;alert name&quot; to split each combination by the alert that fired). Day volume and sector strength are only known at the end of the day,
     so they help explain what makes movers but cannot be used to decide an entry at 9:20 (sector strength = the sector's average move without the stock itself, minus the market's median move; ticking it makes the combinations much smaller, so use it with a lower minimum or more days). &quot;Avg move&quot; follows the &quot;Measure move&quot; choice in the Benchmark.
@@ -546,13 +563,14 @@
       const sec = (msRank[r.date] && msRank[r.date].sector) ? msRank[r.date].sector[r.symbol] : undefined;
       rows.push(Object.assign({}, r, { _lab: lab, sector_rel: (sec === undefined ? null : sec) }));
     });
+    msRows = rows;
     const uncovered = Array.from(new Set(base.map(r => r.date))).filter(d => !(msRank[d] && msRank[d].covered)).sort();
     const days = new Set(rows.map(r => r.date)).size;
     msEl("msStatus").textContent = rows.length
       ? (rows.length + " alerted stock-days over " + days + " days ranked against the F&O universe." +
          (uncovered.length ? " No ranking available for: " + uncovered.join(", ") + " (today before 15:45 IST, or no market data)." : ""))
       : "No ranked days. " + (uncovered.length ? "Could not rank: " + uncovered.join(", ") : "");
-    if (!rows.length) { msEl("msOut").innerHTML = ""; return; }
+    if (!rows.length) { msEl("msOut").innerHTML = ""; recipeRender(); return; }
 
     const byCat = c => rows.filter(r => r.category === c);
     let html = msTable("Overall - did the alert's stock end in the day's top " + top + "?", [
@@ -598,7 +616,66 @@
       ? msTable("Best combinations (at least " + minN + " stocks each, best lift first)", cg, minN, { first: "Combination" })
       : '<h4 style="margin:16px 0 6px;">Best combinations</h4><div class="foot">No combination has at least ' + minN + ' stocks yet - lower the minimum, untick a factor, or load more days in the Benchmark.</div>';
     msEl("msOut").innerHTML = html;
+    recipeRender();
   }
+
+  // ---------- Recipe tester ----------
+  let msRows = [], rcNames = new Set(), rcNameKey = "";
+  const RC_IDS = ["rcOnRatio", "rcRatio", "rcOnShare", "rcShare", "rcOnDay", "rcDay", "rcOnSec", "rcSec"];
+
+  function rcBuildNames() {
+    const all = new Set();
+    msRows.forEach(r => (r.alert_names || []).forEach(n => all.add(n)));
+    const names = Array.from(all).sort();
+    const key = names.join("\u0001");
+    if (key === rcNameKey) return;
+    rcNameKey = key;
+    msEl("rcNames").innerHTML = names.map((n, i) =>
+      '<label style="margin-right:10px;"><input type="checkbox" class="rcName" data-i="' + i + '"' + (rcNames.has(n) ? " checked" : "") + '> ' + esc(n) + '</label>').join("") || '<span class="mut">no alert names yet</span>';
+    msEl("rcNames").querySelectorAll(".rcName").forEach(cb => {
+      cb.onchange = () => { const n = names[+cb.dataset.i]; if (cb.checked) rcNames.add(n); else rcNames.delete(n); recipeRender(); };
+    });
+  }
+
+  function recipeRender() {
+    const out = msEl("rcOut");
+    if (!msRows.length) { out.innerHTML = ""; msEl("rcNames").innerHTML = ""; rcNameKey = ""; return; }
+    rcBuildNames();
+    const minN = Math.max(parseInt(msEl("msMin").value, 10) || 1, 1);
+    const num = id => { const v = parseFloat(msEl(id).value); return isNaN(v) ? 0 : v; };
+    const steps = [];
+    if (rcNames.size) steps.push({ name: "Alert: " + Array.from(rcNames).join(" or "), test: r => (r.alert_names || []).some(n => rcNames.has(n)) });
+    if (msEl("rcOnRatio").checked) steps.push({ name: "9:15 ratio \u2265 " + num("rcRatio") + "\u00d7", test: r => r.first_candle_ratio != null && r.first_candle_ratio >= num("rcRatio") });
+    if (msEl("rcOnShare").checked) steps.push({ name: "9:15 buy share \u2265 " + num("rcShare") + "%", test: r => r.dir_share_pct != null && r.dir_share_pct >= num("rcShare") });
+    if (msEl("rcOnDay").checked) steps.push({ name: "Day volume \u2265 " + num("rcDay") + "\u00d7 (end of day)", test: r => r.day_volume_ratio != null && r.day_volume_ratio >= num("rcDay") });
+    if (msEl("rcOnSec").checked) {
+      const mode = msEl("rcSec").value;
+      steps.push({ name: mode === "with" ? "Sector with the alert (end of day)" : "Sector with or in line (end of day)",
+        test: r => r.sector_rel != null && sectorBand(r.sector_rel, r.category) <= (mode === "with" ? 0 : 1) });
+    }
+    const groups = [{ name: "All alerted stocks (start)", st: msStat(msRows) }];
+    let cur = msRows;
+    steps.forEach(s => { cur = cur.filter(s.test); groups.push({ name: "+ " + s.name, st: msStat(cur) }); });
+    let html = msTable("Recipe funnel - each row adds one condition to the rows above", groups, minN, { first: "Step" });
+    if (steps.length) {
+      html += msTable("Recipe result by side", [
+        { name: "Buy alerts", st: msStat(cur.filter(r => r.category === "Buy")) },
+        { name: "Sell alerts", st: msStat(cur.filter(r => r.category === "Sell")) },
+        { name: "Both", st: msStat(cur) }], minN, { first: "Side" });
+    }
+    const list = cur.slice().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)).slice(0, 80);
+    if (steps.length && list.length) {
+      html += '<h4 style="margin:16px 0 6px;">Stocks matching the recipe (latest first, up to 80)</h4><div class="wrap"><table><thead><tr><th>Date</th><th>Symbol</th><th>Alert</th><th>Alert name</th><th>9:15 ratio</th><th>Buy share</th><th>Day vol</th><th>Sector</th><th>Top-N</th><th>Move</th></tr></thead><tbody>' +
+        list.map(r => '<tr><td>' + esc(r.date) + '</td><td>' + esc(r.symbol) + '</td><td>' + esc(r.category) + '</td><td>' + esc((r.alert_names || []).join(", ")) + '</td><td>' +
+          (r.first_candle_ratio == null ? "-" : f1(r.first_candle_ratio) + "&times;") + '</td><td>' + (r.dir_share_pct == null ? "-" : f1(r.dir_share_pct) + "%") + '</td><td>' +
+          (r.day_volume_ratio == null ? "-" : f1(r.day_volume_ratio) + "&times;") + '</td><td>' + (r.sector_rel == null ? "-" : (r.sector_rel > 0 ? "+" : "") + f1(r.sector_rel)) + '</td><td class="' + (r._lab.hit ? "pos" : "") + '">' +
+          (r._lab.hit ? "yes" : "no") + '</td><td>' + signed(dirMove(r)) + '</td></tr>').join("") + '</tbody></table></div>';
+    } else if (steps.length) {
+      html += '<div class="foot">No stock-day matched every condition. Loosen a condition or load more days in the Benchmark.</div>';
+    }
+    out.innerHTML = html;
+  }
+  RC_IDS.forEach(id => { msEl(id).onchange = recipeRender; });
 
   async function runStudy() {
     const st = msEl("msStatus");
