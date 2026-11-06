@@ -176,6 +176,7 @@
     <label><input type="checkbox" id="rcOnRatio" checked> 9:15 ratio &ge; <input type="number" id="rcRatio" value="3" min="0" step="0.5" style="width:60px;">&times;</label>
     <label><input type="checkbox" id="rcOnShare" checked> 9:15 buy share &ge; <input type="number" id="rcShare" value="70" min="0" max="100" step="5" style="width:60px;">%</label>
     <label><input type="checkbox" id="rcOnDay" checked> Day volume (end of day) &ge; <input type="number" id="rcDay" value="1.5" min="0" step="0.5" style="width:60px;">&times;</label>
+    <label><input type="checkbox" id="rcOnSec25"> Sector @9:25 with the alert &ge; <input type="number" id="rcSec25" value="0.5" min="0" step="0.1" style="width:60px;">%</label>
     <label><input type="checkbox" id="rcOnSec" checked> Sector (end of day)
       <select id="rcSec"><option value="with">with the alert (0.5+ pt)</option><option value="notagainst">with or in line</option></select></label>
   </div>
@@ -194,7 +195,7 @@
 
 <script>
   const COLS = [
-    ["symbol", "Symbol"], ["category", "Alert"], ["decision", "Decision"], ["fno_mover", "F&O mover"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
+    ["symbol", "Symbol"], ["category", "Alert"], ["sector_pct_0925", "Sector @9:25"], ["fno_mover", "F&O mover"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
     ["pct_of_avg_day_volume", "9:15 % of day"], ["first_candle_body_pct", "9:15 body %"], ["gap_open_pct", "Gap %"],
     ["day_volume_ratio", "Day vol"], ["below_20d_high_pct", "Below 20d high %"],
     ["day_high_vs_prev_close_pct", "Day high %"], ["last_close_vs_prev_close_pct", "Last %"],
@@ -221,11 +222,11 @@
     if (v === null || v === undefined) return '<span class="mut">-</span>';
     if (k === "symbol") return esc(v);
     if (k === "category") return '<span class="tag ' + esc(v) + '">' + esc(v) + '</span>';
-    if (k === "decision") {
-      const why = r.decision_reason ? esc(r.decision_reason) : "";
-      if (v === "TRADED") return '<span class="tag Buy" title="' + why + '">Traded</span>';
-      const short = r.decision_reason ? esc(r.decision_reason.length > 46 ? r.decision_reason.slice(0, 46) + "..." : r.decision_reason) : "";
-      return '<span class="tag" title="' + why + '">' + (v === "ERROR" ? "Error" : "Skipped") + '</span> <span class="mut">' + short + '</span>';
+    if (k === "sector_pct_0925") {
+      if (!r.sector) return '<span class="mut">-</span>';
+      const p = r.sector_pct_0925;
+      if (p === null || p === undefined) return esc(r.sector) + ' <span class="mut" title="Computed from 5-min candles after 09:26 IST; reload in a minute">(-)</span>';
+      return esc(r.sector) + ' <span class="' + (p > 0 ? "pos" : p < 0 ? "neg" : "") + '" title="Sector average at 09:25 IST, fixed for the day">' + (p > 0 ? "+" : "") + p + '%</span>';
     }
     if (k === "fno_mover") {
       const m = r.fno_info;
@@ -286,12 +287,15 @@
       if (d.state === "running") {
         st.textContent = "Working... " + d.done + " of " + d.total + " stocks";
         timer = setTimeout(() => load(false), 2500);
+      } else if (d.sector_0925_state === "running" && rows.some(r => r.sector && (r.sector_pct_0925 === null || r.sector_pct_0925 === undefined))) {
+        st.textContent = rows.length + " stocks. Calculating each sector's 09:25 % (one-time per day)...";
+        timer = setTimeout(() => load(false), 4000);
       } else if (d.state === "error") {
         st.textContent = "Stopped early: " + (d.error || "error") + " (showing " + rows.length + " stocks)";
       } else {
         st.textContent = rows.length
           ? (rows.length + " stocks for " + d.date + (d.total_alerted > rows.length ? " (" + (d.total_alerted - rows.length) + " more alerted stocks not shown - list capped)" : "") +
-             ". Decision is recorded from the day this feature went live; earlier days show '-'.")
+             ". Sector @9:25 = the sector's average % change at 09:25 IST (fixed for the day).")
           : "No Buy/Sell alerts found for " + d.date;
       }
     } catch (e) {
@@ -624,7 +628,7 @@
 
   // ---------- Recipe tester ----------
   let msRows = [], rcNames = new Set(), rcNameKey = "";
-  const RC_IDS = ["rcOnRatio", "rcRatio", "rcOnShare", "rcShare", "rcOnDay", "rcDay", "rcOnSec", "rcSec"];
+  const RC_IDS = ["rcOnSec25", "rcSec25", "rcOnRatio", "rcRatio", "rcOnShare", "rcShare", "rcOnDay", "rcDay", "rcOnSec", "rcSec"];
 
   function rcBuildNames() {
     const all = new Set();
@@ -650,6 +654,7 @@
     if (rcNames.size) steps.push({ name: "Alert: " + Array.from(rcNames).join(" or "), test: r => (r.alert_names || []).some(n => rcNames.has(n)) });
     if (msEl("rcOnRatio").checked) steps.push({ name: "9:15 ratio \u2265 " + num("rcRatio") + "\u00d7", test: r => r.first_candle_ratio != null && r.first_candle_ratio >= num("rcRatio") });
     if (msEl("rcOnShare").checked) steps.push({ name: "9:15 buy share \u2265 " + num("rcShare") + "%", test: r => r.dir_share_pct != null && r.dir_share_pct >= num("rcShare") });
+    if (msEl("rcOnSec25").checked) steps.push({ name: "Sector @9:25 with the alert \u2265 " + num("rcSec25") + "%", test: r => r.sector_pct_0925 != null && (r.category === "Sell" ? -r.sector_pct_0925 : r.sector_pct_0925) >= num("rcSec25") });
     if (msEl("rcOnDay").checked) steps.push({ name: "Day volume \u2265 " + num("rcDay") + "\u00d7 (end of day)", test: r => r.day_volume_ratio != null && r.day_volume_ratio >= num("rcDay") });
     if (msEl("rcOnSec").checked) {
       const mode = msEl("rcSec").value;

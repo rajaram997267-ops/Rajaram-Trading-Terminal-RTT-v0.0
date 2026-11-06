@@ -205,6 +205,11 @@
       align-items: baseline;
       gap: 8px;
     }
+    .sym-wrap { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden; }
+    .sec-chip { font-size: 10px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 170px; padding: 1px 6px; border-radius: 8px; background: rgba(127,127,127,0.14); color: var(--muted); }
+    .sec-chip.pos { color: var(--green); }
+    .sec-chip.neg { color: #ff5370; }
     .row-top .sym {
       font-size: 14px;
       font-weight: 700;
@@ -603,7 +608,7 @@
                 {% for alert in items %}
                 <div class="list-row{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}{% if alert['confirmed_count'] and alert['confirmed_count'] >= 3 %} triple-confirmed{% endif %}" data-sector="{{ alert['sector'] }}" {% if alert["alert_name"] %}title="{{ alert['alert_name'] }}"{% endif %}>
                   <div class="row-top">
-                    <span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>
+                    <span class="sym-wrap"><span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>{% if alert.get("sector") and alert.get("sector") != "Unclassified" %}<span class="sec-chip{% if alert.get('sector_0925') is not none %}{{ ' pos' if alert['sector_0925'] > 0 else (' neg' if alert['sector_0925'] < 0 else '') }}{% endif %}" title="Sector {{ alert['sector'] }}{% if alert.get('sector_0925') is not none %}: {{ '%+.2f'|format(alert['sector_0925']) }}% at 09:25 IST (fixed for the day){% else %}: 09:25 value not available yet{% endif %}">{{ alert['sector'] }}{% if alert.get('sector_0925') is not none %} {{ '%+.2f'|format(alert['sector_0925']) }}%{% endif %}</span>{% endif %}</span>
                     <span class="price-wrap"><span class="price">{{ (alert["trigger_price"] or "-")|inr }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '{{ (alert['symbol'] or '')|escape }}')" title="Fetch live price">&#8635;</button>
                   </div>
                   {% if alert.get("volume") %}
@@ -706,7 +711,7 @@
       return `
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
-            <span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>
+            <span class="sym-wrap"><span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>${secChipHtml(a)}</span>
             <span class="price-wrap"><span class="price">${escapeHtml(String(inr(a.trigger_price || "-")))}</span>${pctBadge}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '${escapeHtml(a.symbol || "")}')" title="Fetch live price">&#8635;</button>
           </div>
           ${volHtml}
@@ -723,6 +728,16 @@
 
     // The first-candle line under an alert: 9:15 buy/sell share (the important one), the move
     // since the 9:15 candle, the day's extreme and the latest price, all vs the previous close.
+    // Sector name + the sector's FIXED % at 09:25 IST, shown next to the stock name.
+    function secChipHtml(a) {
+      if (!a.sector || a.sector === "Unclassified") return "";
+      const p = a.sector_0925;
+      const has = p !== null && p !== undefined;
+      const cls = has ? (p > 0 ? " pos" : p < 0 ? " neg" : "") : "";
+      const tip = "Sector " + a.sector + (has ? ": " + (p > 0 ? "+" : "") + Number(p).toFixed(2) + "% at 09:25 IST (fixed for the day)" : ": 09:25 value not available yet");
+      return `<span class="sec-chip${cls}" title="${escapeHtml(tip)}">${escapeHtml(a.sector)}${has ? " " + (p > 0 ? "+" : "") + Number(p).toFixed(2) + "%" : ""}</span>`;
+    }
+
     function fcLineHtml(fc) {
       if (!fc || fc.share === null || fc.share === undefined) return "";
       const sg = (v) => (v > 0 ? "+" : "") + v.toFixed(2) + "%";
