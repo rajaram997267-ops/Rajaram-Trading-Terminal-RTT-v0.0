@@ -145,6 +145,30 @@
     </table></div>
   </div>
 
+  <h3 style="margin-top:28px;">Top movers study</h3>
+  <div class="foot" style="margin-top:0;">
+    Which alerts end the day among the F&amp;O stocks' biggest <b>gainers</b> (for Buy alerts) or <b>losers</b> (for Sell alerts), and what do they have in common?
+    It uses the days loaded by the Benchmark above, so press <b>Build benchmark</b> first, then <b>Run study</b>.
+    <b>Chance</b> = how often a random F&amp;O stock would land in the top N. <b>Lift</b> = hits &divide; what chance alone would give (1.0&times; = no better than random).
+  </div>
+  <div class="controls">
+    <label>Top <select id="msTop"><option value="10">10</option><option value="15">15</option><option value="20">20</option><option value="30">30</option></select> movers</label>
+    <label>Min stocks per row <input type="number" id="msMin" value="8" min="1" step="1" style="width:60px;"></label>
+    <label><input type="checkbox" id="msF1" checked> 9:15 ratio</label>
+    <label><input type="checkbox" id="msF2" checked> 9:15 buy share</label>
+    <label><input type="checkbox" id="msF3" checked> Day volume</label>
+    <label><input type="checkbox" id="msF4"> alert name</label>
+    <label title="The sector's full-day move vs the market (without the stock itself)"><input type="checkbox" id="msF5"> sector strength</label>
+    <button id="msRun">Run study</button>
+  </div>
+  <div id="msStatus" class="foot"></div>
+  <div id="msOut"></div>
+  <div class="foot">
+    The combinations table uses the factors ticked above (tick &quot;alert name&quot; to split each combination by the alert that fired). Day volume and sector strength are only known at the end of the day,
+    so they help explain what makes movers but cannot be used to decide an entry at 9:20 (sector strength = the sector's average move without the stock itself, minus the market's median move; ticking it makes the combinations much smaller, so use it with a lower minimum or more days). &quot;Avg move&quot; follows the &quot;Measure move&quot; choice in the Benchmark.
+    Rows with fewer stocks than the minimum are greyed out or hidden - small samples are mostly luck.
+  </div>
+
   <div class="foot">
     Covers stocks with a Buy or Sell alert on the chosen day. <b>9:15 ratio</b> = first 5-min candle volume &divide; its average over the previous 10 sessions.
     <b>Day vol</b> = whole-day volume so far &divide; the average at the same clock time. <b>Below 20d high</b> = previous close vs the highest high of the last 20 sessions.
@@ -448,6 +472,149 @@
   document.getElementById("benchInclude").onchange = renderBench;
   document.getElementById("showSel").onchange = render;
   document.getElementById("benchDirMin").oninput = renderBench;
+
+
+  // ---------- Top movers study ----------
+  // For every alerted stock-day loaded by the benchmark: did a Buy alert end among that day's top N F&O gainers
+  // (a Sell alert: top N losers)? Then which alert names / volume bands / buy-share bands do that most often.
+  const DAYVOL_BANDS = ["Under 1\u00d7", "1\u00d7 to 1.5\u00d7", "1.5\u00d7 to 2.5\u00d7", "2.5\u00d7 and above"];
+  function dayVolBand(x) { return x < 1 ? 0 : x < 1.5 ? 1 : x < 2.5 ? 2 : 3; }
+  // Sector strength = the stock's sector (without the stock itself) vs the whole F&O market that day, in percentage
+  // points. For a Sell alert the sign is flipped, so "with the alert" always means the sector moved the alert's way.
+  const SECTOR_BANDS = ["Sector with the alert (0.5+ pt)", "Sector in line", "Sector against the alert (0.5+ pt)"];
+  function sectorBand(rel, category) { const x = category === "Sell" ? -rel : rel; return x >= 0.5 ? 0 : x > -0.5 ? 1 : 2; }
+  let msRank = {}, msToken = 0;
+  const msEl = id => document.getElementById(id);
+  const msSleep = ms => new Promise(res => setTimeout(res, ms));
+
+  async function msFetchRanks(dates, token) {
+    for (;;) {
+      const res = await fetch("/api/fno-rank-history?dates=" + encodeURIComponent(dates.join(",")));
+      const d = await res.json();
+      if (!res.ok) throw new Error(d.error || "request failed");
+      if (token !== msToken) return null;
+      if (d.state === "running") {
+        msEl("msStatus").textContent = "Loading the F&O history from Upstox (one-time per day, " + (d.done || 0) + " of " + (d.total || "?") + " stocks)...";
+        await msSleep(2000);
+        continue;
+      }
+      return d.days || {};
+    }
+  }
+
+  function msLabel(r, top) {
+    const day = msRank[r.date];
+    if (!day || !day.covered) return null;
+    const rank = (r.category === "Sell" ? day.lose : day.gain)[r.symbol];
+    return { hit: rank !== undefined && rank <= top, chance: top / day.universe };
+  }
+
+  function msStat(list) {
+    let n = 0, hits = 0, exp = 0, mv = 0, mvN = 0;
+    list.forEach(r => {
+      n++; if (r._lab.hit) hits++; exp += r._lab.chance;
+      const m = dirMove(r);
+      if (m !== null && m !== undefined) { mv += m; mvN++; }
+    });
+    return { n, hits, rate: n ? hits / n * 100 : null, chance: n ? exp / n * 100 : null,
+             lift: exp > 0 ? hits / exp : null, avg: mvN ? mv / mvN : null };
+  }
+
+  function msTable(title, groups, minN, opts) {
+    opts = opts || {};
+    let h = '<h4 style="margin:16px 0 6px;">' + title + '</h4><div class="wrap"><table><thead><tr><th>' + (opts.first || "Group") +
+      '</th><th>Stocks</th><th>Top-N hits</th><th>Hit rate</th><th>Chance</th><th>Lift</th><th>Avg move</th></tr></thead><tbody>';
+    groups.forEach(g => {
+      const st = g.st, small = st.n < minN;
+      const liftCls = (!small && st.lift !== null) ? (st.lift >= 1.5 ? "pos" : st.lift < 0.8 ? "neg" : "") : "";
+      h += '<tr' + (small ? ' style="opacity:.5;"' : '') + '><td>' + esc(g.name) + '</td><td>' + st.n + '</td><td>' + st.hits + '</td><td>' +
+        (st.rate === null ? "-" : f1(st.rate) + "%") + '</td><td>' + (st.chance === null ? "-" : f1(st.chance) + "%") + '</td><td class="' + liftCls + '">' +
+        (st.lift === null ? "-" : st.lift.toFixed(2) + "&times;") + '</td><td>' + signed(st.avg) + '</td></tr>';
+    });
+    return h + '</tbody></table></div>';
+  }
+
+  function msRender() {
+    const top = parseInt(msEl("msTop").value, 10) || 10;
+    const minN = Math.max(parseInt(msEl("msMin").value, 10) || 1, 1);
+    const f = [msEl("msF1").checked, msEl("msF2").checked, msEl("msF3").checked, msEl("msF4").checked, msEl("msF5").checked];
+    const base = benchRows.filter(r => r.status === "ok");
+    const rows = [];
+    base.forEach(r => {
+      const lab = msLabel(r, top);
+      if (!lab) return;
+      const sec = (msRank[r.date] && msRank[r.date].sector) ? msRank[r.date].sector[r.symbol] : undefined;
+      rows.push(Object.assign({}, r, { _lab: lab, sector_rel: (sec === undefined ? null : sec) }));
+    });
+    const uncovered = Array.from(new Set(base.map(r => r.date))).filter(d => !(msRank[d] && msRank[d].covered)).sort();
+    const days = new Set(rows.map(r => r.date)).size;
+    msEl("msStatus").textContent = rows.length
+      ? (rows.length + " alerted stock-days over " + days + " days ranked against the F&O universe." +
+         (uncovered.length ? " No ranking available for: " + uncovered.join(", ") + " (today before 15:45 IST, or no market data)." : ""))
+      : "No ranked days. " + (uncovered.length ? "Could not rank: " + uncovered.join(", ") : "");
+    if (!rows.length) { msEl("msOut").innerHTML = ""; return; }
+
+    const byCat = c => rows.filter(r => r.category === c);
+    let html = msTable("Overall - did the alert's stock end in the day's top " + top + "?", [
+      { name: "Buy alerts -> top " + top + " gainers", st: msStat(byCat("Buy")) },
+      { name: "Sell alerts -> top " + top + " losers", st: msStat(byCat("Sell")) },
+      { name: "All alerts", st: msStat(rows) }], minN, { first: "Alerts" });
+
+    // by alert name (a stock that fired two alerts counts under each)
+    const nameMap = {};
+    rows.forEach(r => { (r.alert_names && r.alert_names.length ? r.alert_names : ["(no alert name)"]).forEach(nm => { (nameMap[nm] = nameMap[nm] || []).push(r); }); });
+    const nameGroups = Object.keys(nameMap).map(nm => ({ name: nm, st: msStat(nameMap[nm]) }));
+    nameGroups.sort((a, b) => ((b.st.n >= minN) - (a.st.n >= minN)) || ((b.st.lift || 0) - (a.st.lift || 0)) || (b.st.n - a.st.n));
+    html += msTable("By alert name", nameGroups, minN, { first: "Alert" });
+
+    // one factor at a time
+    const one = (title, key, names, bandFn, first) => {
+      const groups = names.map((nm, i) => ({ name: nm, st: msStat(rows.filter(r => r[key] !== null && r[key] !== undefined && bandFn(r[key]) === i)) }));
+      return msTable(title, groups, minN, { first });
+    };
+    html += one("By 9:15 volume ratio", "first_candle_ratio", BANDS, x => bandOf(x), "9:15 ratio");
+    html += one("By 9:15 buy share (selling share for Sell alerts)", "dir_share_pct", SHARE_BANDS, x => bandOf(x, "dir_share_pct"), "Buy share");
+    html += one("By day volume (whole day vs its usual level)", "day_volume_ratio", DAYVOL_BANDS, dayVolBand, "Day volume");
+    {
+      const groups = SECTOR_BANDS.map((nm, i) => ({ name: nm, st: msStat(rows.filter(r => r.sector_rel !== null && sectorBand(r.sector_rel, r.category) === i)) }));
+      html += msTable("By sector strength (the sector's full-day move vs the market, without the stock itself)", groups, minN, { first: "Sector" });
+    }
+
+    // combinations of the ticked factors
+    const combos = {};
+    rows.forEach(r => {
+      const parts = [];
+      if (f[0]) { if (r.first_candle_ratio == null) return; parts.push("9:15 vol " + BANDS[bandOf(r.first_candle_ratio)]); }
+      if (f[1]) { if (r.dir_share_pct == null) return; parts.push("buy share " + SHARE_BANDS[bandOf(r.dir_share_pct, "dir_share_pct")]); }
+      if (f[2]) { if (r.day_volume_ratio == null) return; parts.push("day vol " + DAYVOL_BANDS[dayVolBand(r.day_volume_ratio)]); }
+      if (f[4]) { if (r.sector_rel == null) return; parts.push(SECTOR_BANDS[sectorBand(r.sector_rel, r.category)]); }
+      const names = f[3] ? (r.alert_names && r.alert_names.length ? r.alert_names : ["(no alert name)"]) : [null];
+      names.forEach(nm => { const key = (nm ? [nm].concat(parts) : parts).join("  |  "); if (key) (combos[key] = combos[key] || []).push(r); });
+    });
+    let cg = Object.keys(combos).map(k => ({ name: k, st: msStat(combos[k]) })).filter(g => g.st.n >= minN);
+    cg.sort((a, b) => ((b.st.lift || 0) - (a.st.lift || 0)) || (b.st.n - a.st.n));
+    cg = cg.slice(0, 25);
+    html += cg.length
+      ? msTable("Best combinations (at least " + minN + " stocks each, best lift first)", cg, minN, { first: "Combination" })
+      : '<h4 style="margin:16px 0 6px;">Best combinations</h4><div class="foot">No combination has at least ' + minN + ' stocks yet - lower the minimum, untick a factor, or load more days in the Benchmark.</div>';
+    msEl("msOut").innerHTML = html;
+  }
+
+  async function runStudy() {
+    const st = msEl("msStatus");
+    const base = benchRows.filter(r => r.status === "ok");
+    if (!base.length) { st.textContent = "Press Build benchmark first (it loads the days), then Run study."; return; }
+    const token = ++msToken;
+    const dates = Array.from(new Set(base.map(r => r.date))).sort();
+    st.textContent = "Loading each day's F&O gainers and losers...";
+    let ranks;
+    try { ranks = await msFetchRanks(dates, token); } catch (e) { st.textContent = "Could not load the F&O history: " + e.message; return; }
+    if (ranks === null) return;
+    msRank = ranks;
+    msRender();
+  }
+  msEl("msRun").onclick = runStudy;
+  ["msTop", "msMin", "msF1", "msF2", "msF3", "msF4", "msF5"].forEach(id => { msEl(id).onchange = () => { if (Object.keys(msRank).length) msRender(); }; });
 
   document.getElementById("loadBtn").onclick = () => load(false);
   document.getElementById("refreshBtn").onclick = () => load(true);
