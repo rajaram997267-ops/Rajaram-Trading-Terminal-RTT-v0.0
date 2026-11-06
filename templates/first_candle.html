@@ -500,7 +500,7 @@
   // points. For a Sell alert the sign is flipped, so "with the alert" always means the sector moved the alert's way.
   const SECTOR_BANDS = ["Sector with the alert (0.5+ pt)", "Sector in line", "Sector against the alert (0.5+ pt)"];
   function sectorBand(rel, category) { const x = category === "Sell" ? -rel : rel; return x >= 0.5 ? 0 : x > -0.5 ? 1 : 2; }
-  let msRank = {}, msToken = 0;
+  let msRank = {}, msToken = 0, msDiag = "";
   const msEl = id => document.getElementById(id);
   const msSleep = ms => new Promise(res => setTimeout(res, ms));
 
@@ -515,6 +515,9 @@
         await msSleep(2000);
         continue;
       }
+      msDiag = (d.failed || d.last_error)
+        ? " Upstox calls: " + (d.ok || 0) + " ok, " + (d.failed || 0) + " failed." + (d.last_error ? " Last error: " + d.last_error : "")
+        : "";
       return d.days || {};
     }
   }
@@ -568,8 +571,8 @@
     const days = new Set(rows.map(r => r.date)).size;
     msEl("msStatus").textContent = rows.length
       ? (rows.length + " alerted stock-days over " + days + " days ranked against the F&O universe." +
-         (uncovered.length ? " No ranking available for: " + uncovered.join(", ") + " (today before 15:45 IST, or no market data)." : ""))
-      : "No ranked days. " + (uncovered.length ? "Could not rank: " + uncovered.join(", ") : "");
+         (uncovered.length ? " No ranking available for: " + uncovered.join(", ") + " (today before 15:45 IST, or no market data)." + msDiag : ""))
+      : "No ranked days. " + (uncovered.length ? "Could not rank: " + uncovered.join(", ") + msDiag : "");
     if (!rows.length) { msEl("msOut").innerHTML = ""; recipeRender(); return; }
 
     const byCat = c => rows.filter(r => r.category === c);
