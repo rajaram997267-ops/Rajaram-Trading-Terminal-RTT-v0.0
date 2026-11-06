@@ -742,6 +742,19 @@ def init_db():
             )
             """
         )
+        # Each sector's % change at 09:25 IST (average over its F&O stocks: close of the 09:20-09:25
+        # 5-min candle vs the previous close). Fixed once stored - it never changes later in the day.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sector_0925 (
+                date TEXT NOT NULL,
+                sector TEXT NOT NULL,
+                pct DOUBLE PRECISION,
+                n INTEGER,
+                PRIMARY KEY (date, sector)
+            )
+            """
+        )
         # Funds added to / removed from the PAPER account, kept apart from the
         # trades themselves so topping up never touches (or re-bases) the
         # trade history - see get_current_capital / attach_running_balance.
@@ -3006,6 +3019,162 @@ def api_fno_rank_history():
             threading.Thread(target=_fno_rank_worker, args=(token, min(missing), list(missing)), daemon=True).start()
     return jsonify({"state": st["state"], "done": st["done"], "total": st["total"], "error": st["error"], "days": days,
                     "ok": st["ok"], "failed": st["failed"], "last_error": st["last_error"]})
+
+
+# ---------------------------------------------------------------------------
+# Sector % at 09:25 IST - a FIXED snapshot per day. For every F&O stock: close of the 09:20-09:25
+# 5-minute candle vs the previous day's close; a sector's value is the average over its stocks.
+# It is computed from candles, so past days work too, and it is stored once (it cannot change later).
+# Shown next to the stock name on the dashboard and in the First Candle table.
+# ---------------------------------------------------------------------------
+SECTOR_0925_READY_AFTER = (9, 26)     # today's 09:20 candle is closed (and published) after this IST time
+_sector0925_state: dict = {"state": "idle", "done": 0, "total": 0, "ok": 0, "failed": 0, "last_error": None, "attempted": set()}
+_sector0925_lock = threading.Lock()
+_sector0925_mem: dict = {}            # date -> {sector: pct}, only finished days (values never change)
+
+
+def _sector0925_date_ready(date_str: str, now_ist: datetime) -> bool:
+    today = now_ist.strftime("%Y-%m-%d")
+    if date_str > today:
+        return False
+    return date_str < today or (now_ist.hour, now_ist.minute) >= SECTOR_0925_READY_AFTER
+
+
+def _sector_0925_load(date_str: str) -> dict:
+    """{sector: pct} stored for the day, or {}."""
+    got = _sector0925_mem.get(date_str)
+    if got:
+        return got
+    try:
+        with get_db() as conn:
+            rows = conn.execute("SELECT sector, pct FROM sector_0925 WHERE date = ?", (date_str,)).fetchall()
+    except Exception:
+        return {}
+    out = {r["sector"]: float(r["pct"]) for r in rows if r["pct"] is not None}
+    if out:
+        _sector0925_mem[date_str] = out
+    return out
+
+
+def _sector_0925_worker(token: str, dates: list) -> None:
+    st = _sector0925_state
+    try:
+        now_ist = datetime.utcnow() + IST_OFFSET
+        today = now_ist.strftime("%Y-%m-%d")
+        dates = sorted(set(dates))
+        past = [d for d in dates if d < today]
+        universe = _fno_universe()
+        st["total"], st["done"], st["ok"], st["failed"], st["last_error"] = len(universe), 0, 0, 0, None
+        if not universe:
+            st["last_error"] = "no F&O symbols resolved to an Upstox instrument key"
+        sums: dict = {d: {} for d in dates}        # date -> {sector: [total, count]}
+        hdr = lambda: {"Accept": "application/json", "User-Agent": BROWSER_USER_AGENT, "Authorization": f"Bearer {token}"}
+
+        def get_candles(url: str) -> list:
+            req = urllib.request.Request(url, headers=hdr())
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return ((json.loads(resp.read().decode()).get("data") or {}).get("candles")) or []
+
+        for symbol, key in universe:
+            sector = SECTOR_MAP.get(symbol)
+            if not sector:
+                st["done"] += 1
+                continue
+            q = urllib.parse.quote(key, safe="|")
+            try:
+                daily = sorted(get_candles(f"https://api.upstox.com/v3/historical-candle/{q}/days/1/{dates[-1]}/"
+                                           f"{(datetime.strptime(dates[0], '%Y-%m-%d') - timedelta(days=10)).strftime('%Y-%m-%d')}"),
+                               key=lambda c: c[0])
+                five = []
+                if past:
+                    five += get_candles(f"https://api.upstox.com/v3/historical-candle/{q}/minutes/5/{past[-1]}/{past[0]}")
+                if today in dates:
+                    five += get_candles(f"https://api.upstox.com/v3/historical-candle/intraday/{q}/minutes/5")
+                st["ok"] += 1
+                closes = [(c[0][:10], float(c[4] or 0)) for c in daily]
+                at_0920 = {c[0][:10]: float(c[4] or 0) for c in five if c[0][11:16] == "09:20"}
+                for d in dates:
+                    px = at_0920.get(d)
+                    prev = next((cl for dd, cl in reversed(closes) if dd < d and cl > 0), None)
+                    if px and px > 0 and prev:
+                        t = sums[d].setdefault(sector, [0.0, 0])
+                        t[0] += (px - prev) / prev * 100.0
+                        t[1] += 1
+            except urllib.error.HTTPError as e:
+                st["failed"] += 1
+                st["last_error"] = f"{symbol}: HTTP {e.code}"
+                if e.code == 429:
+                    time.sleep(2.0)
+            except Exception as e:
+                st["failed"] += 1
+                st["last_error"] = f"{symbol}: {type(e).__name__}: {e}"
+            st["done"] += 1
+            time.sleep(0.1)
+        stored = 0
+        with get_db() as conn:
+            for d, secs in sums.items():
+                for sector, (tot, n) in secs.items():
+                    if n > 0:
+                        conn.execute(
+                            "INSERT INTO sector_0925 (date, sector, pct, n) VALUES (?, ?, ?, ?) "
+                            "ON CONFLICT (date, sector) DO UPDATE SET pct = excluded.pct, n = excluded.n",
+                            (d, sector, round(tot / n, 2), n))
+                        stored += 1
+            conn.commit()
+        if st["ok"] > 0:
+            st["attempted"].update(dates)           # only remember a day as tried if Upstox answered
+        st["state"] = "done"
+    except Exception as e:
+        st["state"] = "error"
+        st["last_error"] = f"{type(e).__name__}: {e}"
+        print(f"[sector-0925] job failed: {e}", flush=True)
+
+
+def _sector_0925_for_dates(dates: list, token: str | None) -> dict:
+    """{date: {sector: pct}} for the days already stored; starts one background job for the days that are
+    missing and ready (never blocks the request)."""
+    now_ist = datetime.utcnow() + IST_OFFSET
+    out, missing = {}, []
+    for d in dates:
+        got = _sector_0925_load(d)
+        out[d] = got
+        if not got and _sector0925_date_ready(d, now_ist) and d not in _sector0925_state["attempted"]:
+            missing.append(d)
+    if missing and token:
+        with _sector0925_lock:
+            if _sector0925_state["state"] != "running":
+                _sector0925_state["state"] = "running"
+                threading.Thread(target=_sector_0925_worker, args=(token, missing), daemon=True).start()
+    return out
+
+
+def _attach_sector_0925(items: list, date_str: str, token: str | None) -> None:
+    """Adds 'sector_0925' (the sector's fixed % at 09:25 IST) to each alert dict that has a sector."""
+    try:
+        sec = _sector_0925_for_dates([date_str], token).get(date_str) or {}
+    except Exception:
+        sec = {}
+    for a in items:
+        a["sector_0925"] = sec.get(a.get("sector"))
+
+
+@app.route("/api/sector-0925")
+def api_sector_0925():
+    """?dates=YYYY-MM-DD,...  -> {state, days: {date: {sector: pct}}, ok, failed, last_error}."""
+    token = get_setting("upstox_access_token")
+    dates = []
+    for d in [x.strip() for x in (request.args.get("dates") or "").split(",") if x.strip()][:40]:
+        try:
+            datetime.strptime(d, "%Y-%m-%d")
+            dates.append(d)
+        except ValueError:
+            pass
+    if not dates:
+        return jsonify({"error": "dates must be a comma-separated list of YYYY-MM-DD"}), 400
+    st = _sector0925_state
+    days = _sector_0925_for_dates(dates, token)
+    return jsonify({"state": st["state"], "done": st["done"], "total": st["total"], "ok": st["ok"], "failed": st["failed"],
+                    "last_error": st["last_error"], "days": days})
 
 
 def resample_1min_to_5min(candles_1min: list) -> list[tuple[float, float, float, float]]:
@@ -7489,6 +7658,7 @@ def index():
         merged_count = sum(len(items) for _, items in grouped)
         for _, _items in grouped:
             _attach_volume_readings(_items, access_token, selected_date == today_str)
+            _attach_sector_0925(_items, selected_date, access_token)
             _items.sort(key=_volume_rank)   # Strong volume first (stable)
 
         html = render_template(
@@ -7573,6 +7743,7 @@ def api_alerts():
     # Directional-volume badge: reads a background-maintained cache, adds
     # no per-alert API calls to this request - see _attach_volume_readings.
     _attach_volume_readings(merged_alerts, access_token, selected_date == today_str)
+    _attach_sector_0925(merged_alerts, selected_date, access_token)
     # Strong volume first within each column (stable: newest-first kept within a rank)
     _cat_pos = {name: i for i, name in enumerate(CATEGORY_ORDER)}
     merged_alerts.sort(key=lambda a: (_cat_pos.get(a.get("category"), len(_cat_pos)), _volume_rank(a)))
@@ -9097,13 +9268,20 @@ def api_first_candle_board():
     rows = [_fc_table_row(r) for r in list(st["reports"])]
     rows.sort(key=lambda r: r["first_candle_ratio"] or 0, reverse=True)
     decisions = _decisions_by_symbol(date_str)   # read now, not cached with the board
+    try:
+        sec25 = _sector_0925_for_dates([date_str], token).get(date_str) or {}
+    except Exception:
+        sec25 = {}
     for r in rows:
         d = decisions.get(r["symbol"])
         r["decision"] = d["decision"] if d else None
         r["decision_reason"] = d["reason"] if d else None
         r["alert_names"] = (st.get("names") or {}).get(r["symbol"], [])
+        r["sector"] = SECTOR_MAP.get(r["symbol"])
+        r["sector_pct_0925"] = sec25.get(r["sector"]) if r["sector"] else None
     return jsonify({"date": date_str, "state": st["state"], "total": st["total"], "done": st["done"],
-                    "total_alerted": st.get("alerted", st["total"]), "error": st["error"], "rows": rows})
+                    "total_alerted": st.get("alerted", st["total"]), "error": st["error"], "rows": rows,
+                    "sector_0925_state": _sector0925_state["state"]})
 
 
 
