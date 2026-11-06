@@ -3977,6 +3977,12 @@ def _build_volume_reading(symbol: str, access_token: str, as_of_ist: datetime | 
             today_all = [c for c in raw if c[0][:10] == today]
             info = _fc_dashboard_info(prev_close, today_all, first_c)
             if info:
+                # Dir. pressure: the 09:15 candle's estimated buying (selling) volume vs its 10-session average
+                b0 = slots.get("09:15")
+                if b0 and b0["n"] >= _VOL_MIN_HISTORY_SESSIONS:
+                    fb, fs = _directional_pressure(first_c[2], first_c[3], first_c[4], float(first_c[5] or 0))
+                    info["pressure_buy"] = round(fb / b0["buy"], 2) if b0["buy"] > 0 else None
+                    info["pressure_sell"] = round(fs / b0["sell"], 2) if b0["sell"] > 0 else None
                 out["fc_info"] = info
         except Exception:
             pass
@@ -4094,6 +4100,7 @@ def _fc_for_alert(symbol: str | None, category: str) -> dict | None:
         "side": "buy" if is_buy else "sell",
         "share": info["buy_share"] if is_buy else round(100.0 - info["buy_share"], 1),
         "after_pct": info.get("after_pct"),
+        "pressure": info.get("pressure_buy") if is_buy else info.get("pressure_sell"),
         "extreme_label": "Day high" if is_buy else "Day low",
         "extreme_pct": info.get("day_high_pct") if is_buy else info.get("day_low_pct"),
         "last_pct": info.get("last_pct"),
