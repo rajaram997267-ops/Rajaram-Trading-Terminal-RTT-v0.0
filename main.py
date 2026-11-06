@@ -11209,62 +11209,9 @@ def api_auto_vol_action():
 
 @app.route("/exit-lab")
 def exit_lab_page():
-    bucket = request.args.get("bucket", "Strong")
-    if bucket not in ("Strong", "Moderate", "Weak", "All"):
-        bucket = "Strong"
-    liquid = request.args.get("liquid") == "1"
-    try:
-        cost = max(0.0, min(float(request.args.get("cost", 1.0)), 10.0))
-    except ValueError:
-        cost = 1.0
-    sort = request.args.get("sort", "avg")
-    try:
-        res = _exit_lab_run(bucket, liquid, cost)
-    except (psycopg2.Error, RuntimeError):
-        return "Database unavailable", 503
-    key = {"avg": ("avg", True), "pf": ("pf", True), "win": ("win", True), "worst": ("worst", True),
-           "risk": ("per_risk", True), "hold": ("hold", False)}.get(sort, ("avg", True))
-    rows = sorted(res["results"], key=lambda x: (x[key[0]] is None, -(x[key[0]] or 0) if key[1] else (x[key[0]] or 0)))
-    try:
-        with get_db() as conn:
-            open_trades = [dict(r) for r in conn.execute(
-                "SELECT id, symbol, strategy, live_status, entry_price FROM paper_trades WHERE status = 'OPEN'").fetchall()]
-    except (psycopg2.Error, RuntimeError):
-        open_trades = []
-    active = get_exit_strategy()
-    active_rule = _lab_rule_by_id(active)
-    try:
-        auto = _auto_state()
-    except (psycopg2.Error, RuntimeError):
-        auto = {"active": False, "live_ok": False, "fallback": "RSI_MOMENTUM", "fallback_name": "RSI_MOMENTUM",
-                "previous": "RSI_MOMENTUM", "default": "", "table": None}
-    try:
-        with get_db() as conn:
-            rt = [dict(r) for r in conn.execute(
-                "SELECT id, symbol, direction, pnl, exit_time FROM paper_trades WHERE status = 'CLOSED' ORDER BY id DESC LIMIT 40").fetchall()]
-        for r in rt:
-            ex = (datetime.fromisoformat(r["exit_time"]) + IST_OFFSET).strftime("%d %b %H:%M") if r.get("exit_time") else ""
-            r["label"] = f"#{r['id']} {r.get('symbol')} {r.get('direction')} - {ex} - P&L {fmt_inr(round(r.get('pnl') or 0), plus=True)}"
-        replay_trades = rt
-    except (psycopg2.Error, RuntimeError):
-        replay_trades = []
-    default_groups: dict = {}
-    for x in _exit_lab_strategies():
-        if x["live_ok"]:
-            default_groups.setdefault(x["family"], []).append({"id": x["id"], "name": x["name"]})
-    grid = []
-    for b in _AUTO_BUCKETS:
-        cells = []
-        for w, lo, hi in _AUTO_WINDOWS:
-            level, choice, why = _auto_resolve(auto["table"], b, w)
-            raw = (auto["table"] or {}).get("cells", {}).get(f"{b}|{w}") or {}
-            cells.append({"window": w, "level": level, "choice": choice, "why": why, "n": raw.get("n")})
-        grid.append({"bucket": b, "cells": cells})
-    return render_template("exit_lab.html", active_tab="exit_lab", res=res, rows=rows, bucket=bucket, liquid=liquid,
-                           cost=cost, sort=sort, open_trades=open_trades, active=active,
-                           active_label=("Auto (volume-driven)" if auto["active"] else (active_rule["name"] if active_rule else active)),
-                           active_is_lab=bool(active_rule), auto=auto, grid=grid, windows=_AUTO_WINDOWS,
-                           replay_trades=replay_trades, default_groups=default_groups)
+    # Only the RSI Simple / 1st 5 Min FIB history cards remain (each loads its own data when you press Show),
+    # so opening this page no longer replays every exit rule or reads the trade tables.
+    return render_template("exit_lab.html", active_tab="exit_lab")
 
 
 @app.route("/api/exit-lab/replay")
