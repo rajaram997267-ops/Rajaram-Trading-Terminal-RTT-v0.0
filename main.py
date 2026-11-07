@@ -742,6 +742,22 @@ def init_db():
             )
             """
         )
+        # ~09:25 IST snapshot of every F&O stock future's open interest (cannot be backfilled, so it is logged daily).
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS oi_snapshot (
+                date TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                oi DOUBLE PRECISION,
+                prev_oi DOUBLE PRECISION,
+                price_pct DOUBLE PRECISION,
+                vwap_pct DOUBLE PRECISION,
+                buy_qty DOUBLE PRECISION,
+                sell_qty DOUBLE PRECISION,
+                PRIMARY KEY (date, symbol)
+            )
+            """
+        )
         # Each sector's % change at 09:25 IST (average over its F&O stocks: close of the 09:20-09:25
         # 5-min candle vs the previous close). Fixed once stored - it never changes later in the day.
         conn.execute(
@@ -2249,6 +2265,7 @@ _instrument_debug: dict = {}
 # "instrument_key", "lot_size"} for every CE/PE contract on that underlying.
 _option_chain_cache: dict[str, list[dict]] = {}
 _option_debug: dict = {}
+_futures_cache: dict[str, list] = {}   # SYMBOL -> [(expiry 'YYYY-MM-DD', instrument_key)] for stock futures
 
 UPSTOX_INSTRUMENTS_URL = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
 
@@ -2286,7 +2303,7 @@ def _load_instrument_master() -> None:
     check /api/paper-trading/debug-instruments after the first real fetch
     and fix the column names there if option_matched_count is 0."""
     global _instrument_cache, _instrument_cache_date, _instrument_debug
-    global _option_chain_cache, _option_debug
+    global _option_chain_cache, _option_debug, _futures_cache
     try:
         req = urllib.request.Request(UPSTOX_INSTRUMENTS_URL, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -2309,6 +2326,7 @@ def _load_instrument_master() -> None:
         mapping = {}
         name_to_ticker: dict[str, str] = {}
         pending_options = []
+        pending_futs = []
         row_count = 0
         index_rows_seen = 0
         for i, row in enumerate(reader):
@@ -2345,6 +2363,8 @@ def _load_instrument_master() -> None:
                 # in case an alert name happens to match Upstox's own naming.
                 if tsym:
                     mapping.setdefault(tsym, ikey)
+            elif exch == "NSE_FO" and opt_type not in ("CE", "PE") and itype.startswith("FUT") and ikey:
+                pending_futs.append((tsym, (row.get("name") or "").upper(), row.get("expiry"), ikey))
             elif exch == "NSE_FO" and opt_type in ("CE", "PE") and ikey:
                 if len(fo_sample_rows) < 3:
                     fo_sample_rows.append(dict(row))
@@ -2390,6 +2410,16 @@ def _load_instrument_master() -> None:
                     "lot_size": lot_size,
                 })
 
+        futs: dict[str, list] = {}
+        for tsym, fname, fexp_raw, fkey in pending_futs:
+            fexp = _parse_expiry(fexp_raw)
+            first = tsym.split(" ")[0] if tsym else ""
+            fsym = first if first in mapping else name_to_ticker.get(fname)
+            if fsym and fexp:
+                futs.setdefault(fsym, []).append((fexp, fkey))
+        for v in futs.values():
+            v.sort()
+        _futures_cache = futs
         _instrument_cache = mapping
         _option_chain_cache = option_chains
         _instrument_cache_date = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
@@ -2421,6 +2451,7 @@ def _load_instrument_master() -> None:
         import traceback
         _instrument_cache = {}
         _option_chain_cache = {}
+        _futures_cache = {}
         _instrument_debug = {
             "ok": False,
             "error": str(e),
@@ -3201,6 +3232,240 @@ def api_sector_0925():
     days = _sector_0925_for_dates(dates, token)
     return jsonify({"state": st["state"], "done": st["done"], "total": st["total"], "ok": st["ok"], "failed": st["failed"],
                     "last_error": st["last_error"], "days": days})
+
+
+# ---------------------------------------------------------------------------
+# Market EYE: sector % at 09:25 and the change in futures open interest (OI) for the day's alerted stocks.
+# OI comes from Upstox (nearest stock future): today's OI from one batched quote call, the previous day's OI
+# from the daily futures candles (7th value). NSE's own OI-spurts page needs browser cookies and is often
+# blocked for cloud servers, so the same idea is built from Upstox data. Live view = no database use;
+# the database is touched once a day (the ~09:26 snapshot) and only when a past day is viewed.
+# ---------------------------------------------------------------------------
+_oi_prev: dict = {"date": None, "map": {}}
+_oi_state: dict = {"state": "idle", "done": 0, "total": 0, "ok": 0, "failed": 0, "last_error": None}
+_oi_lock = threading.Lock()
+_oi_quote_cache: dict = {"t": 0.0, "sig": None, "data": {}}
+OI_SNAPSHOT_WINDOW = ("09:26", "09:35")
+
+
+def _fut_key(symbol: str, today: str) -> str | None:
+    for exp, key in _futures_cache.get(symbol, []):
+        if exp >= today:
+            return key
+    return None
+
+
+def _oi_prev_fill(token: str, symbols: list, today: str) -> None:
+    """Previous session's closing OI for each symbol (from daily futures candles), kept in memory for the day."""
+    st = _oi_state
+    if _oi_prev["date"] != today:
+        _oi_prev["date"], _oi_prev["map"] = today, {}
+    st["total"], st["done"], st["ok"], st["failed"], st["last_error"] = len(symbols), 0, 0, 0, None
+    frm = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
+    for sym in symbols:
+        key = _fut_key(sym, today)
+        if key and sym not in _oi_prev["map"]:
+            try:
+                url = f"https://api.upstox.com/v3/historical-candle/{urllib.parse.quote(key, safe='|')}/days/1/{today}/{frm}"
+                req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": BROWSER_USER_AGENT,
+                                                           "Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    candles = ((json.loads(resp.read().decode()).get("data") or {}).get("candles")) or []
+                prev = [c for c in sorted(candles, key=lambda c: c[0]) if c[0][:10] < today and len(c) >= 7]
+                if prev:
+                    _oi_prev["map"][sym] = float(prev[-1][6] or 0)
+                st["ok"] += 1
+            except urllib.error.HTTPError as e:
+                st["failed"] += 1
+                st["last_error"] = f"{sym}: HTTP {e.code}"
+                if e.code == 429:
+                    time.sleep(2.0)
+            except Exception as e:
+                st["failed"] += 1
+                st["last_error"] = f"{sym}: {type(e).__name__}: {e}"
+            time.sleep(0.1)
+        st["done"] += 1
+
+
+def _oi_prev_job(token: str, symbols: list, today: str) -> None:
+    try:
+        _oi_prev_fill(token, symbols, today)
+        _oi_state["state"] = "done"
+    except Exception as e:
+        _oi_state["state"] = "error"
+        _oi_state["last_error"] = f"{type(e).__name__}: {e}"
+
+
+def _oi_quotes(symbols: list, token: str, today: str) -> dict:
+    """{symbol: {oi, ltp, price_pct, vwap_pct, buy_qty, sell_qty}} from Upstox full quotes (batches of 100)."""
+    key_to_sym = {}
+    for sym in symbols:
+        k = _fut_key(sym, today)
+        if k:
+            key_to_sym[k] = sym
+    out = {}
+    keys = list(key_to_sym)
+    for i in range(0, len(keys), 100):
+        batch = keys[i:i + 100]
+        url = "https://api.upstox.com/v2/market-quote/quotes?instrument_key=" + ",".join(urllib.parse.quote(k, safe="") for k in batch)
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": BROWSER_USER_AGENT,
+                                                   "Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = (json.loads(resp.read().decode()).get("data")) or {}
+        for v in data.values():
+            sym = key_to_sym.get(v.get("instrument_token"))
+            if not sym:
+                continue
+            ltp, net, avg = v.get("last_price"), v.get("net_change"), v.get("average_price")
+            base = (ltp - net) if (ltp is not None and net is not None) else None
+            out[sym] = {
+                "oi": v.get("oi"), "ltp": ltp,
+                "price_pct": round(net / base * 100, 2) if base else None,
+                "vwap_pct": round((ltp - avg) / avg * 100, 2) if (ltp and avg) else None,
+                "buy_qty": v.get("total_buy_quantity"), "sell_qty": v.get("total_sell_quantity"),
+            }
+    return out
+
+
+def _oi_reading(price_pct, oi_pct) -> str:
+    if price_pct is None or oi_pct is None:
+        return "-"
+    if price_pct >= 0:
+        return "Long build-up" if oi_pct >= 0 else "Short covering"
+    return "Short build-up" if oi_pct >= 0 else "Long unwinding"
+
+
+def _oi_row(sym: str, oi, prev_oi, price_pct, vwap_pct, side, buy_qty=None, sell_qty=None) -> dict:
+    chg = (oi - prev_oi) if (oi is not None and prev_oi) else None
+    pct = round(chg / prev_oi * 100, 2) if (chg is not None and prev_oi) else None
+    return {"symbol": sym, "side": side, "sector": SECTOR_MAP.get(sym), "oi": oi, "prev_oi": prev_oi,
+            "oi_chg": chg, "oi_chg_pct": pct, "price_pct": price_pct, "vwap_pct": vwap_pct,
+            "reading": _oi_reading(price_pct, pct), "buy_qty": buy_qty, "sell_qty": sell_qty}
+
+
+def _oi_snapshot_loop() -> None:
+    """Once per trading day, 09:26-09:35 IST: logs every F&O stock future's OI vs the previous day (one quote batch
+    + one database insert). Outside that window it does nothing, so Neon is never kept awake by it."""
+    done_date = None
+    while True:
+        try:
+            now = datetime.utcnow() + IST_OFFSET
+            today = now.strftime("%Y-%m-%d")
+            hm = now.strftime("%H:%M")
+            if now.weekday() < 5 and OI_SNAPSHOT_WINDOW[0] <= hm <= OI_SNAPSHOT_WINDOW[1] and done_date != today:
+                token = get_setting("upstox_access_token")
+                if token:
+                    if not _futures_cache:
+                        get_instrument_key("RELIANCE")            # loads the instrument master (and the futures)
+                    syms = sorted(_futures_cache)
+                    with _oi_lock:
+                        _oi_state["state"] = "running"
+                    _oi_prev_fill(token, syms, today)
+                    quotes = _oi_quotes(syms, token, today)
+                    rows = []
+                    for sym, q in quotes.items():
+                        prev = _oi_prev["map"].get(sym)
+                        if q["oi"] is not None and prev:
+                            rows.append((today, sym, q["oi"], prev, q["price_pct"], q["vwap_pct"], q["buy_qty"], q["sell_qty"]))
+                    if rows:
+                        with get_db() as conn:
+                            for r in rows:
+                                conn.execute(
+                                    "INSERT INTO oi_snapshot (date, symbol, oi, prev_oi, price_pct, vwap_pct, buy_qty, sell_qty) "
+                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (date, symbol) DO NOTHING", r)
+                            conn.commit()
+                    _oi_state["state"] = "done"
+                    done_date = today
+        except Exception as e:
+            _oi_state["state"] = "error"
+            _oi_state["last_error"] = f"{type(e).__name__}: {e}"
+            print(f"[oi-snapshot] {e}", flush=True)
+        time.sleep(45)
+
+
+_oi_thread_started = False
+
+
+def ensure_oi_loop_started() -> None:
+    global _oi_thread_started
+    if _oi_thread_started:
+        return
+    _oi_thread_started = True
+    threading.Thread(target=_oi_snapshot_loop, daemon=True, name="oi-snapshot").start()
+
+
+@app.route("/market-eye")
+def market_eye_page():
+    counts: dict = {}
+    for sym, sec in SECTOR_MAP.items():
+        if sec and sec != "Unclassified":
+            counts[sec] = counts.get(sec, 0) + 1
+    sectors = [{"name": k, "n": counts[k]} for k in sorted(counts)]
+    return render_template("market_eye.html", active_tab="market_eye", sectors=sectors,
+                           today=(datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d"))
+
+
+@app.route("/api/market-oi")
+def api_market_oi():
+    """?date=YYYY-MM-DD -> change in OI for that day's alerted stocks. Today = live; past days = the logged 09:26 snapshot."""
+    date_str = (request.args.get("date") or "").strip()
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    try:
+        sides: dict = {}
+        for a in _alerts_for_ist_date(date_str):
+            sym = (a.get("symbol") or "").strip().upper()
+            cat = categorize(a)
+            if sym and sym not in sides and cat in ("Buy", "Sell"):
+                sides[sym] = cat
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    if not sides:
+        return jsonify({"state": "done", "source": "none", "rows": [], "message": "no alerts on this date"})
+    if date_str < today:
+        try:
+            with get_db() as conn:
+                snap = conn.execute("SELECT * FROM oi_snapshot WHERE date = ?", (date_str,)).fetchall()
+        except (psycopg2.Error, RuntimeError):
+            return jsonify({"error": "database unavailable"}), 503
+        by = {r["symbol"]: r for r in snap}
+        rows = [_oi_row(sym, by[sym]["oi"], by[sym]["prev_oi"], by[sym]["price_pct"], by[sym]["vwap_pct"], side,
+                        by[sym]["buy_qty"], by[sym]["sell_qty"]) for sym, side in sides.items() if sym in by]
+        return jsonify({"state": "done", "source": "snapshot", "rows": rows, "alerted": len(sides),
+                        "message": None if rows else "no ~09:26 OI snapshot was logged for this day (it cannot be backfilled)"})
+    if date_str > today:
+        return jsonify({"state": "done", "source": "none", "rows": [], "message": "future date"})
+    token = get_setting("upstox_access_token")
+    if not token:
+        return jsonify({"error": "Upstox token missing"}), 400
+    if not _futures_cache:
+        get_instrument_key("RELIANCE")
+    syms = [s for s in sides if _fut_key(s, today)]
+    if _oi_prev["date"] != today:
+        _oi_prev["date"], _oi_prev["map"] = today, {}
+    missing = [s for s in syms if s not in _oi_prev["map"]]
+    if missing:
+        with _oi_lock:
+            if _oi_state["state"] != "running":
+                _oi_state["state"] = "running"
+                threading.Thread(target=_oi_prev_job, args=(token, missing, today), daemon=True).start()
+    sig = tuple(sorted(syms))
+    c = _oi_quote_cache
+    if c["sig"] != sig or time.time() - c["t"] > 20:
+        try:
+            c["data"], c["sig"], c["t"] = _oi_quotes(syms, token, today), sig, time.time()
+        except Exception as e:
+            return jsonify({"error": f"Upstox quote failed: {type(e).__name__}: {e}"}), 502
+    q = c["data"]
+    rows = [_oi_row(s, q[s]["oi"], _oi_prev["map"].get(s), q[s]["price_pct"], q[s]["vwap_pct"], sides[s],
+                    q[s]["buy_qty"], q[s]["sell_qty"]) for s in syms if s in q and s in _oi_prev["map"]]
+    return jsonify({"state": _oi_state["state"] if missing else "done", "source": "live", "rows": rows,
+                    "alerted": len(sides), "no_future": [s for s in sides if not _fut_key(s, today)],
+                    "done": _oi_state["done"], "total": _oi_state["total"], "failed": _oi_state["failed"],
+                    "last_error": _oi_state["last_error"], "as_of": (datetime.utcnow() + IST_OFFSET).strftime("%H:%M:%S")})
 
 
 def resample_1min_to_5min(candles_1min: list) -> list[tuple[float, float, float, float]]:
@@ -12451,6 +12716,7 @@ except Exception as _init_err:
     threading.Thread(target=_init_db_with_retry, daemon=True, name="init-db-retry").start()
 ensure_exit_check_loop_started()  # same: starts on import, tab-independent from here on
 ensure_shadow_loop_started()
+ensure_oi_loop_started()
 
 # ---------------------------------------------------------------------------
 # Date-wise "what if" reports (read-only, nothing is written to the DB):
