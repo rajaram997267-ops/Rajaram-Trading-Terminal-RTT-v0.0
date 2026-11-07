@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - Market EYE</title>
+  <style>
+    :root { --bg:#0b0e14; --panel:#131722; --border:#1e222d; --text:#e6e9f0; --muted:#6b7280; --green:#00c896; --gold:#ffb800; --red:#ff5370; }
+    :root[data-theme="light-gray"] { --red:#dc2626; --bg:#e9ebee; --panel:#ffffff; --border:#d0d4da; --text:#1a1d23; --muted:#6b7280; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="sky-blue"] { --red:#dc2626; --bg:#eaf4fb; --panel:#ffffff; --border:#bfe0f2; --text:#10222c; --muted:#4a6572; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="off-white"] { --red:#dc2626; --bg:#f7f5f0; --panel:#ffffff; --border:#e2ddd2; --text:#1f1c16; --muted:#6b6455; --green:#0e9f6e; --gold:#b45309; }
+    * { box-sizing: border-box; }
+    body { font-family:'Segoe UI',Arial,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px 32px 48px; }
+    a { color: var(--green); }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 2px; line-height: 1.5; }
+    .tabbar { display:flex; gap:4px; border-bottom:1px solid var(--border); margin:18px 0 20px; overflow-x:auto; }
+    .tabbar a { padding:10px 14px; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; white-space:nowrap; }
+    .tabbar a.active { color:var(--text); border-bottom-color:var(--green); }
+    .tabbar a:hover { color:var(--text); }
+    .cards { display:flex; gap:12px; flex-wrap:wrap; margin:0 0 18px; }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:10px 14px; font-size:11px; color:var(--muted); text-transform:uppercase; min-width:130px; }
+    .card b { display:block; font-size:18px; margin-top:4px; color:var(--text); text-transform:none; }
+    .card small { display:block; text-transform:none; margin-top:4px; font-size:12px; color:var(--muted); max-width:260px; line-height:1.4; }
+    .wrap { overflow-x:auto; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
+    table { border-collapse:collapse; width:100%; font-size:12px; }
+    th, td { border-bottom:1px solid var(--border); padding:7px 9px; text-align:left; white-space:nowrap; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; }
+    tr:last-child td { border-bottom:none; }
+    .sw { position:relative; display:inline-block; width:46px; height:24px; vertical-align:middle; }
+    .sw input { opacity:0; width:0; height:0; }
+    .sw .slider { position:absolute; inset:0; background:var(--border); border-radius:24px; cursor:pointer; transition:.2s; }
+    .sw .slider:before { content:""; position:absolute; height:18px; width:18px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; }
+    .sw input:checked + .slider { background:var(--green); }
+    .sw input:checked + .slider:before { transform:translateX(22px); }
+    .pos { color:var(--green); } .neg { color:var(--red); } .mut { color:var(--muted); }
+    .ctl { margin:10px 0; font-size:13px; color:var(--muted); }
+    .ctl a { margin-right:10px; } .ctl a.on { color:var(--text); font-weight:600; text-decoration:none; }
+    .warn { background:var(--panel); border:1px solid var(--gold); border-radius:8px; padding:10px 14px; font-size:12.5px; line-height:1.55; margin:14px 0; }
+    .fam { color:var(--muted); font-size:11px; }
+    h3 { margin:26px 0 6px; }
+    button.pick { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:3px 8px; font-size:11px; cursor:pointer; margin-right:4px; }
+    button.pick:hover:not(:disabled) { border-color:var(--green); color:var(--green); }
+    button.pick:disabled { opacity:.4; cursor:not-allowed; }
+  </style>
+</head>
+<body>
+  <h2 style="margin:0">Market EYE &#128065;&#65039; <span style="color:var(--muted);font-weight:400;font-size:14px">RTT v0.0</span></h2>
+  <div class="sub">Sector performance at 09:25 and the change in open interest (OI) of the day's alerted stocks. Read-only.</div>
+  <div class="tabbar">
+    <a href="/">Dashboard</a>
+    <a href="/paper-trading">Paper Trading</a>
+    <a href="/live-trading">Live Trading</a>
+    <a href="/stats">Stats</a>
+    <a href="/websocket-stats">WS Speed</a>
+    <a href="/settings">Settings</a>
+    <a href="/shadow">Manual vs RSI</a>
+    <a href="/exit-lab" class="{% if active_tab == 'exit_lab' %}active{% endif %}">Exit Lab</a>
+    <a href="/first-candle" class="{% if active_tab == 'first_candle' %}active{% endif %}">First Candle</a>
+    <a href="/exit-compare" class="{% if active_tab == 'exit_compare' %}active{% endif %}">Exit Compare</a>
+    <a href="/market-eye" class="{% if active_tab == 'market_eye' %}active{% endif %}">Market EYE &#128065;&#65039;</a>
+  </div>
+
+  <div class="ctl">Date <input type="date" id="meDate" value="{{ today }}" max="{{ today }}" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;">
+    <button id="meLoad" style="padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--green);color:#fff;cursor:pointer;margin-left:6px;">Load</button>
+    <span id="meStatus" class="mut" style="margin-left:10px;"></span></div>
+
+  <h3>Sector Performance at 09:25 AM</h3>
+  <div class="sub" style="margin-bottom:8px;">Average % change of the sector's F&amp;O stocks at 09:25 IST against the previous close. Fixed for the day once calculated.</div>
+  <div class="wrap"><table><thead><tr><th>Sector</th><th>Stocks</th><th>% at 09:25</th></tr></thead><tbody id="secBody"></tbody></table></div>
+
+  <h3>Change in Open Interest (OI)</h3>
+  <div class="sub" style="margin-bottom:8px;">Nearest stock future of each stock that had a Buy or Sell alert on the date. Today = live from Upstox; earlier days = the ~09:26 snapshot logged each morning (it cannot be backfilled, so days before logging started stay empty). Same idea as NSE's OI Spurts page, built from Upstox data because NSE blocks cloud servers.</div>
+  <div class="wrap"><table><thead><tr>
+    <th>Symbol</th><th>Alert</th><th>Sector</th><th>OI (prev day)</th><th>OI (now)</th><th>Change</th><th>Change %</th><th>Price %</th><th>vs VWAP %</th><th>Reading</th>
+  </tr></thead><tbody id="oiBody"></tbody></table></div>
+  <div class="sub" id="oiNote" style="margin-top:8px;"></div>
+  <div class="sub" style="margin-top:6px;">Reading: price up + OI up = long build-up; price down + OI up = short build-up; price up + OI down = short covering (weaker); price down + OI down = long unwinding.</div>
+
+  <script>
+    const SECTORS = {{ sectors|tojson }};
+    const $ = id => document.getElementById(id);
+    const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+    const fmt = n => n == null ? "-" : Math.round(n).toLocaleString("en-IN");
+    const pct = (v, d) => v == null ? '<span class="mut">-</span>' : '<span class="' + (v > 0 ? "pos" : v < 0 ? "neg" : "") + '">' + (v > 0 ? "+" : "") + v.toFixed(d == null ? 2 : d) + "%</span>";
+    const sgn = n => n == null ? "-" : '<span class="' + (n > 0 ? "pos" : n < 0 ? "neg" : "") + '">' + (n > 0 ? "+" : "") + Math.round(n).toLocaleString("en-IN") + "</span>";
+    let timer = null, token = 0, sortKey = "oi_chg_pct", sortDir = -1, oiRows = [];
+
+    function renderSectors(map, note) {
+      const rows = SECTORS.map(s => ({ name: s.name, n: s.n, p: map && map[s.name] != null ? map[s.name] : null }));
+      rows.sort((a, b) => (b.p == null ? -999 : b.p) - (a.p == null ? -999 : a.p));
+      $("secBody").innerHTML = rows.map(r => "<tr><td>" + esc(r.name) + "</td><td>" + r.n + "</td><td>" + pct(r.p) + "</td></tr>").join("");
+      if (note) $("meStatus").textContent = note;
+    }
+
+    function renderOi() {
+      const rows = oiRows.slice().sort((a, b) => {
+        const x = a[sortKey], y = b[sortKey];
+        if (x == null && y == null) return 0;
+        if (x == null) return 1;
+        if (y == null) return -1;
+        return typeof x === "string" ? sortDir * x.localeCompare(y) : sortDir * (x - y);
+      });
+      $("oiBody").innerHTML = rows.map(r => "<tr><td><b>" + esc(r.symbol) + "</b></td><td>" + esc(r.side) + "</td><td>" + esc(r.sector || "-") + "</td><td>" +
+        fmt(r.prev_oi) + "</td><td>" + fmt(r.oi) + "</td><td>" + sgn(r.oi_chg) + "</td><td>" + pct(r.oi_chg_pct) + "</td><td>" + pct(r.price_pct) + "</td><td>" + pct(r.vwap_pct) + "</td><td>" + esc(r.reading) + "</td></tr>").join("");
+    }
+    const KEYS = ["symbol", "side", "sector", "prev_oi", "oi", "oi_chg", "oi_chg_pct", "price_pct", "vwap_pct", "reading"];
+    // sortable OI headers
+    Array.from(document.querySelectorAll("table")[1].querySelectorAll("th")).forEach((th, i) => {
+      th.style.cursor = "pointer";
+      th.onclick = () => { const k = KEYS[i]; sortDir = (sortKey === k) ? -sortDir : -1; sortKey = k; renderOi(); };
+    });
+
+    async function loadSectors(date, my) {
+      try {
+        const r = await fetch("/api/sector-0925?dates=" + date);
+        const d = await r.json();
+        if (my !== token) return;
+        const map = (d.days || {})[date] || {};
+        const has = Object.keys(map).length > 0;
+        renderSectors(map);
+        if (!has && d.state === "running") { $("meStatus").textContent = "Calculating sector % (one-time per day)..."; timer = setTimeout(() => loadSectors(date, my), 4000); }
+        else if (!has) $("meStatus").textContent = "No 09:25 sector data for this date yet (available after 09:26 IST on trading days)." + (d.last_error ? " Upstox: " + d.last_error : "");
+      } catch (e) { $("meStatus").textContent = "Could not load sectors."; }
+    }
+
+    async function loadOi(date, my) {
+      try {
+        const r = await fetch("/api/market-oi?date=" + date);
+        const d = await r.json();
+        if (my !== token) return;
+        if (d.error) { $("oiNote").textContent = d.error; return; }
+        oiRows = d.rows || [];
+        renderOi();
+        let note = d.message || "";
+        if (d.source === "live") {
+          note = oiRows.length + " of " + d.alerted + " alerted stocks, live as of " + d.as_of + " IST.";
+          if (d.state === "running") note += " Reading previous-day OI: " + d.done + " of " + d.total + "...";
+          if ((d.no_future || []).length) note += " No stock future found for: " + d.no_future.join(", ") + ".";
+          if (d.last_error) note += " Upstox: " + d.last_error;
+          if (d.state === "running") timer = setTimeout(() => loadOi(date, my), 3000);
+          else if ($("meDate").value === "{{ today }}") timer = setTimeout(() => loadOi(date, my), 30000);
+        } else if (d.source === "snapshot") {
+          note = oiRows.length + " of " + d.alerted + " alerted stocks from the ~09:26 snapshot." + (d.message ? " " + d.message : "");
+        }
+        $("oiNote").textContent = note;
+      } catch (e) { $("oiNote").textContent = "Could not load OI."; }
+    }
+
+    function loadAll() {
+      clearTimeout(timer); token++;
+      const date = $("meDate").value;
+      $("meStatus").textContent = "Loading...";
+      renderSectors({}); oiRows = []; renderOi(); $("oiNote").textContent = "";
+      loadSectors(date, token);
+      loadOi(date, token);
+    }
+    $("meLoad").onclick = loadAll;
+    $("meDate").onchange = loadAll;
+    loadAll();
+  </script>
+</body>
+</html>
