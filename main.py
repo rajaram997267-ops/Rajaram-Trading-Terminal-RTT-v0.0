@@ -742,6 +742,8 @@ def init_db():
             )
             """
         )
+        for _col in ("buy_val", "sell_val", "buy_stocks", "sell_stocks"):
+            conn.execute(f"ALTER TABLE sector_0925 ADD COLUMN IF NOT EXISTS {_col} DOUBLE PRECISION")
         # ~09:25 IST snapshot of every F&O stock future's open interest (cannot be backfilled, so it is logged daily).
         conn.execute(
             """
@@ -3071,20 +3073,44 @@ def _sector0925_date_ready(date_str: str, now_ist: datetime) -> bool:
     return date_str < today or (now_ist.hour, now_ist.minute) >= SECTOR_0925_READY_AFTER
 
 
-def _sector_0925_load(date_str: str) -> dict:
-    """{sector: pct} stored for the day, or {}."""
-    got = _sector0925_mem.get(date_str)
+_sector0925_full_mem: dict = {}       # date -> {sector: {...}} once the day has flow figures too
+_sector0925_partial: dict = {}        # date -> (time, rows): short-lived copy of days that are empty / still lack flow,
+                                      # so dashboard polls do not hit the database every few seconds
+
+
+def _sector_0925_full(date_str: str) -> dict:
+    """{sector: {pct, n, buy_val, sell_val, buy_stocks, sell_stocks}} stored for the day, or {}.
+    Cached in memory only when the flow figures are present (older rows get recalculated once)."""
+    got = _sector0925_full_mem.get(date_str)
     if got:
         return got
+    hit = _sector0925_partial.get(date_str)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
     try:
         with get_db() as conn:
-            rows = conn.execute("SELECT sector, pct FROM sector_0925 WHERE date = ?", (date_str,)).fetchall()
+            rows = conn.execute("SELECT sector, pct, n, buy_val, sell_val, buy_stocks, sell_stocks FROM sector_0925 WHERE date = ?",
+                                (date_str,)).fetchall()
     except Exception:
         return {}
-    out = {r["sector"]: float(r["pct"]) for r in rows if r["pct"] is not None}
-    if out:
-        _sector0925_mem[date_str] = out
+    out = {r["sector"]: {"pct": float(r["pct"]) if r["pct"] is not None else None, "n": r["n"],
+                         "buy_val": r["buy_val"], "sell_val": r["sell_val"],
+                         "buy_stocks": r["buy_stocks"], "sell_stocks": r["sell_stocks"]} for r in rows}
+    if out and all(v["buy_val"] is not None for v in out.values()):
+        _sector0925_full_mem[date_str] = out
+    else:
+        _sector0925_partial[date_str] = (time.time(), out)
     return out
+
+
+def _sector_0925_has_flow(date_str: str) -> bool:
+    full = _sector_0925_full(date_str)
+    return bool(full) and all(v["buy_val"] is not None for v in full.values())
+
+
+def _sector_0925_load(date_str: str) -> dict:
+    """{sector: pct} stored for the day, or {}."""
+    return {k: v["pct"] for k, v in _sector_0925_full(date_str).items() if v["pct"] is not None}
 
 
 def _sector_0925_worker(token: str, dates: list) -> None:
@@ -3099,6 +3125,7 @@ def _sector_0925_worker(token: str, dates: list) -> None:
         if not universe:
             st["last_error"] = "no F&O symbols resolved to an Upstox instrument key"
         sums: dict = {d: {} for d in dates}        # date -> {sector: [total, count]}
+        flows: dict = {d: {} for d in dates}       # date -> {sector: [buy_value, sell_value, buy_stocks, sell_stocks]}
         hdr = lambda: {"Accept": "application/json", "User-Agent": BROWSER_USER_AGENT, "Authorization": f"Bearer {token}"}
 
         def get_candles(url: str) -> list:
@@ -3124,6 +3151,22 @@ def _sector_0925_worker(token: str, dates: list) -> None:
                 st["ok"] += 1
                 closes = [(c[0][:10], float(c[4] or 0)) for c in daily]
                 at_0920 = {c[0][:10]: float(c[4] or 0) for c in five if c[0][11:16] == "09:20"}
+                early: dict = {}
+                for c in five:
+                    if c[0][11:16] in ("09:15", "09:20"):
+                        e = early.setdefault(c[0][:10], [0.0, 0.0, 0.0])
+                        b, sv = _directional_pressure(c[2], c[3], c[4], c[5])
+                        e[0] += b
+                        e[1] += sv
+                        e[2] = float(c[4] or 0)          # price of the latest of the two candles
+                for d in dates:
+                    if d in early and early[d][2] > 0:
+                        eb, es, ep = early[d]
+                        fl = flows[d].setdefault(sector, [0.0, 0.0, 0, 0])
+                        fl[0] += eb * ep
+                        fl[1] += es * ep
+                        fl[2] += 1 if eb > es else 0
+                        fl[3] += 1 if es > eb else 0
                 for d in dates:
                     px = at_0920.get(d)
                     prev = next((cl for dd, cl in reversed(closes) if dd < d and cl > 0), None)
@@ -3146,12 +3189,20 @@ def _sector_0925_worker(token: str, dates: list) -> None:
             for d, secs in sums.items():
                 for sector, (tot, n) in secs.items():
                     if n > 0:
+                        fl = flows[d].get(sector, [0.0, 0.0, 0, 0])
                         conn.execute(
-                            "INSERT INTO sector_0925 (date, sector, pct, n) VALUES (?, ?, ?, ?) "
-                            "ON CONFLICT (date, sector) DO UPDATE SET pct = excluded.pct, n = excluded.n",
-                            (d, sector, round(tot / n, 2), n))
+                            "INSERT INTO sector_0925 (date, sector, pct, n, buy_val, sell_val, buy_stocks, sell_stocks) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                            "ON CONFLICT (date, sector) DO UPDATE SET pct = excluded.pct, n = excluded.n, "
+                            "buy_val = excluded.buy_val, sell_val = excluded.sell_val, "
+                            "buy_stocks = excluded.buy_stocks, sell_stocks = excluded.sell_stocks",
+                            (d, sector, round(tot / n, 2), n, fl[0], fl[1], fl[2], fl[3]))
                         stored += 1
             conn.commit()
+        for d in dates:
+            _sector0925_mem.pop(d, None)
+            _sector0925_full_mem.pop(d, None)
+            _sector0925_partial.pop(d, None)
         if st["ok"] > 0:
             st["attempted"].update(dates)           # only remember a day as tried if Upstox answered
         st["state"] = "done"
@@ -3169,7 +3220,7 @@ def _sector_0925_for_dates(dates: list, token: str | None) -> dict:
     for d in dates:
         got = _sector_0925_load(d)
         out[d] = got
-        if not got and _sector0925_date_ready(d, now_ist) and d not in _sector0925_state["attempted"]:
+        if not _sector_0925_has_flow(d) and _sector0925_date_ready(d, now_ist) and d not in _sector0925_state["attempted"]:
             missing.append(d)
     if missing and token:
         with _sector0925_lock:
@@ -3403,6 +3454,36 @@ def market_eye_page():
     sectors = [{"name": k, "n": counts[k]} for k in sorted(counts)]
     return render_template("market_eye.html", active_tab="market_eye", sectors=sectors,
                            today=(datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d"))
+
+
+@app.route("/api/market-eye-sectors")
+def api_market_eye_sectors():
+    """?date=YYYY-MM-DD -> each sector's % at 09:25 and the estimated buying/selling flow of its F&O stocks
+    over the first two candles (09:15-09:25), plus market breadth (stocks with more buying than selling)."""
+    date_str = (request.args.get("date") or "").strip()
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    token = get_setting("upstox_access_token")
+    _sector_0925_for_dates([date_str], token)             # starts the one-time calculation if the day is missing
+    full = _sector_0925_full(date_str)
+    sectors, tb, ts = [], 0, 0
+    for name, v in full.items():
+        bv, sv = v.get("buy_val"), v.get("sell_val")
+        has = bv is not None and sv is not None
+        tot = (bv + sv) if has else 0
+        sectors.append({"name": name, "pct": v["pct"], "n": v["n"],
+                        "flow_cr": round((bv - sv) / 1e7, 1) if has else None,
+                        "flow_pct": round((bv - sv) / tot * 100, 1) if has and tot > 0 else None,
+                        "buy_stocks": int(v["buy_stocks"]) if v.get("buy_stocks") is not None else None,
+                        "sell_stocks": int(v["sell_stocks"]) if v.get("sell_stocks") is not None else None})
+        tb += int(v["buy_stocks"] or 0)
+        ts += int(v["sell_stocks"] or 0)
+    st = _sector0925_state
+    return jsonify({"state": st["state"], "done": st["done"], "total": st["total"], "last_error": st["last_error"],
+                    "ready": _sector_0925_has_flow(date_str), "sectors": sectors,
+                    "breadth": {"buy": tb, "sell": ts}})
 
 
 @app.route("/api/market-oi")
