@@ -67,7 +67,9 @@
 
   <h3>Sector Performance at 09:25 AM</h3>
   <div class="sub" style="margin-bottom:8px;">Average % change of the sector's F&amp;O stocks at 09:25 IST against the previous close. Fixed for the day once calculated.</div>
-  <div class="wrap"><table><thead><tr><th>Sector</th><th>Stocks</th><th>% at 09:25</th></tr></thead><tbody id="secBody"></tbody></table></div>
+  <div id="breadth" class="sub" style="margin-bottom:8px;font-size:13px;"></div>
+  <div class="wrap"><table><thead><tr><th>Sector</th><th>Stocks</th><th>% at 09:25</th><th>Est. net flow (&#8377; cr)</th><th>Flow %</th><th>Buy / Sell stocks</th></tr></thead><tbody id="secBody"></tbody></table></div>
+  <div class="sub" style="margin-top:8px;">Estimated flow = the first two candles (09:15&ndash;09:25) of each F&amp;O stock, volume split into buying and selling by where each candle closes in its range, in &#8377;. Net flow = buying minus selling; Flow % = net &divide; total. Buy / Sell stocks = how many stocks had more estimated buying than selling. It is an estimate from price and volume, not real institutional orders.</div>
 
   <h3>Change in Open Interest (OI)</h3>
   <div class="sub" style="margin-bottom:8px;">Nearest stock future of each stock that had a Buy or Sell alert on the date. Today = live from Upstox; earlier days = the ~09:26 snapshot logged each morning (it cannot be backfilled, so days before logging started stay empty). Same idea as NSE's OI Spurts page, built from Upstox data because NSE blocks cloud servers.</div>
@@ -86,12 +88,17 @@
     const sgn = n => n == null ? "-" : '<span class="' + (n > 0 ? "pos" : n < 0 ? "neg" : "") + '">' + (n > 0 ? "+" : "") + Math.round(n).toLocaleString("en-IN") + "</span>";
     let timer = null, token = 0, sortKey = "oi_chg_pct", sortDir = -1, oiRows = [];
 
-    function renderSectors(map, note) {
-      const rows = SECTORS.map(s => ({ name: s.name, n: s.n, p: map && map[s.name] != null ? map[s.name] : null }));
-      rows.sort((a, b) => (b.p == null ? -999 : b.p) - (a.p == null ? -999 : a.p));
-      $("secBody").innerHTML = rows.map(r => "<tr><td>" + esc(r.name) + "</td><td>" + r.n + "</td><td>" + pct(r.p) + "</td></tr>").join("");
-      if (note) $("meStatus").textContent = note;
+    function renderSectors(list, breadth) {
+      const by = {};
+      (list || []).forEach(x => { by[x.name] = x; });
+      const rows = SECTORS.map(s => Object.assign({ name: s.name, n: s.n, pct: null, flow_cr: null, flow_pct: null, buy_stocks: null, sell_stocks: null }, by[s.name] || {}));
+      rows.sort((a, b) => (b.pct == null ? -999 : b.pct) - (a.pct == null ? -999 : a.pct));
+      $("secBody").innerHTML = rows.map(r => "<tr><td>" + esc(r.name) + "</td><td>" + r.n + "</td><td>" + pct(r.pct) + "</td><td>" + sgn1(r.flow_cr) + "</td><td>" + pct(r.flow_pct, 1) + "</td><td>" +
+        (r.buy_stocks == null ? '<span class="mut">-</span>' : '<span class="pos">' + r.buy_stocks + '</span> / <span class="neg">' + r.sell_stocks + "</span>") + "</td></tr>").join("");
+      const b = breadth || {};
+      $("breadth").innerHTML = (b.buy || b.sell) ? "Market breadth at 09:25: <b class=\"pos\">&#9650; " + b.buy + " buy pressure</b> &middot; <b class=\"neg\">&#9660; " + b.sell + " sell pressure</b> (of " + (b.buy + b.sell) + " F&amp;O stocks with a reading)" : "";
     }
+    const sgn1 = n => n == null ? '<span class="mut">-</span>' : '<span class="' + (n > 0 ? "pos" : n < 0 ? "neg" : "") + '">' + (n > 0 ? "+" : "") + n.toFixed(1) + "</span>";
 
     function renderOi() {
       const rows = oiRows.slice().sort((a, b) => {
@@ -113,14 +120,14 @@
 
     async function loadSectors(date, my) {
       try {
-        const r = await fetch("/api/sector-0925?dates=" + date);
+        const r = await fetch("/api/market-eye-sectors?date=" + date);
         const d = await r.json();
         if (my !== token) return;
-        const map = (d.days || {})[date] || {};
-        const has = Object.keys(map).length > 0;
-        renderSectors(map);
-        if (!has && d.state === "running") { $("meStatus").textContent = "Calculating sector % (one-time per day)..."; timer = setTimeout(() => loadSectors(date, my), 4000); }
-        else if (!has) $("meStatus").textContent = "No 09:25 sector data for this date yet (available after 09:26 IST on trading days)." + (d.last_error ? " Upstox: " + d.last_error : "");
+        if (d.error) { $("meStatus").textContent = d.error; return; }
+        renderSectors(d.sectors, d.breadth);
+        if (!d.ready && d.state === "running") { $("meStatus").textContent = "Calculating sector % and flow (one-time per day): " + d.done + " of " + d.total + " stocks..."; timer = setTimeout(() => loadSectors(date, my), 4000); }
+        else if (!d.ready) $("meStatus").textContent = (d.sectors || []).length ? "Flow figures not ready for this date." : "No 09:25 data for this date yet (available after 09:26 IST on trading days)." + (d.last_error ? " Upstox: " + d.last_error : "");
+        else $("meStatus").textContent = "";
       } catch (e) { $("meStatus").textContent = "Could not load sectors."; }
     }
 
@@ -151,7 +158,7 @@
       clearTimeout(timer); token++;
       const date = $("meDate").value;
       $("meStatus").textContent = "Loading...";
-      renderSectors({}); oiRows = []; renderOi(); $("oiNote").textContent = "";
+      renderSectors([], null); oiRows = []; renderOi(); $("oiNote").textContent = "";
       loadSectors(date, token);
       loadOi(date, token);
     }
