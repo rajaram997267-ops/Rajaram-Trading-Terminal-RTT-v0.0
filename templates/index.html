@@ -209,6 +209,9 @@
     .sec-chip { font-size: 10px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       max-width: 170px; padding: 1px 6px; border-radius: 8px; background: rgba(127,127,127,0.14); color: var(--muted); }
     .dp-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--border); color: var(--muted); cursor: help; }
+    .oi-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 7px; border-radius: 8px; border: 1px solid transparent; cursor: help; background: rgba(127,127,127,0.18); color: var(--muted); }
+    .oi-chip.up { background: #0a6b3f; border-color: #0a6b3f; color: #fff; }
+    .oi-chip.down { background: #c62839; border-color: #c62839; color: #fff; }
     .mv-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 6px; border-radius: 8px; border: 1px solid currentColor; cursor: help; }
     .mv-chip.pos { color: var(--green); }
     .mv-chip.neg { color: #ff5370; }
@@ -615,7 +618,7 @@
                 {% for alert in items %}
                 <div class="list-row{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}{% if alert['confirmed_count'] and alert['confirmed_count'] >= 3 %} triple-confirmed{% endif %}" data-sector="{{ alert['sector'] }}" {% if alert["alert_name"] %}title="{{ alert['alert_name'] }}"{% endif %}>
                   <div class="row-top">
-                    <span class="sym-wrap"><span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>{% if alert.get("sector") and alert.get("sector") != "Unclassified" %}<span class="sec-chip{% if alert.get('sector_0925') is not none %}{{ ' pos' if alert['sector_0925'] > 0 else (' neg' if alert['sector_0925'] < 0 else '') }}{% endif %}" title="Sector {{ alert['sector'] }}{% if alert.get('sector_0925') is not none %}: {{ '%+.2f'|format(alert['sector_0925']) }}% at 09:25 IST (fixed for the day){% else %}: 09:25 value not available yet{% endif %}">{{ alert['sector'] }}{% if alert.get('sector_0925') is not none %} {{ '%+.2f'|format(alert['sector_0925']) }}%{% endif %}</span>{% endif %}{% set _fcp = alert.get("fc") %}{% if _fcp and _fcp.get("pressure") is not none %}<span class="dp-chip{{ ' good' if _fcp['pressure'] >= 3 else '' }}" title="Dir. pressure {{ '%.2f'|format(_fcp['pressure']) }}x: estimated {{ _fcp['side'] }}ing volume of the 9:15 candle vs its 10-session average">Pressure {{ '%.1f'|format(_fcp['pressure']) }}&times;</span>{% endif %}{% set _mv = alert.get("fno_rank") %}{% if _mv %}<span class="mv-chip {{ 'pos' if _mv['type'] == 'gain' else 'neg' }}" title="{{ 'Top F&O gainer' if _mv['type'] == 'gain' else 'Top F&O loser' }} #{{ _mv['rank'] }} vs the previous close, as of {{ _mv['as_of'] }}">{{ '&uarr;'|safe if _mv['type'] == 'gain' else '&darr;'|safe }} #{{ _mv['rank'] }} {{ '%+.2f'|format(_mv['pct']) }}%</span>{% endif %}</span>
+                    <span class="sym-wrap"><span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>{% if alert.get("sector") and alert.get("sector") != "Unclassified" %}<span class="sec-chip{% if alert.get('sector_0925') is not none %}{{ ' pos' if alert['sector_0925'] > 0 else (' neg' if alert['sector_0925'] < 0 else '') }}{% endif %}" title="Sector {{ alert['sector'] }}{% if alert.get('sector_0925') is not none %}: {{ '%+.2f'|format(alert['sector_0925']) }}% at 09:25 IST (fixed for the day){% else %}: 09:25 value not available yet{% endif %}">{{ alert['sector'] }}{% if alert.get('sector_0925') is not none %} {{ '%+.2f'|format(alert['sector_0925']) }}%{% endif %}</span>{% endif %}{% set _fcp = alert.get("fc") %}{% if _fcp and _fcp.get("pressure") is not none %}<span class="dp-chip{{ ' good' if _fcp['pressure'] >= 3 else '' }}" title="Dir. pressure {{ '%.2f'|format(_fcp['pressure']) }}x: estimated {{ _fcp['side'] }}ing volume of the 9:15 candle vs its 10-session average">Pressure {{ '%.1f'|format(_fcp['pressure']) }}&times;</span>{% endif %}{% set _mv = alert.get("fno_rank") %}{% if _mv %}<span class="mv-chip {{ 'pos' if _mv['type'] == 'gain' else 'neg' }}" title="{{ 'Top F&O gainer' if _mv['type'] == 'gain' else 'Top F&O loser' }} #{{ _mv['rank'] }} vs the previous close, as of {{ _mv['as_of'] }}">{{ '&uarr;'|safe if _mv['type'] == 'gain' else '&darr;'|safe }} #{{ _mv['rank'] }} {{ '%+.2f'|format(_mv['pct']) }}%</span>{% endif %}{% set _ot = alert.get("oi_trend") %}{% if _ot %}<span class="oi-chip {{ _ot['dir'] }}" title="Open interest vs previous day">OI {% if _ot['open_pct'] is not none %}{{ '%+.2f'|format(_ot['open_pct']) }}% &rarr; {% endif %}{{ '%+.2f'|format(_ot['now_pct']) }}%{{ ' &#9650;'|safe if _ot['dir'] == 'up' else (' &#9660;'|safe if _ot['dir'] == 'down' else '') }}</span>{% endif %}</span>
                     <span class="price-wrap"><span class="price">{{ (alert["trigger_price"] or "-")|inr }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '{{ (alert['symbol'] or '')|escape }}')" title="Fetch live price">&#8635;</button>
                   </div>
                   {% if alert.get("volume") %}
@@ -718,7 +721,7 @@
       return `
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
-            <span class="sym-wrap"><span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>${secChipHtml(a)}${dirChipHtml(a)}${moverChipHtml(a)}</span>
+            <span class="sym-wrap"><span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>${secChipHtml(a)}${dirChipHtml(a)}${moverChipHtml(a)}${oiChipHtml(a)}</span>
             <span class="price-wrap"><span class="price">${escapeHtml(String(inr(a.trigger_price || "-")))}</span>${pctBadge}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '${escapeHtml(a.symbol || "")}')" title="Fetch live price">&#8635;</button>
           </div>
           ${volHtml}
@@ -760,6 +763,17 @@
       const up = m.type === "gain";
       const tip = (up ? "Top F&O gainer #" : "Top F&O loser #") + m.rank + " vs the previous close, as of " + (m.as_of || "");
       return `<span class="mv-chip ${up ? "pos" : "neg"}" title="${escapeHtml(tip)}">${up ? "&uarr;" : "&darr;"} #${m.rank} ${m.pct > 0 ? "+" : ""}${m.pct}%</span>`;
+    }
+
+    // OI change vs the previous day at the 09:15 candle and now. Dark green = OI rising since 09:15, red = falling.
+    function oiChipHtml(a) {
+      const o = a.oi_trend;
+      if (!o) return "";
+      const f = v => (v > 0 ? "+" : "") + Number(v).toFixed(2) + "%";
+      const arrow = o.dir === "up" ? " &#9650;" : o.dir === "down" ? " &#9660;" : "";
+      const text = (o.open_pct === null || o.open_pct === undefined) ? "OI " + f(o.now_pct) : "OI " + f(o.open_pct) + " &rarr; " + f(o.now_pct);
+      const tip = "Open interest vs previous day: " + (o.open_pct === null || o.open_pct === undefined ? "09:15 value not available" : "09:15 candle " + f(o.open_pct)) + ", now " + f(o.now_pct) + (o.dir === "up" ? " (rising)" : o.dir === "down" ? " (falling)" : "");
+      return `<span class="oi-chip ${o.dir}" title="${escapeHtml(tip)}">${text}${arrow}</span>`;
     }
 
     function fcLineHtml(fc) {
