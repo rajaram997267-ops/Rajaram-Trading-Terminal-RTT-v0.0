@@ -558,6 +558,8 @@
         <option value="volume">Sort: volume strength</option>
         <option value="share">Sort: 9:15 buy share</option>
         <option value="pressure">Sort: direction pressure</option>
+        <option value="oipct">Sort: OI % (latest)</option>
+        <option value="oirise">Sort: OI % rise since 9:15</option>
       </select>
       <div class="count">alerts this day: <b id="dayCount">{{ alerts_count }}</b></div>
       <form method="post" action="/clear" onsubmit="return confirm('Clear all saved alerts (all days)?');">
@@ -898,13 +900,19 @@
     // Sort choice for the alert columns. "volume" = the server's order (Strong volume first);
     // "share" = highest 9:15 buy share first (selling share for Sell alerts), alerts with no
     // reading yet last, ties keeping the server order. Remembered in this browser.
+    const SORT_KEYS = ["share", "pressure", "oipct", "oirise"];
     let sortMode = "volume";
-    try { const sv = localStorage.getItem("rtt_dash_sort"); if (sv === "share" || sv === "pressure") sortMode = sv; } catch (e) {}
+    try { const sv = localStorage.getItem("rtt_dash_sort"); if (SORT_KEYS.indexOf(sv) >= 0) sortMode = sv; } catch (e) {}
     function shareOf(a) { return (a && a.fc && typeof a.fc.share === "number") ? a.fc.share : null; }
+    function oiPctOf(a) { return (a && a.oi_trend && typeof a.oi_trend.now_pct === "number") ? a.oi_trend.now_pct : null; }
+    function oiRiseOf(a) {
+      const o = a && a.oi_trend;
+      return (o && typeof o.now_pct === "number" && typeof o.open_pct === "number") ? o.now_pct - o.open_pct : null;
+    }
     function pressureOf(a) { return (a && a.fc && typeof a.fc.pressure === "number") ? a.fc.pressure : null; }
     function sortAlerts(list) {
-      if (sortMode !== "share" && sortMode !== "pressure") return list;
-      const keyOf = sortMode === "pressure" ? pressureOf : shareOf;
+      if (SORT_KEYS.indexOf(sortMode) < 0) return list;
+      const keyOf = { share: shareOf, pressure: pressureOf, oipct: oiPctOf, oirise: oiRiseOf }[sortMode];
       return list.map((a, i) => [a, i]).sort((x, y) => {
         const sx = keyOf(x[0]), sy = keyOf(y[0]);
         if (sx === null && sy === null) return x[1] - y[1];
@@ -914,7 +922,7 @@
       }).map(p => p[0]);
     }
     function setSortMode(v) {
-      sortMode = (v === "share" || v === "pressure") ? v : "volume";
+      sortMode = SORT_KEYS.indexOf(v) >= 0 ? v : "volume";
       try { localStorage.setItem("rtt_dash_sort", sortMode); } catch (e) {}
       refreshAlerts();
     }
