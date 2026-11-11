@@ -71,13 +71,40 @@ _INR_JS = ("<script>window.inr=function(v,d,p){if(v===null||v===undefined)return
            "if(p&&!sg&&Number(s)>0)sg='+';return sg+ip+fr;};</script>")
 
 
+# Live feed badge (top-right of every page except the WS Speed page itself): connection status + age of the
+# last tick, refreshed every 3 s while the tab is visible. Reads the same in-memory stats as the WS Speed page.
+_WS_BADGE_JS = ("<script>(function(){if(window.__wsBadge)return;window.__wsBadge=1;"
+    "var el=document.createElement('a');el.href='/websocket-stats';el.id='ws-age-badge';el.title='WS Speed - last tick age';"
+    "el.style.cssText='position:fixed;top:6px;right:14px;z-index:99999;display:flex;align-items:center;gap:7px;padding:3px 11px;"
+    "border-radius:999px;background:rgba(12,18,26,.93);border:1px solid rgba(130,150,170,.35);font:600 11px/1.2 -apple-system,Segoe UI,Roboto,sans-serif;"
+    "color:#8b98a5;text-decoration:none;box-shadow:0 2px 8px rgba(0,0,0,.4)';"
+    "el.innerHTML='<span id=\"wsb-dot\" style=\"width:9px;height:9px;border-radius:50%;background:#6b7785\"></span>"
+    "<span id=\"wsb-st\">WS</span><b id=\"wsb-age\" style=\"font-size:15px;color:#6b7785\">-</b>"
+    "<span style=\"font-size:8px;letter-spacing:.07em\">LAST TICK AGE</span>';"
+    "function add(){document.body.appendChild(el);}if(document.body)add();else document.addEventListener('DOMContentLoaded',add);"
+    "var ST={streaming:'Streaming',connecting:'Connecting',stale_reconnecting:'Reconnecting',error:'Error',disconnected:'Disconnected',not_started:'Not started'};"
+    "function paint(c,st,age){document.getElementById('wsb-dot').style.background=c;var s=document.getElementById('wsb-st');s.textContent=st;s.style.color=c;"
+    "var a=document.getElementById('wsb-age');a.textContent=age;a.style.color=c;}"
+    "function tick(){if(document.hidden)return;fetch('/api/paper-trading/websocket-stats').then(function(r){return r.json()}).then(function(d){"
+    "var q=d.feed_quality,c=(q==='EXCELLENT'||q==='GOOD')?'#19d69a':q==='DELAYED'?'#f5c542':q==='SLOW'?'#ff9f43':q==='STALE'?'#ff5370':'#6b7785';"
+    "paint(c,ST[d.status]||d.status||'WS',(d.current_tick_age===null||d.current_tick_age===undefined)?'-':d.current_tick_age+'s');"
+    "}).catch(function(){paint('#6b7785','WS offline','-');});}"
+    "tick();setInterval(tick,3000);})();</script>")
+
+
 @app.after_request
 def _inject_inr_helper(resp):
     try:
         if resp.mimetype == "text/html" and not resp.direct_passthrough:
             body = resp.get_data(as_text=True)
+            changed = False
             if "window.inr=" not in body:
                 body = body.replace("</head>", _INR_JS + "</head>", 1) if "</head>" in body else _INR_JS + body
+                changed = True
+            if resp.status_code == 200 and request.path != "/websocket-stats" and "__wsBadge" not in body and "</body>" in body:
+                body = body.replace("</body>", _WS_BADGE_JS + "</body>", 1)
+                changed = True
+            if changed:
                 resp.set_data(body)
     except Exception:
         pass
@@ -3254,6 +3281,93 @@ def _attach_fno_rank(items: list, token: str | None, is_today: bool) -> None:
         m[l["symbol"]] = {"type": "lose", "rank": l["rank"], "pct": l["pct"], "as_of": data.get("as_of")}
     for a in items:
         a["fno_rank"] = m.get((a.get("symbol") or "").strip().upper())
+
+
+_oi_open: dict = {"date": None, "map": {}}      # symbol -> OI shown by the 09:15 candle (nearest future)
+_oi_latest: dict = {"t": 0.0, "map": {}}        # symbol -> most recent OI
+_oi_trend_running = False
+
+
+def _oi_trend_job(token: str, symbols: list, today: str) -> None:
+    """Background: fills previous-day OI and the 09:15 OI once per symbol, then refreshes the latest OI in one batch."""
+    global _oi_trend_running
+    try:
+        if _oi_prev["date"] != today:
+            _oi_prev["date"], _oi_prev["map"] = today, {}
+        if _oi_open["date"] != today:
+            _oi_open["date"], _oi_open["map"] = today, {}
+        frm = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
+
+        def candles(url: str) -> list:
+            req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": BROWSER_USER_AGENT,
+                                                       "Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return ((json.loads(resp.read().decode()).get("data") or {}).get("candles")) or []
+
+        for sym in symbols:
+            key = _fut_key(sym, today)
+            if not key:
+                continue
+            q = urllib.parse.quote(key, safe="|")
+            try:
+                if sym not in _oi_prev["map"]:
+                    prev = [c for c in sorted(candles(f"https://api.upstox.com/v3/historical-candle/{q}/days/1/{today}/{frm}"),
+                                              key=lambda c: c[0]) if c[0][:10] < today and len(c) >= 7]
+                    if prev:
+                        _oi_prev["map"][sym] = float(prev[-1][6] or 0)
+                    time.sleep(0.1)
+                if sym not in _oi_open["map"]:
+                    for c in sorted(candles(f"https://api.upstox.com/v3/historical-candle/intraday/{q}/minutes/5"), key=lambda c: c[0]):
+                        if c[0][11:16] == "09:15" and len(c) >= 7 and c[6]:
+                            _oi_open["map"][sym] = float(c[6])
+                            break
+                    time.sleep(0.1)
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    time.sleep(2.0)
+            except Exception:
+                pass
+        for sym, qd in _oi_quotes(symbols, token, today).items():
+            if qd.get("oi") is not None:
+                _oi_latest["map"][sym] = float(qd["oi"])
+        _oi_latest["t"] = time.time()
+    except Exception as e:
+        print(f"[oi-trend] {type(e).__name__}: {e}", flush=True)
+    finally:
+        _oi_trend_running = False
+
+
+def _attach_oi_trend(items: list, token: str | None, is_today: bool) -> None:
+    """Adds 'oi_trend' = {open_pct, now_pct, dir} to today's alerts: OI change vs the previous day at the 09:15
+    candle and now, and whether it is rising or falling since. Reads memory only; refreshes in a background thread
+    every ~20 s during market hours, so a dashboard poll never waits on Upstox."""
+    global _oi_trend_running
+    if not is_today or not token:
+        return
+    try:
+        now_ist = datetime.utcnow() + IST_OFFSET
+        today = now_ist.strftime("%Y-%m-%d")
+        if not _futures_cache:
+            threading.Thread(target=lambda: get_instrument_key("RELIANCE"), daemon=True).start()
+            return
+        syms = sorted({(a.get("symbol") or "").strip().upper() for a in items} & set(_futures_cache))
+        in_hours = now_ist.weekday() < 5 and "09:15" <= now_ist.strftime("%H:%M") <= "15:45"
+        missing = [x for x in syms if x not in _oi_prev["map"] or x not in _oi_open["map"] or x not in _oi_latest["map"]]
+        fresh = time.time() - _oi_latest["t"] < 20
+        if syms and not _oi_trend_running and (missing or (in_hours and not fresh)) and (in_hours or missing):
+            _oi_trend_running = True
+            threading.Thread(target=_oi_trend_job, args=(token, syms, today), daemon=True).start()
+    except Exception:
+        pass
+    for a in items:
+        sym = (a.get("symbol") or "").strip().upper()
+        prev, op, lt = _oi_prev["map"].get(sym), _oi_open["map"].get(sym), _oi_latest["map"].get(sym)
+        if not prev or lt is None:
+            continue
+        now_pct = round((lt - prev) / prev * 100, 2)
+        open_pct = round((op - prev) / prev * 100, 2) if op else None
+        d = "flat" if open_pct is None or abs(now_pct - open_pct) < 0.05 else ("up" if now_pct > open_pct else "down")
+        a["oi_trend"] = {"open_pct": open_pct, "now_pct": now_pct, "dir": d}
 
 
 def _attach_sector_0925(items: list, date_str: str, token: str | None) -> None:
@@ -8039,6 +8153,7 @@ def index():
             _attach_volume_readings(_items, access_token, selected_date == today_str)
             _attach_sector_0925(_items, selected_date, access_token)
             _attach_fno_rank(_items, access_token, selected_date == today_str)
+            _attach_oi_trend(_items, access_token, selected_date == today_str)
             _items.sort(key=_volume_rank)   # Strong volume first (stable)
 
         html = render_template(
@@ -8125,6 +8240,7 @@ def api_alerts():
     _attach_volume_readings(merged_alerts, access_token, selected_date == today_str)
     _attach_sector_0925(merged_alerts, selected_date, access_token)
     _attach_fno_rank(merged_alerts, access_token, selected_date == today_str)
+    _attach_oi_trend(merged_alerts, access_token, selected_date == today_str)
     # Strong volume first within each column (stable: newest-first kept within a rank)
     _cat_pos = {name: i for i, name in enumerate(CATEGORY_ORDER)}
     merged_alerts.sort(key=lambda a: (_cat_pos.get(a.get("category"), len(_cat_pos)), _volume_rank(a)))
