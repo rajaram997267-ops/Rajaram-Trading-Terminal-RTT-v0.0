@@ -79,6 +79,13 @@
   <div class="sub" id="oiNote" style="margin-top:8px;"></div>
   <div class="sub" style="margin-top:6px;">Reading: price up + OI up = long build-up; price down + OI up = short build-up; price up + OI down = short covering (weaker); price down + OI down = long unwinding.</div>
 
+  <h3 style="margin-top:28px;">Memory &amp; feature switches</h3>
+  <div class="sub" style="margin-bottom:8px;">Render's free plan restarts the service above 512 MB. Switch a feature OFF to stop its background work and free its memory; switch it back ON when you need it. Saved in settings, so it survives restarts.</div>
+  <div id="memBox" class="sub" style="font-size:13px;margin-bottom:8px;">Loading...</div>
+  <div id="memSwitches" style="display:flex;flex-direction:column;gap:6px;margin-bottom:12px;"></div>
+  <div class="wrap"><table><thead><tr><th>Cache (in memory)</th><th>Approx. size (MB)</th></tr></thead><tbody id="memCaches"></tbody></table></div>
+  <button id="memRefresh" style="margin-top:8px;padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer;">Refresh memory</button>
+
   <script>
     const SECTORS = {{ sectors|tojson }};
     const $ = id => document.getElementById(id);
@@ -162,6 +169,29 @@
       loadSectors(date, token);
       loadOi(date, token);
     }
+    async function loadMemory() {
+      try {
+        const d = await (await fetch("/api/memory")).json();
+        const used = d.rss_mb, lim = d.limit_mb || 512;
+        const p = used ? Math.round(used / lim * 100) : null;
+        $("memBox").innerHTML = used == null ? "Memory reading not available on this server." :
+          "Using <b class=\"" + (p >= 85 ? "neg" : p >= 65 ? "" : "pos") + "\">" + used + " MB</b> of " + lim + " MB (" + p + "%) &middot; peak since start " + (d.peak_mb || "-") + " MB &middot; " + d.threads + " threads";
+        $("memSwitches").innerHTML = (d.switches || []).map(s =>
+          '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;"><input type="checkbox" data-sw="' + esc(s.name) + '"' + (s.on ? " checked" : "") + '> <b>' + (s.on ? "ON" : "OFF") + "</b> &nbsp;" + esc(s.label) + "</label>").join("");
+        $("memSwitches").querySelectorAll("input[data-sw]").forEach(cb => {
+          cb.onchange = async () => {
+            cb.disabled = true;
+            try {
+              await fetch("/api/feature-switch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: cb.dataset.sw, on: cb.checked }) });
+            } catch (e) {}
+            loadMemory();
+          };
+        });
+        $("memCaches").innerHTML = (d.caches || []).map(c => "<tr><td>" + esc(c.name) + "</td><td>" + c.mb.toFixed(2) + "</td></tr>").join("");
+      } catch (e) { $("memBox").textContent = "Could not read memory."; }
+    }
+    $("memRefresh").onclick = loadMemory;
+    loadMemory();
     $("meLoad").onclick = loadAll;
     $("meDate").onchange = loadAll;
     loadAll();
