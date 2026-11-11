@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import gc
 import gzip
 import hmac
 import io
+import sys
 import json
 import math
 import os
@@ -2320,7 +2322,43 @@ def _parse_expiry(raw) -> str | None:
     return raw[:10]
 
 
+_instrument_load_lock = threading.Lock()
+_instrument_loaded_at = 0.0
+_instrument_fail_at = 0.0
+
+
+class _CountingReader(io.RawIOBase):
+    """Passes bytes through and counts them (so the master file can be parsed as a stream, not held in memory)."""
+    def __init__(self, f):
+        self._f = f
+        self.n = 0
+
+    def readable(self):
+        return True
+
+    def readinto(self, b):
+        data = self._f.read(len(b))
+        if not data:
+            return 0
+        b[:len(data)] = data
+        self.n += len(data)
+        return len(data)
+
+
 def _load_instrument_master() -> None:
+    """Only one load at a time. Before this lock, several threads (dashboard polls, background jobs) could each
+    download and parse the whole ~100 MB file at once after a restart - the cause of 'ran out of memory (512 MB)'
+    restart loops on Render. Callers that waited reuse the copy that just finished."""
+    with _instrument_load_lock:
+        today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+        if _instrument_cache and _instrument_cache_date == today and time.time() - _instrument_loaded_at < 15:
+            return
+        if not _instrument_cache and time.time() - _instrument_fail_at < 30:
+            return                                   # just failed - do not hammer the download
+        _load_instrument_master_impl()
+
+
+def _load_instrument_master_impl() -> None:
     """Downloads Upstox's public instrument master file and builds two
     lookups in a single pass: a trading-symbol -> instrument_key map for
     NSE equities, and an underlying-symbol -> option-contract-list map for
@@ -2333,21 +2371,20 @@ def _load_instrument_master() -> None:
     and fix the column names there if option_matched_count is 0."""
     global _instrument_cache, _instrument_cache_date, _instrument_debug
     global _option_chain_cache, _option_debug, _futures_cache
+    global _instrument_loaded_at, _instrument_fail_at
+    resp = None
     try:
         req = urllib.request.Request(UPSTOX_INSTRUMENTS_URL, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            raw_bytes = resp.read()
-
-        # Try gzip first (expected), but fall back to plain text in case
-        # the URL now serves an uncompressed file.
-        try:
-            raw = gzip.decompress(raw_bytes)
-        except OSError:
-            raw = raw_bytes
-
-        text = raw.decode("utf-8", errors="replace")
-        reader = csv.DictReader(io.StringIO(text))
+        resp = urllib.request.urlopen(req, timeout=30)
+        content_type = resp.headers.get("Content-Type", "")
+        # Parse as a STREAM (download -> gunzip -> text -> csv row by row) so the file is never held in memory as a
+        # whole. Gzip is expected; a plain-text file is handled too.
+        compressed = _CountingReader(resp)
+        head = resp.peek(2)[:2] if hasattr(resp, "peek") else b""
+        source = gzip.GzipFile(fileobj=compressed) if head == b"\x1f\x8b" else compressed
+        decompressed = _CountingReader(source)
+        reader = csv.DictReader(io.TextIOWrapper(io.BufferedReader(decompressed, buffer_size=1 << 16),
+                                                 encoding="utf-8", errors="replace", newline=""))
         fieldnames = reader.fieldnames or []
         sample_rows = []
         fo_sample_rows = []
@@ -2439,6 +2476,7 @@ def _load_instrument_master() -> None:
                     "lot_size": lot_size,
                 })
 
+        resp.close()
         futs: dict[str, list] = {}
         for tsym, fname, fexp_raw, fkey in pending_futs:
             fexp = _parse_expiry(fexp_raw)
@@ -2452,11 +2490,12 @@ def _load_instrument_master() -> None:
         _instrument_cache = mapping
         _option_chain_cache = option_chains
         _instrument_cache_date = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+        _instrument_loaded_at = time.time()
         _instrument_debug = {
             "ok": True,
             "content_type": content_type,
-            "raw_bytes_len": len(raw_bytes),
-            "decompressed_len": len(raw),
+            "raw_bytes_len": compressed.n,
+            "decompressed_len": decompressed.n,
             "fieldnames": fieldnames,
             "sample_rows": sample_rows,
             "total_rows_scanned": row_count,
@@ -2478,6 +2517,12 @@ def _load_instrument_master() -> None:
         }
     except Exception as e:
         import traceback
+        try:
+            if resp is not None:
+                resp.close()
+        except Exception:
+            pass
+        _instrument_fail_at = time.time()
         _instrument_cache = {}
         _option_chain_cache = {}
         _futures_cache = {}
@@ -3249,7 +3294,7 @@ def _sector_0925_for_dates(dates: list, token: str | None) -> dict:
         out[d] = got
         if not _sector_0925_has_flow(d) and _sector0925_date_ready(d, now_ist) and d not in _sector0925_state["attempted"]:
             missing.append(d)
-    if missing and token:
+    if missing and token and _feature_on("sector_925"):
         with _sector0925_lock:
             if _sector0925_state["state"] != "running":
                 _sector0925_state["state"] = "running"
@@ -3261,7 +3306,7 @@ def _attach_fno_rank(items: list, token: str | None, is_today: bool) -> None:
     """Adds 'fno_rank' = {type: gain|lose, rank, pct, as_of} to alerts whose stock is among today's top F&O
     gainers / losers (same snapshot as the First Candle page). Uses the cached snapshot and refreshes it in a
     background thread, so a dashboard poll never waits on Upstox."""
-    if not is_today:
+    if not is_today or not _feature_on("fno_rank"):
         return
     c = _fno_movers_cache
     try:
@@ -3281,6 +3326,45 @@ def _attach_fno_rank(items: list, token: str | None, is_today: bool) -> None:
         m[l["symbol"]] = {"type": "lose", "rank": l["rank"], "pct": l["pct"], "as_of": data.get("as_of")}
     for a in items:
         a["fno_rank"] = m.get((a.get("symbol") or "").strip().upper())
+
+
+# ON/OFF switches for the optional background / data features (Market EYE page). Default ON. Cached in memory so
+# dashboard polls do not query the database for them; the cache is updated the moment a switch is flipped.
+FEATURE_SWITCHES = {
+    "oi_trend": "OI trend chips on the dashboard (reads futures OI every ~20 s)",
+    "oi_snapshot": "Daily ~09:26 OI snapshot of all F&O futures (writes to the database once a day)",
+    "sector_925": "Sector % / flow at 09:25 (calculated from 5-min candles of all F&O stocks)",
+    "fno_rank": "Top F&O gainers / losers rank on the dashboard",
+}
+_feature_flags: dict = {"t": 0.0, "v": {}}
+
+
+def _feature_on(name: str) -> bool:
+    now = time.time()
+    if now - _feature_flags["t"] > 120:
+        try:
+            with get_db() as conn:
+                rows = conn.execute("SELECT key, value FROM settings WHERE key LIKE 'feat_%'").fetchall()
+            _feature_flags["v"] = {r["key"][5:]: (r["value"] != "off") for r in rows}
+        except Exception:
+            pass
+        _feature_flags["t"] = now
+    return _feature_flags["v"].get(name, True)
+
+
+def _free_feature_memory(name: str) -> None:
+    if name == "oi_trend":
+        _oi_prev["map"] = {}
+        _oi_open["map"] = {}
+        _oi_latest["map"] = {}
+        _oi_quote_cache["data"] = {}
+    elif name == "sector_925":
+        _sector0925_mem.clear()
+        _sector0925_full_mem.clear()
+        _sector0925_partial.clear()
+    elif name == "fno_rank":
+        _fno_movers_cache["data"] = None
+    gc.collect()
 
 
 _oi_open: dict = {"date": None, "map": {}}      # symbol -> OI shown by the 09:15 candle (nearest future)
@@ -3342,14 +3426,13 @@ def _attach_oi_trend(items: list, token: str | None, is_today: bool) -> None:
     candle and now, and whether it is rising or falling since. Reads memory only; refreshes in a background thread
     every ~20 s during market hours, so a dashboard poll never waits on Upstox."""
     global _oi_trend_running
-    if not is_today or not token:
+    if not is_today or not token or not _feature_on("oi_trend"):
         return
     try:
         now_ist = datetime.utcnow() + IST_OFFSET
         today = now_ist.strftime("%Y-%m-%d")
         if not _futures_cache:
-            threading.Thread(target=lambda: get_instrument_key("RELIANCE"), daemon=True).start()
-            return
+            return                      # futures list comes with the instrument master; never start a load from a poll
         syms = sorted({(a.get("symbol") or "").strip().upper() for a in items} & set(_futures_cache))
         in_hours = now_ist.weekday() < 5 and "09:15" <= now_ist.strftime("%H:%M") <= "15:45"
         missing = [x for x in syms if x not in _oi_prev["map"] or x not in _oi_open["map"] or x not in _oi_latest["map"]]
@@ -3517,7 +3600,8 @@ def _oi_snapshot_loop() -> None:
             now = datetime.utcnow() + IST_OFFSET
             today = now.strftime("%Y-%m-%d")
             hm = now.strftime("%H:%M")
-            if now.weekday() < 5 and OI_SNAPSHOT_WINDOW[0] <= hm <= OI_SNAPSHOT_WINDOW[1] and done_date != today:
+            if (now.weekday() < 5 and OI_SNAPSHOT_WINDOW[0] <= hm <= OI_SNAPSHOT_WINDOW[1] and done_date != today
+                    and _feature_on("oi_snapshot")):
                 token = get_setting("upstox_access_token")
                 if token:
                     if not _futures_cache:
@@ -3568,6 +3652,67 @@ def market_eye_page():
     sectors = [{"name": k, "n": counts[k]} for k in sorted(counts)]
     return render_template("market_eye.html", active_tab="market_eye", sectors=sectors,
                            today=(datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d"))
+
+
+def _deep_size(obj, seen=None, depth=0) -> int:
+    seen = seen if seen is not None else set()
+    if id(obj) in seen or depth > 6:
+        return 0
+    seen.add(id(obj))
+    size = sys.getsizeof(obj)
+    if isinstance(obj, dict):
+        size += sum(_deep_size(k, seen, depth + 1) + _deep_size(v, seen, depth + 1) for k, v in list(obj.items()))
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        size += sum(_deep_size(i, seen, depth + 1) for i in list(obj))
+    return size
+
+
+@app.route("/api/memory")
+def api_memory():
+    """Process memory (Render free plan kills the service above 512 MB) and the approximate size of the big caches."""
+    rss = peak = None
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss = round(int(line.split()[1]) / 1024, 1)
+                elif line.startswith("VmHWM:"):
+                    peak = round(int(line.split()[1]) / 1024, 1)
+    except Exception:
+        pass
+    g = globals()
+    names = ["_instrument_cache", "_option_chain_cache", "_futures_cache", "_alerts_api_cache", "_vol_history_cache",
+             "_vol_history_cache_past", "_vol_reading_cache", "_today_candle_cache", "_prev_session_candle_cache",
+             "_fcv_cache", "_ws_price_cache", "_exit_lab_cache", "_lab_vol_cache", "_sector0925_full_mem", "_oi_prev",
+             "_oi_open", "_oi_latest", "_oi_quote_cache", "_fno_movers_cache", "_fib_close_cache", "_prev_close_cache"]
+    caches = []
+    for n in names:
+        if n in g:
+            try:
+                caches.append({"name": n, "mb": round(_deep_size(g[n]) / 1048576, 2)})
+            except Exception:
+                pass
+    caches.sort(key=lambda c: -c["mb"])
+    return jsonify({"rss_mb": rss, "peak_mb": peak, "limit_mb": 512, "threads": threading.active_count(),
+                    "caches": caches,
+                    "switches": [{"name": k, "label": v, "on": _feature_on(k)} for k, v in FEATURE_SWITCHES.items()]})
+
+
+@app.route("/api/feature-switch", methods=["POST"])
+def api_feature_switch():
+    body = request.get_json(silent=True) or {}
+    name, on = body.get("name"), bool(body.get("on"))
+    if name not in FEATURE_SWITCHES:
+        return jsonify({"error": "unknown switch"}), 400
+    try:
+        set_setting("feat_" + name, "on" if on else "off")
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    _feature_flags["v"][name] = on
+    _feature_flags["t"] = time.time()
+    if not on:
+        _free_feature_memory(name)
+    return jsonify({"ok": True, "name": name, "on": on})
 
 
 @app.route("/api/market-eye-sectors")
