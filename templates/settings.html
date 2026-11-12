@@ -460,7 +460,7 @@
     <div class="er-foot"><span class="er-saved" id="erSaved"></span><button class="secondary" onclick="loadEntryRule()">Refresh</button></div>
 
     <div class="er-section">Recent entry-rule decisions</div>
-    <div class="er-log" id="erLog"><div class="er-sub">No alert has been judged since the app started.</div></div>
+    <div class="er-log" id="erLog"><div class="er-sub">Nothing judged since the app last (re)started. This list is kept in memory only; every trade also stores its own entry-rule result, shown under its symbol on the Paper and Live pages.</div></div>
   </div>
 
   <div class="settings-box" style="flex-direction: column; align-items: stretch; gap: 10px;">
@@ -954,7 +954,7 @@
       document.getElementById("erLog").innerHTML = (d.log || []).length ? d.log.map(x => {
         const colour = x.outcome === "PASSED" || x.outcome === "ALLOWED" ? "var(--green)" : x.outcome === "ERROR" ? "#f5c542" : "var(--red)";
         return '<div><span class="er-badge" style="color:' + colour + '">' + escapeHtml(x.outcome) + "</span><span style=\"color:var(--muted)\">" + escapeHtml(x.at) + "</span><b>" + escapeHtml(x.symbol) + "</b> (" + escapeHtml(x.category) + ") &mdash; " + escapeHtml(x.detail) + "</div>";
-      }).join("") : '<div class="er-sub">No alert has been judged since the app started.</div>';
+      }).join("") : '<div class="er-sub">Nothing judged since the app last (re)started. This list is kept in memory only; every trade also stores its own entry-rule result, shown under its symbol on the Paper and Live pages.</div>';
     }
 
     async function loadEntryRule() {
