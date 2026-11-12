@@ -126,6 +126,33 @@
       font-size: 13px;
     }
     .token-status { font-size: 12px; color: var(--muted); }
+    /* Entry rule (recipe) card */
+    .er-card { flex-direction: column; align-items: stretch; gap: 14px; }
+    .er-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .er-title { font-weight: 700; font-size: 15px; }
+    .er-pill { font-size: 11px; font-weight: 700; letter-spacing: .06em; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+    .er-pill.on { color: #fff; background: var(--red); border-color: var(--red); }
+    .er-pill.live { color: #06110d; background: #f5c542; border-color: #f5c542; }
+    .er-sub { font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .er-section { font-size: 11px; font-weight: 700; letter-spacing: .08em; color: var(--muted); text-transform: uppercase; margin-top: 2px; }
+    .er-grid { display: grid; grid-template-columns: 44px minmax(210px, 1.3fr) 28px 130px minmax(160px, 2fr); align-items: center; column-gap: 12px; row-gap: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .er-grid > div { padding: 11px 0; border-bottom: 1px solid var(--border); }
+    .er-grid > div:nth-last-child(-n+5) { border-bottom: none; }
+    .er-row-off { opacity: .45; }
+    .er-name { font-weight: 600; font-size: 13px; }
+    .er-hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .er-op { text-align: center; color: var(--muted); font-weight: 700; }
+    .er-grid select { width: 100%; }
+    .er-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .er-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; cursor: pointer; user-select: none; }
+    .er-chip.sel { border-color: var(--green); color: var(--green); background: rgba(0,200,150,.08); }
+    .er-chip input { display: none; }
+    .er-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .er-saved { font-size: 12px; color: var(--green); min-height: 16px; }
+    .er-log { font-size: 12px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .er-log div { padding: 7px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; }
+    .er-log div:last-child { border-bottom: none; }
+    .er-badge { min-width: 62px; font-weight: 700; }
     .token-status.saved { color: var(--green); }
     .switch {
       position: relative;
@@ -405,6 +432,37 @@
     </span>
   </div>
 
+  <div class="settings-box er-card" id="erCard">
+    <div class="er-head">
+      <label class="switch"><input type="checkbox" id="erEnabled" onchange="saveEntryRule()"><span class="slider"></span></label>
+      <span class="er-title">Entry rule &mdash; recipe</span>
+      <span class="er-pill" id="erPill">OFF</span>
+      <span class="er-pill live" id="erLive" style="display:none;">LIVE TRADING ON</span>
+    </div>
+    <div class="er-sub">One combined gate that every new trade must pass, <b>paper and live alike</b>. Switch on only the conditions you want; all switched-on conditions must be true (AND). Alerts that fail are skipped and the reason is recorded. Everything here is OFF until you turn it on.</div>
+
+    <div class="er-section">Alert type</div>
+    <div class="er-chips" id="erAlerts"><span class="er-sub">Loading...</span></div>
+    <div class="er-sub">Tick the alerts allowed to open a trade. None ticked = any alert.</div>
+
+    <div class="er-section">Conditions known at entry</div>
+    <div class="er-grid" id="erGrid"></div>
+
+    <div class="er-section">When a reading is not available yet</div>
+    <div class="er-foot">
+      <select id="erMissing" onchange="saveEntryRule()" style="min-width:260px;">
+        <option value="skip">Skip the trade (recommended)</option>
+        <option value="allow">Allow the trade</option>
+      </select>
+      <span class="er-sub">Example: 9:15 readings appear about 9:20, the 9:25 sector value after 9:26.</span>
+    </div>
+    <div class="er-sub">Whole-day volume and the sector's full-day move are only known after the close, so they cannot be entry conditions. Their live counterparts are the existing <i>Volume entry rule</i> and <i>Sector momentum filter</i> above.</div>
+    <div class="er-foot"><span class="er-saved" id="erSaved"></span><button class="secondary" onclick="loadEntryRule()">Refresh</button></div>
+
+    <div class="er-section">Recent entry-rule decisions</div>
+    <div class="er-log" id="erLog"><div class="er-sub">No alert has been judged since the app started.</div></div>
+  </div>
+
   <div class="settings-box" style="flex-direction: column; align-items: stretch; gap: 10px;">
     <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
       <label class="switch"><input type="checkbox" id="fcvGate" {% if fcv.gate_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
@@ -502,6 +560,7 @@
     }
     loadVolumeLog();
     loadFcv();
+    loadEntryRule();
     (function initThemeSelect() {
       var t = "dark";
       try { t = localStorage.getItem("rtt-theme") || "dark"; } catch (e) {}
@@ -849,6 +908,85 @@
         const colour = (x.outcome === "ALLOWED" || x.outcome === "ROUTED" || x.outcome === "AUTO-PICKED") ? "var(--green)" : (x.outcome === "error" ? "var(--red)" : "var(--muted)");
         return `<div><span style="color:${colour}; font-weight:600;">${escapeHtml(x.outcome)}</span> ${escapeHtml(x.at)} ${escapeHtml(x.symbol)} (${escapeHtml(x.category)}) - ${escapeHtml(x.detail)}</div>`;
       }).join("");
+    }
+
+    // ---------- Entry rule (recipe) ----------
+    const ER_ROWS = [
+      { key: "ratio", name: "9:15 volume ratio", hint: "First 5-minute candle volume vs its 10-session average", unit: "x",
+        opts: [1.5, 2, 3, 4, 5, 7, 10], fmt: v => v + "\u00d7" },
+      { key: "share", name: "9:15 candle agrees with the alert", hint: "Buying share for a Buy alert, selling share for a Sell alert", unit: "%",
+        opts: [55, 60, 65, 70, 75, 80, 85, 90, 95], fmt: v => v + "%" },
+      { key: "pressure", name: "Direction pressure", hint: "Buying (Sell: selling) volume of the 9:15 candle vs its average", unit: "x",
+        opts: [1.5, 2, 3, 4, 5, 7, 10], fmt: v => v + "\u00d7" },
+      { key: "sector25", name: "Sector at 09:25 moves with the alert", hint: "Sector average % at 09:25 (Buy: up, Sell: down)", unit: "%",
+        opts: [0.25, 0.5, 0.75, 1, 1.5, 2], fmt: v => v + "%" },
+      { key: "oi", name: "Open interest rising", hint: "Latest OI% above its 09:15 value (futures, vs previous day)", unit: "pts", label: "by at least",
+        opts: [0, 0.05, 0.1, 0.25, 0.5, 1], fmt: v => v === 0 ? "any rise" : v + " pts" },
+    ];
+    let erState = null, erTimer = null;
+
+    function erBuild(d) {
+      erState = d.rule;
+      const r = d.rule;
+      document.getElementById("erEnabled").checked = !!r.enabled;
+      const pill = document.getElementById("erPill");
+      pill.textContent = r.enabled ? "ON" : "OFF";
+      pill.className = "er-pill" + (r.enabled ? " on" : "");
+      document.getElementById("erLive").style.display = (r.enabled && d.live_trading) ? "" : "none";
+      document.getElementById("erMissing").value = r.if_missing;
+      const names = d.alert_names || [];
+      document.getElementById("erAlerts").innerHTML = names.length ? names.map((n, i) =>
+        '<label class="er-chip' + (r.alerts.indexOf(n) >= 0 ? " sel" : "") + '"><input type="checkbox" class="erAlert" data-i="' + i + '"' + (r.alerts.indexOf(n) >= 0 ? " checked" : "") + "> " + escapeHtml(n) + "</label>").join("")
+        : '<span class="er-sub">No alert names found in the last 45 days.</span>';
+      document.getElementById("erAlerts").dataset.names = JSON.stringify(names);
+      document.querySelectorAll(".erAlert").forEach(cb => { cb.onchange = () => { cb.parentElement.classList.toggle("sel", cb.checked); saveEntryRule(); }; });
+      document.getElementById("erGrid").innerHTML = ER_ROWS.map(row => {
+        const c = r[row.key];
+        const opts = row.opts.slice();
+        if (opts.indexOf(c.min) < 0) { opts.push(c.min); opts.sort((a, b) => a - b); }
+        return '<div class="' + (c.on ? "" : "er-row-off") + '" data-row="' + row.key + '"><label class="switch"><input type="checkbox" class="erOn" data-k="' + row.key + '"' + (c.on ? " checked" : "") + '><span class="slider"></span></label></div>' +
+          '<div class="' + (c.on ? "" : "er-row-off") + '" data-row="' + row.key + '"><div class="er-name">' + row.name + '</div><div class="er-hint">' + row.hint + "</div></div>" +
+          '<div class="er-op ' + (c.on ? "" : "er-row-off") + '" data-row="' + row.key + '">' + (row.key === "oi" ? "" : "&ge;") + "</div>" +
+          '<div class="' + (c.on ? "" : "er-row-off") + '" data-row="' + row.key + '"><select class="erMin" data-k="' + row.key + '">' + opts.map(o => '<option value="' + o + '"' + (o === c.min ? " selected" : "") + ">" + row.fmt(o) + "</option>").join("") + "</select></div>" +
+          '<div class="er-hint ' + (c.on ? "" : "er-row-off") + '" data-row="' + row.key + '">' + (row.label ? row.label + " &middot; " : "") + (c.on ? "ON" : "off") + "</div>";
+      }).join("");
+      document.querySelectorAll(".erOn, .erMin").forEach(el => { el.onchange = saveEntryRule; });
+      document.getElementById("erLog").innerHTML = (d.log || []).length ? d.log.map(x => {
+        const colour = x.outcome === "PASSED" || x.outcome === "ALLOWED" ? "var(--green)" : x.outcome === "ERROR" ? "#f5c542" : "var(--red)";
+        return '<div><span class="er-badge" style="color:' + colour + '">' + escapeHtml(x.outcome) + "</span><span style=\"color:var(--muted)\">" + escapeHtml(x.at) + "</span><b>" + escapeHtml(x.symbol) + "</b> (" + escapeHtml(x.category) + ") &mdash; " + escapeHtml(x.detail) + "</div>";
+      }).join("") : '<div class="er-sub">No alert has been judged since the app started.</div>';
+    }
+
+    async function loadEntryRule() {
+      try { erBuild(await (await fetch("/api/entry-rule")).json()); }
+      catch (e) { document.getElementById("erSaved").textContent = "Could not load the entry rule."; }
+    }
+
+    async function saveEntryRule() {
+      const names = JSON.parse(document.getElementById("erAlerts").dataset.names || "[]");
+      const body = {
+        enabled: document.getElementById("erEnabled").checked,
+        if_missing: document.getElementById("erMissing").value,
+        alerts: Array.from(document.querySelectorAll(".erAlert")).filter(x => x.checked).map(x => names[+x.dataset.i]),
+      };
+      ER_ROWS.forEach(row => {
+        body[row.key] = {
+          on: document.querySelector('.erOn[data-k="' + row.key + '"]').checked,
+          min: parseFloat(document.querySelector('.erMin[data-k="' + row.key + '"]').value),
+        };
+      });
+      try {
+        const res = await fetch("/api/entry-rule", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const d = await res.json();
+        if (d.status !== "ok") throw new Error(d.message || "save failed");
+        erBuild(d);
+        const el = document.getElementById("erSaved");
+        el.textContent = "Saved \u2713 applies to the next alert";
+        clearTimeout(erTimer);
+        erTimer = setTimeout(() => { el.textContent = ""; }, 3000);
+      } catch (e) {
+        document.getElementById("erSaved").textContent = "Could not save - " + e.message;
+      }
     }
 
     async function loadFcv() {
