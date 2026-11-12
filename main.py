@@ -879,6 +879,8 @@ def init_db():
             # First-candle (09:15) volume snapshot, logged on every trade at entry.
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_fc_ratio DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_fc_dir_share DOUBLE PRECISION",
+            # Result of the Entry rule (recipe) at the moment this trade opened (JSON: verdict, OI% at 09:15 and at entry, text).
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_rule TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_volume_label TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS exit_volume_ratio DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS lab_state TEXT",
@@ -1598,16 +1600,17 @@ def _entry_oi_readings(sym: str, token: str):
     return (open_oi - prev_oi) / prev_oi * 100.0, (float(now_oi) - prev_oi) / prev_oi * 100.0, None
 
 
-def entry_rule_decision(symbol: str, category: str, alert_name: str, scan_name: str, token: str | None) -> tuple[bool, str]:
-    """(allowed, reason). Evaluates every ON condition; a failed condition blocks the trade, a reading that is not
+def entry_rule_decision(symbol: str, category: str, alert_name: str, scan_name: str, token: str | None) -> tuple[bool, str, dict | None]:
+    """(allowed, reason, detail). detail is saved on the trade (None when the rule is off). Evaluates every ON condition; a failed condition blocks the trade, a reading that is not
     available yet follows the 'if a reading is missing' choice (default: skip)."""
     cfg = get_entry_rule()
     if not cfg["enabled"]:
-        return True, ""
+        return True, "", None
     sym = (symbol or "").strip().upper()
     if category not in ("Buy", "Sell"):
-        return True, ""
+        return True, "", None
     passed, failed, missing = [], [], []
+    oi_pair = None
     word = "buying" if category == "Buy" else "selling"
     names = {n.lower() for n in cfg["alerts"]}
     if names and not ({(alert_name or "").lower(), (scan_name or "").lower()} & names):
@@ -1657,22 +1660,36 @@ def entry_rule_decision(symbol: str, category: str, alert_name: str, scan_name: 
         if err:
             missing.append(err)
         else:
+            oi_pair = (round(o_open, 2), round(o_now, 2))
             ok = o_now - o_open > cfg["oi"]["min"] if cfg["oi"]["min"] > 0 else o_now > o_open
             need = f" by at least {cfg['oi']['min']:g} pts" if cfg["oi"]["min"] > 0 else ""
             (passed if ok else failed).append(f"OI {o_open:+.2f}% at 09:15 -> {o_now:+.2f}% now " + ("is rising" if ok else "is not rising") + need)
     if failed:
         reason = "Entry rule: " + "; ".join(failed)
         _entry_log(sym, category, "SKIPPED", reason)
-        return False, reason
+        return False, reason, None
+    stamp = (datetime.utcnow() + IST_OFFSET).strftime("%H:%M:%S")
     if missing:
         if cfg["if_missing"] == "allow":
             _entry_log(sym, category, "ALLOWED", "reading missing, allowed by setting: " + "; ".join(missing))
-            return True, ""
+            return True, "", {"v": "ALLOWED", "t": stamp, "oi": oi_pair, "text": "; ".join(passed), "missing": "; ".join(missing)}
         reason = "Entry rule: waiting for data - " + "; ".join(missing)
         _entry_log(sym, category, "SKIPPED", reason)
-        return False, reason
+        return False, reason, None
     _entry_log(sym, category, "PASSED", "; ".join(passed) or "no condition switched on")
-    return True, ""
+    return True, "", {"v": "PASSED", "t": stamp, "oi": oi_pair, "text": "; ".join(passed)}
+
+
+def _save_entry_rule_on_trade(trade_id: int, detail: dict) -> None:
+    """Stores the entry-rule verdict (and the OI% readings it used) on the trade row. Own thread, best-effort,
+    after the order has gone out, so it can never delay an entry."""
+    try:
+        with get_db() as conn:
+            conn.execute("UPDATE paper_trades SET entry_rule = ? WHERE id = ?",
+                         (json.dumps(detail, separators=(",", ":")), trade_id))
+            conn.commit()
+    except Exception as e:
+        print(f"[entry-rule] could not save on trade {trade_id}: {type(e).__name__}", flush=True)
 
 
 @app.route("/api/entry-rule", methods=["GET", "POST"])
@@ -1767,8 +1784,9 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # Entry rule (recipe) - Settings. OFF by default. Applies to paper and live alike: both open here. A rule the
     # user switched on is never skipped silently: if it cannot be evaluated, the 'if a reading is missing' choice
     # decides, and the reason is recorded.
+    _er_detail = None
     try:
-        _er_ok, _er_why = entry_rule_decision(symbol, category, alert_name, scan_name, access_token)
+        _er_ok, _er_why, _er_detail = entry_rule_decision(symbol, category, alert_name, scan_name, access_token)
         if not _er_ok:
             return False, _er_why
     except Exception as e:
@@ -2272,6 +2290,8 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # order has already gone out - so it can never add delay to an order.
     _log_entry_volume_async(row["id"], symbol, category, now)
     threading.Thread(target=_log_entry_first_candle, args=(row["id"], symbol, category), daemon=True).start()
+    if _er_detail:
+        threading.Thread(target=_save_entry_rule_on_trade, args=(row["id"], _er_detail), daemon=True).start()
     return True, None
 
 
@@ -11944,6 +11964,17 @@ def _rule_note(t: dict) -> str:
                      f"past {fcv.get('n')} trades avg {fcv.get('avg')}%")
     elif fcv:
         parts.append(f"Routed by 9:15 volume {fcv.get('ratio')}x ({fcv.get('band')})")
+    try:
+        er = json.loads(t.get("entry_rule") or "null")
+    except Exception:
+        er = None
+    if isinstance(er, dict):
+        oi = er.get("oi")
+        oi_txt = f" OI {oi[0]:+.2f}% -> {oi[1]:+.2f}%" if isinstance(oi, list) and len(oi) == 2 else ""
+        if er.get("v") == "ALLOWED":
+            parts.append(f"Entry rule: allowed, a reading was missing{oi_txt}")
+        else:
+            parts.append(f"Entry rule passed{oi_txt}")
     if t.get("entry_fc_ratio") is not None:
         txt = f"9:15 vol {t['entry_fc_ratio']}x"
         if t.get("entry_fc_dir_share") is not None:
