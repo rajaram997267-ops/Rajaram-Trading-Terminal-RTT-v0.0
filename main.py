@@ -1505,6 +1505,210 @@ def create_paper_trades_for_batch(data: dict) -> None:
     _open_trade_if_free(symbol, category, price_val, alert_name=data.get("alert_name", ""), scan_name=data.get("scan_name", ""))
 
 
+# ---------------------------------------------------------------------------
+# Entry rule (recipe): one optional, user-built gate that every new trade - paper AND live - must pass, because
+# both are opened through open_trade_for_symbol. Everything is OFF by default. Only readings that are known at
+# entry time are used (the two end-of-day conditions of the recipe tester - whole-day volume and the sector's
+# full-day move - cannot exist at entry, so they are not part of it).
+# ---------------------------------------------------------------------------
+ENTRY_RULE_DEFAULT = {
+    "enabled": False,
+    "alerts": [],                                     # alert names, any of; empty = any alert
+    "ratio": {"on": False, "min": 3.0},               # 9:15 volume ratio >= x
+    "share": {"on": False, "min": 70.0},              # 9:15 buying (Buy) / selling (Sell) share >= x %
+    "pressure": {"on": False, "min": 3.0},            # 9:15 direction pressure >= x times
+    "sector25": {"on": False, "min": 0.5},            # sector % at 09:25 moving WITH the alert >= x %
+    "oi": {"on": False, "min": 0.0},                  # latest OI% > OI% at 09:15 by at least x points
+    "if_missing": "skip",                             # "skip" or "allow" when a reading is not available yet
+}
+_ENTRY_RULE_LIMITS = {"ratio": (0.0, 100.0), "share": (0.0, 100.0), "pressure": (0.0, 100.0),
+                      "sector25": (0.0, 20.0), "oi": (0.0, 20.0)}
+_entry_rule_log: list = []
+
+
+def get_entry_rule() -> dict:
+    cfg = json.loads(json.dumps(ENTRY_RULE_DEFAULT))
+    try:
+        raw = get_setting("entry_rule", "")
+        saved = json.loads(raw) if raw else {}
+    except Exception:
+        saved = {}
+    if isinstance(saved, dict):
+        cfg["enabled"] = bool(saved.get("enabled", False))
+        if isinstance(saved.get("alerts"), list):
+            cfg["alerts"] = [str(a) for a in saved["alerts"]][:50]
+        for k, (lo, hi) in _ENTRY_RULE_LIMITS.items():
+            v = saved.get(k)
+            if isinstance(v, dict):
+                cfg[k]["on"] = bool(v.get("on", False))
+                try:
+                    cfg[k]["min"] = min(max(float(v.get("min", cfg[k]["min"])), lo), hi)
+                except (TypeError, ValueError):
+                    pass
+        if saved.get("if_missing") in ("skip", "allow"):
+            cfg["if_missing"] = saved["if_missing"]
+    return cfg
+
+
+def _entry_log(symbol: str, category: str, outcome: str, detail: str) -> None:
+    _entry_rule_log.append({"at": (datetime.utcnow() + IST_OFFSET).strftime("%H:%M:%S"), "symbol": symbol,
+                            "category": category, "outcome": outcome, "detail": detail})
+    del _entry_rule_log[:-40]
+
+
+def _entry_oi_readings(sym: str, token: str):
+    """(oi_pct_at_0915, oi_pct_now, error). OI change % vs the previous day's close, from the nearest stock future.
+    Uses what the dashboard job already holds in memory and fetches only what is missing (up to 3 Upstox calls)."""
+    now_ist = datetime.utcnow() + IST_OFFSET
+    today = now_ist.strftime("%Y-%m-%d")
+    if now_ist.hour * 60 + now_ist.minute < 9 * 60 + 20:
+        return None, None, "the 09:15 candle has not closed yet"
+    key = _fut_key(sym, today)
+    if not key:
+        return None, None, "no stock future found"
+    if _oi_prev["date"] != today:
+        _oi_prev["date"], _oi_prev["map"] = today, {}
+    if _oi_open["date"] != today:
+        _oi_open["date"], _oi_open["map"] = today, {}
+    q = urllib.parse.quote(key, safe="|")
+
+    def candles(url: str) -> list:
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": BROWSER_USER_AGENT,
+                                                   "Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return ((json.loads(resp.read().decode()).get("data") or {}).get("candles")) or []
+    try:
+        if sym not in _oi_prev["map"]:
+            frm = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
+            prev = [c for c in sorted(candles(f"https://api.upstox.com/v3/historical-candle/{q}/days/1/{today}/{frm}"),
+                                      key=lambda c: c[0]) if c[0][:10] < today and len(c) >= 7]
+            if prev:
+                _oi_prev["map"][sym] = float(prev[-1][6] or 0)
+        if sym not in _oi_open["map"]:
+            for c in sorted(candles(f"https://api.upstox.com/v3/historical-candle/intraday/{q}/minutes/5"), key=lambda c: c[0]):
+                if c[0][11:16] == "09:15" and len(c) >= 7 and c[6]:
+                    _oi_open["map"][sym] = float(c[6])
+                    break
+        quote = _oi_quotes([sym], token, today).get(sym) or {}
+    except Exception as e:
+        return None, None, f"OI data call failed ({type(e).__name__})"
+    prev_oi, open_oi, now_oi = _oi_prev["map"].get(sym), _oi_open["map"].get(sym), quote.get("oi")
+    if not prev_oi or not open_oi or now_oi is None:
+        return None, None, "OI reading not available yet"
+    return (open_oi - prev_oi) / prev_oi * 100.0, (float(now_oi) - prev_oi) / prev_oi * 100.0, None
+
+
+def entry_rule_decision(symbol: str, category: str, alert_name: str, scan_name: str, token: str | None) -> tuple[bool, str]:
+    """(allowed, reason). Evaluates every ON condition; a failed condition blocks the trade, a reading that is not
+    available yet follows the 'if a reading is missing' choice (default: skip)."""
+    cfg = get_entry_rule()
+    if not cfg["enabled"]:
+        return True, ""
+    sym = (symbol or "").strip().upper()
+    if category not in ("Buy", "Sell"):
+        return True, ""
+    passed, failed, missing = [], [], []
+    word = "buying" if category == "Buy" else "selling"
+    names = {n.lower() for n in cfg["alerts"]}
+    if names and not ({(alert_name or "").lower(), (scan_name or "").lower()} & names):
+        failed.append(f"alert '{alert_name or scan_name or 'unknown'}' is not one of the selected alerts")
+    fc_needed = any(cfg[k]["on"] for k in ("ratio", "share", "pressure"))
+    info = None
+    if fc_needed:
+        try:
+            info = get_first_candle_info(sym, token)
+        except Exception:
+            info = None
+        if not info or info.get("status") != "ok":
+            why = (info or {}).get("status", "unavailable")
+            for k, lab in (("ratio", "9:15 volume ratio"), ("share", f"9:15 {word} share"), ("pressure", "direction pressure")):
+                if cfg[k]["on"]:
+                    missing.append(f"{lab} not available ({why})")
+            info = None
+    if info:
+        if cfg["ratio"]["on"]:
+            v = info.get("ratio")
+            (passed if v is not None and v >= cfg["ratio"]["min"] else failed).append(
+                f"9:15 volume {v}x " + ("meets" if v is not None and v >= cfg["ratio"]["min"] else "is below") + f" {cfg['ratio']['min']:g}x")
+        if cfg["share"]["on"]:
+            v = info.get("buy_share") if category == "Buy" else info.get("sell_share")
+            ok = v is not None and v >= cfg["share"]["min"]
+            (passed if ok else failed).append(f"9:15 {word} share {v}% " + ("meets" if ok else "is below") + f" {cfg['share']['min']:g}%")
+        if cfg["pressure"]["on"]:
+            v = info.get("buy_ratio") if category == "Buy" else info.get("sell_ratio")
+            ok = v is not None and v >= cfg["pressure"]["min"]
+            (passed if ok else failed).append(f"direction pressure {v}x " + ("meets" if ok else "is below") + f" {cfg['pressure']['min']:g}x")
+    if cfg["sector25"]["on"]:
+        try:
+            today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+            sec = SECTOR_MAP.get(sym)
+            val = _sector_0925_load(today).get(sec) if sec else None
+        except Exception:
+            val, sec = None, None
+        if val is None:
+            missing.append("sector % at 09:25 not available" + ("" if sec else " (stock has no sector)"))
+        else:
+            signed = val if category == "Buy" else -val
+            ok = signed >= cfg["sector25"]["min"]
+            (passed if ok else failed).append(f"sector {sec} {val:+.2f}% at 09:25 " + ("is with" if ok else "is not far enough with") +
+                                              f" the {category} alert (needs {cfg['sector25']['min']:g}%)")
+    if cfg["oi"]["on"]:
+        o_open, o_now, err = _entry_oi_readings(sym, token) if token else (None, None, "no Upstox token")
+        if err:
+            missing.append(err)
+        else:
+            ok = o_now - o_open > cfg["oi"]["min"] if cfg["oi"]["min"] > 0 else o_now > o_open
+            need = f" by at least {cfg['oi']['min']:g} pts" if cfg["oi"]["min"] > 0 else ""
+            (passed if ok else failed).append(f"OI {o_open:+.2f}% at 09:15 -> {o_now:+.2f}% now " + ("is rising" if ok else "is not rising") + need)
+    if failed:
+        reason = "Entry rule: " + "; ".join(failed)
+        _entry_log(sym, category, "SKIPPED", reason)
+        return False, reason
+    if missing:
+        if cfg["if_missing"] == "allow":
+            _entry_log(sym, category, "ALLOWED", "reading missing, allowed by setting: " + "; ".join(missing))
+            return True, ""
+        reason = "Entry rule: waiting for data - " + "; ".join(missing)
+        _entry_log(sym, category, "SKIPPED", reason)
+        return False, reason
+    _entry_log(sym, category, "PASSED", "; ".join(passed) or "no condition switched on")
+    return True, ""
+
+
+@app.route("/api/entry-rule", methods=["GET", "POST"])
+def api_entry_rule():
+    """GET: rule + known alert names + recent decisions. POST: saves the rule (validated and clamped)."""
+    try:
+        if request.method == "POST":
+            d = request.get_json(silent=True) or {}
+            cfg = get_entry_rule()
+            if "enabled" in d:
+                cfg["enabled"] = bool(d["enabled"])
+            if isinstance(d.get("alerts"), list):
+                cfg["alerts"] = [str(a)[:120] for a in d["alerts"]][:50]
+            for k in _ENTRY_RULE_LIMITS:
+                if isinstance(d.get(k), dict):
+                    cfg[k]["on"] = bool(d[k].get("on", cfg[k]["on"]))
+                    try:
+                        lo, hi = _ENTRY_RULE_LIMITS[k]
+                        cfg[k]["min"] = min(max(float(d[k].get("min", cfg[k]["min"])), lo), hi)
+                    except (TypeError, ValueError):
+                        pass
+            if d.get("if_missing") in ("skip", "allow"):
+                cfg["if_missing"] = d["if_missing"]
+            set_setting("entry_rule", json.dumps(cfg, separators=(",", ":")))
+        cfg = get_entry_rule()
+        cutoff = (datetime.utcnow() + IST_OFFSET - timedelta(days=45)).strftime("%Y-%m-%d")
+        with get_db() as conn:
+            rows = conn.execute("SELECT DISTINCT alert_name FROM alerts WHERE created_at >= ? AND alert_name IS NOT NULL "
+                                "AND alert_name <> '' ORDER BY alert_name", (cutoff,)).fetchall()
+        names = sorted({r["alert_name"] for r in rows} | set(cfg["alerts"]))
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"status": "error", "message": "database unavailable"}), 503
+    return jsonify({"status": "ok", "rule": cfg, "alert_names": names, "live_trading": get_live_trading_enabled(),
+                    "log": list(reversed(_entry_rule_log))})
+
+
 def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_name: str = "", scan_name: str = "") -> tuple[bool, str | None]:
     """Opens exactly one paper trade (and, if live trading is on, a
     matching live order) for a single already-resolved symbol/category/
@@ -1559,6 +1763,19 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                 return False, _fc_why
     except Exception as e:
         _fcv_log_decision(symbol, category, "error", f"{type(e).__name__}: {e}"[:140])
+
+    # Entry rule (recipe) - Settings. OFF by default. Applies to paper and live alike: both open here. A rule the
+    # user switched on is never skipped silently: if it cannot be evaluated, the 'if a reading is missing' choice
+    # decides, and the reason is recorded.
+    try:
+        _er_ok, _er_why = entry_rule_decision(symbol, category, alert_name, scan_name, access_token)
+        if not _er_ok:
+            return False, _er_why
+    except Exception as e:
+        _er_cfg = get_entry_rule()
+        _entry_log(symbol, category, "ERROR", f"{type(e).__name__}: {e}"[:140])
+        if _er_cfg["enabled"] and _er_cfg["if_missing"] == "skip":
+            return False, f"Entry rule: could not be evaluated ({type(e).__name__}) - entry skipped"
 
     option = get_atm_option(symbol, opt_type, price_val) if access_token else None
     premium = get_ltp_with_retry(option["instrument_key"], access_token) if option else None
