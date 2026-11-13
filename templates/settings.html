@@ -922,6 +922,10 @@
         opts: [0.25, 0.5, 0.75, 1, 1.5, 2], fmt: v => v + "%" },
       { key: "oi", name: "Open interest rising", hint: "Latest OI% above its 09:15 value (futures, vs previous day)", unit: "pts", label: "by at least",
         opts: [0, 0.05, 0.1, 0.25, 0.5, 1], fmt: v => v === 0 ? "any rise" : v + " pts" },
+      { key: "opt_volume", name: "Option liquidity: contracts traded today", hint: "Lots traded today in the option this alert would buy (skips contracts nobody trades)", unit: "lots",
+        opts: [10, 25, 50, 100, 250, 500, 1000], fmt: v => v + " lots" },
+      { key: "opt_active", name: "Option liquidity: active minutes", hint: "Minutes with trades in that option during the last 10 minutes", unit: "min",
+        opts: [2, 3, 5, 7, 9], fmt: v => v + " of last 10" },
     ];
     let erState = null, erTimer = null;
 
