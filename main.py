@@ -1521,10 +1521,12 @@ ENTRY_RULE_DEFAULT = {
     "pressure": {"on": False, "min": 3.0},            # 9:15 direction pressure >= x times
     "sector25": {"on": False, "min": 0.5},            # sector % at 09:25 moving WITH the alert >= x %
     "oi": {"on": False, "min": 0.0},                  # latest OI% > OI% at 09:15 by at least x points
+    "opt_volume": {"on": False, "min": 50.0},         # the option to be bought has traded >= x lots today
+    "opt_active": {"on": False, "min": 5.0},          # ... and traded in >= x of the last 10 minutes
     "if_missing": "skip",                             # "skip" or "allow" when a reading is not available yet
 }
 _ENTRY_RULE_LIMITS = {"ratio": (0.0, 100.0), "share": (0.0, 100.0), "pressure": (0.0, 100.0),
-                      "sector25": (0.0, 20.0), "oi": (0.0, 20.0)}
+                      "sector25": (0.0, 20.0), "oi": (0.0, 20.0), "opt_volume": (0.0, 100000.0), "opt_active": (0.0, 10.0)}
 _entry_rule_log: list = []
 
 
@@ -1600,7 +1602,29 @@ def _entry_oi_readings(sym: str, token: str):
     return (open_oi - prev_oi) / prev_oi * 100.0, (float(now_oi) - prev_oi) / prev_oi * 100.0, None
 
 
-def entry_rule_decision(symbol: str, category: str, alert_name: str, scan_name: str, token: str | None) -> tuple[bool, str, dict | None]:
+def _entry_option_liquidity(symbol: str, category: str, price_val, token: str):
+    """(lots traded today, minutes with trades in the last 10, option label, error) for the option this alert would
+    buy (the same ATM contract the trade will use). Illiquid far-month contracts often show 0 / 0."""
+    option = get_atm_option(symbol, "CE" if category == "Buy" else "PE", float(price_val)) if price_val else None
+    if not option:
+        return None, None, None, "no option contract found"
+    try:
+        rows = _fetch_1min_raw(option["instrument_key"], token)
+    except Exception as e:
+        return None, None, None, f"option candle call failed ({type(e).__name__})"
+    now_ist = datetime.utcnow() + IST_OFFSET
+    today = now_ist.strftime("%Y-%m-%d")
+    lot = float(option.get("lot_size") or 1)
+    day_rows = [r for r in rows if _to_naive_ist(r[0]).strftime("%Y-%m-%d") == today]
+    lots = sum(float(r[5] or 0) for r in day_rows) / lot
+    cutoff = now_ist - timedelta(minutes=10)
+    active = len({_to_naive_ist(r[0]).replace(second=0, microsecond=0) for r in day_rows
+                  if float(r[5] or 0) > 0 and _to_naive_ist(r[0]) >= cutoff})
+    return lots, active, option.get("label") or option.get("trading_symbol") or "", None
+
+
+def entry_rule_decision(symbol: str, category: str, alert_name: str, scan_name: str, token: str | None,
+                        price_val=None) -> tuple[bool, str, dict | None]:
     """(allowed, reason, detail). detail is saved on the trade (None when the rule is off). Evaluates every ON condition; a failed condition blocks the trade, a reading that is not
     available yet follows the 'if a reading is missing' choice (default: skip)."""
     cfg = get_entry_rule()
@@ -1664,6 +1688,20 @@ def entry_rule_decision(symbol: str, category: str, alert_name: str, scan_name: 
             ok = o_now - o_open > cfg["oi"]["min"] if cfg["oi"]["min"] > 0 else o_now > o_open
             need = f" by at least {cfg['oi']['min']:g} pts" if cfg["oi"]["min"] > 0 else ""
             (passed if ok else failed).append(f"OI {o_open:+.2f}% at 09:15 -> {o_now:+.2f}% now " + ("is rising" if ok else "is not rising") + need)
+    liq_pair = None
+    if cfg["opt_volume"]["on"] or cfg["opt_active"]["on"]:
+        lots, active, _lbl, err = (_entry_option_liquidity(sym, category, price_val, token) if token
+                                   else (None, None, None, "no Upstox token"))
+        if err:
+            missing.append(err)
+        else:
+            liq_pair = (round(lots, 1), active)
+            if cfg["opt_volume"]["on"]:
+                ok = lots >= cfg["opt_volume"]["min"]
+                (passed if ok else failed).append(f"option traded {lots:.0f} lots today " + ("meets" if ok else "is below") + f" {cfg['opt_volume']['min']:g}")
+            if cfg["opt_active"]["on"]:
+                ok = active >= cfg["opt_active"]["min"]
+                (passed if ok else failed).append(f"option traded in {active} of the last 10 minutes " + ("meets" if ok else "is below") + f" {cfg['opt_active']['min']:g}")
     if failed:
         reason = "Entry rule: " + "; ".join(failed)
         _entry_log(sym, category, "SKIPPED", reason)
@@ -1672,12 +1710,12 @@ def entry_rule_decision(symbol: str, category: str, alert_name: str, scan_name: 
     if missing:
         if cfg["if_missing"] == "allow":
             _entry_log(sym, category, "ALLOWED", "reading missing, allowed by setting: " + "; ".join(missing))
-            return True, "", {"v": "ALLOWED", "t": stamp, "oi": oi_pair, "text": "; ".join(passed), "missing": "; ".join(missing)}
+            return True, "", {"v": "ALLOWED", "t": stamp, "oi": oi_pair, "liq": liq_pair, "text": "; ".join(passed), "missing": "; ".join(missing)}
         reason = "Entry rule: waiting for data - " + "; ".join(missing)
         _entry_log(sym, category, "SKIPPED", reason)
         return False, reason, None
     _entry_log(sym, category, "PASSED", "; ".join(passed) or "no condition switched on")
-    return True, "", {"v": "PASSED", "t": stamp, "oi": oi_pair, "text": "; ".join(passed)}
+    return True, "", {"v": "PASSED", "t": stamp, "oi": oi_pair, "liq": liq_pair, "text": "; ".join(passed)}
 
 
 def _save_entry_rule_on_trade(trade_id: int, detail: dict) -> None:
@@ -1786,7 +1824,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # decides, and the reason is recorded.
     _er_detail = None
     try:
-        _er_ok, _er_why, _er_detail = entry_rule_decision(symbol, category, alert_name, scan_name, access_token)
+        _er_ok, _er_why, _er_detail = entry_rule_decision(symbol, category, alert_name, scan_name, access_token, price_val)
         if not _er_ok:
             return False, _er_why
     except Exception as e:
@@ -11971,6 +12009,9 @@ def _rule_note(t: dict) -> str:
     if isinstance(er, dict):
         oi = er.get("oi")
         oi_txt = f" OI {oi[0]:+.2f}% -> {oi[1]:+.2f}%" if isinstance(oi, list) and len(oi) == 2 else ""
+        liq = er.get("liq")
+        if isinstance(liq, list) and len(liq) == 2:
+            oi_txt += f" | option {liq[0]:g} lots, {liq[1]}/10 min"
         if er.get("v") == "ALLOWED":
             parts.append(f"Entry rule: allowed, a reading was missing{oi_txt}")
         else:
