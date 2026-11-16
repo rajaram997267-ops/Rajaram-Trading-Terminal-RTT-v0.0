@@ -212,7 +212,7 @@
         const d = await (await fetch("/api/movers-autopsy?n=" + $("apN").value + (date ? "&date=" + date : "") + (run ? "&run=1" : ""))).json();
         if (!$("apDate").value && d.default_date) $("apDate").value = d.default_date;
         if (d.state === "running") {
-          $("apStatus").textContent = "Reading stocks: " + d.done + " of " + (d.total || "?") + "...";
+          $("apStatus").textContent = d.phase === "ranking" ? "Step 1 of 2 - ranking all F&O stocks for that day: " + d.rank_done + " of " + (d.rank_total || "?") + "..." : "Step 2 of 2 - reading the movers: " + d.done + " of " + (d.total || "?") + "...";
           apTimer = setTimeout(() => apLoad(false), 3000);
         } else if (d.state === "done") {
           $("apStatus").textContent = "Done." + (d.last_error ? " (some stocks skipped: " + d.last_error + ")" : "");
