@@ -4310,6 +4310,223 @@ def api_preopen_results():
         return jsonify({"status": "error", "message": "database unavailable"}), 503
 
 
+# ---------------------------------------------------------------------------
+# Top movers autopsy: for one day, the biggest F&O gainers and losers with every reading that was known EARLY
+# (9:15 volume ratio, buying/selling share, pressure, sector at 09:25, OI) and when each stock's first alert came, so you
+# can see which conditions the winners really shared - and how much of the move was already over by the alert.
+# On demand only (button), one background job at a time, ~5 Upstox calls per stock at a gentle pace, stops at the
+# first rate-limit answer, results kept in memory for a few days (no database writes).
+# ---------------------------------------------------------------------------
+_autopsy: dict = {}
+_autopsy_lock = threading.Lock()
+
+
+def _autopsy_dates() -> tuple[str | None, str]:
+    """(latest day with a usable ranking, today)."""
+    today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    with get_db() as conn:
+        row = conn.execute("SELECT date FROM fno_daily_change GROUP BY date HAVING COUNT(*) >= 150 ORDER BY date DESC LIMIT 1").fetchone()
+    return (row["date"] if row else None), today
+
+
+def _floor5(hhmm: str) -> str:
+    h, m = int(hhmm[:2]), int(hhmm[3:5])
+    return f"{h:02d}:{m // 5 * 5:02d}"
+
+
+def _autopsy_dayvol(sym, date_str, hist, daily, raw_day, upto):
+    """Day volume so far vs the usual at that clock time, using only candles that started before `upto` (HH:MM)."""
+    rows = [c for c in raw_day if c[0][:10] == date_str and c[0][11:16] < upto]
+    if not rows:
+        return None
+    try:
+        st = _first_candle_stats(sym, date_str, hist, rows, daily)
+    except Exception:
+        return None
+    return (st.get("day_volume_so_far") or {}).get("ratio_vs_same_time_average")
+
+
+def _autopsy_summary(rows: list, side: str) -> list:
+    """How many of the movers passed each condition (the same thresholds as the recipe tester / entry rule)."""
+    def cnt(fn):
+        return sum(1 for r in rows if fn(r))
+    n = len(rows)
+    spec = [
+        ("Had an alert that day", "any time", lambda r: r["alerts"]["n"] > 0),
+        ("First alert by 09:30", "09:30", lambda r: r["alerts"]["first"] is not None and r["alerts"]["first"] <= "09:30"),
+        ("9:15 volume ratio >= 3x", "09:20", lambda r: (r["ratio"] or 0) >= 3),
+        ("9:15 buying/selling share >= 70%", "09:20", lambda r: (r["share"] or 0) >= 70),
+        ("Direction pressure >= 3x", "09:20", lambda r: (r["pressure"] or 0) >= 3),
+        ("Sector at 09:25 moving with the move >= 0.5%", "09:26", lambda r: r["sector_pct"] is not None and (r["sector_pct"] if side == "gain" else -r["sector_pct"]) >= 0.5),
+        ("OI at alert above OI at 09:15", "at alert", lambda r: r["oi"]["open"] is not None and r["oi"]["alert"] is not None and r["oi"]["alert"] > r["oi"]["open"]),
+        ("Day volume >= 1.5x at 09:30", "09:30", lambda r: (r["dayvol"]["0930"] or 0) >= 1.5),
+        ("Day volume >= 1.5x at 10:30", "10:30", lambda r: (r["dayvol"]["1030"] or 0) >= 1.5),
+        ("Day volume >= 1.5x when the alert came", "at alert", lambda r: (r["dayvol"]["alert"] or 0) >= 1.5),
+        ("Day volume >= 1.5x for the whole day", "after close", lambda r: (r["dayvol"]["eod"] or 0) >= 1.5),
+    ]
+    return [{"label": lab, "known": known, "pass": cnt(fn), "of": n} for lab, known, fn in spec]
+
+
+def _autopsy_job(date_str: str, n: int, token: str) -> None:
+    st = _autopsy[date_str]
+    try:
+        today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+        day = datetime.strptime(date_str, "%Y-%m-%d")
+        with get_db() as conn:
+            data = conn.execute("SELECT symbol, pct, close, prev_close FROM fno_daily_change WHERE date = ? AND pct IS NOT NULL",
+                                (date_str,)).fetchall()
+        data = [(r["symbol"], float(r["pct"]), r["close"], r["prev_close"]) for r in data]
+        if len(data) < 150:
+            raise RuntimeError("no usable ranking for this date - open the First Candle page for it once, then run again")
+        gain = sorted(data, key=lambda x: -x[1])[:n]
+        lose = sorted(data, key=lambda x: x[1])[:n]
+        # alerts of the day, per stock and per side
+        alerts: dict = {}
+        for a in _alerts_for_ist_date(date_str):
+            sym = (a.get("symbol") or "").strip().upper()
+            cat = categorize(a)
+            if not sym or cat not in ("Buy", "Sell"):
+                continue
+            try:
+                t = (datetime.fromisoformat(str(a["created_at"]).replace("Z", "")) + IST_OFFSET).strftime("%H:%M")
+            except Exception:
+                continue
+            e = alerts.setdefault((sym, cat), {"times": [], "names": set(), "price": {}})
+            e["times"].append(t)
+            nm = (a.get("alert_name") or a.get("scan_name") or "").strip()
+            if nm:
+                e["names"].add(nm)
+            try:
+                e["price"].setdefault(t, float(a.get("trigger_price")))
+            except (TypeError, ValueError):
+                pass
+        sec25 = _sector_0925_load(date_str)
+        base_url = "https://api.upstox.com/v3/historical-candle/"
+        work = [(s, "gain", p, c, pc) for s, p, c, pc in gain] + [(s, "lose", p, c, pc) for s, p, c, pc in lose]
+        st["total"] = len(work)
+        out = {"gain": [], "lose": []}
+        for rank_i, (sym, side, pct, close, prev_close) in enumerate(work):
+            rank = rank_i + 1 if side == "gain" else rank_i + 1 - len(gain)
+            try:
+                key = get_instrument_key(sym)
+                if not key:
+                    st["last_error"] = f"{sym}: no instrument key"
+                    st["done"] += 1
+                    continue
+                q = urllib.parse.quote(key, safe="|")
+                hist = _vol_fetch_candles(f"{base_url}{q}/minutes/5/{(day - timedelta(days=1)).strftime('%Y-%m-%d')}/{(day - timedelta(days=20)).strftime('%Y-%m-%d')}", token)
+                time.sleep(0.2)
+                daily = _vol_fetch_candles(f"{base_url}{q}/days/1/{(day - timedelta(days=1)).strftime('%Y-%m-%d')}/{(day - timedelta(days=100)).strftime('%Y-%m-%d')}", token)
+                time.sleep(0.2)
+                raw_day = (_vol_fetch_candles(f"{base_url}{q}/minutes/5/{date_str}/{date_str}", token) if date_str < today
+                           else _vol_fetch_candles(f"{base_url}intraday/{q}/minutes/5", token))
+                time.sleep(0.2)
+                full = _first_candle_stats(sym, date_str, hist, raw_day, daily)
+                vs, pr = full.get("volume_strength") or {}, full.get("price") or {}
+                is_buy = side == "gain"
+                share = vs.get("buy_share_of_candle_pct")
+                if share is not None and not is_buy:
+                    share = round(100.0 - share, 1)
+                pressure = vs.get("buy_pressure_ratio") if is_buy else vs.get("sell_pressure_ratio")
+                cat = "Buy" if is_buy else "Sell"
+                al = alerts.get((sym, cat))
+                first_t = min(al["times"]) if al else None
+                p_alert = al["price"].get(first_t) if al else None
+                before = after = None
+                if p_alert and pr.get("prev_close") and pr.get("last_close"):
+                    sign = 1 if is_buy else -1
+                    before = round(sign * (p_alert / pr["prev_close"] - 1.0) * 100.0, 2)
+                    after = round(sign * (pr["last_close"] / p_alert - 1.0) * 100.0, 2)
+                upto_alert = _floor5(first_t) if first_t else None
+                dv = {"0930": _autopsy_dayvol(sym, date_str, hist, daily, raw_day, "09:30"),
+                      "1030": _autopsy_dayvol(sym, date_str, hist, daily, raw_day, "10:30"),
+                      "alert": _autopsy_dayvol(sym, date_str, hist, daily, raw_day, upto_alert) if upto_alert and upto_alert > "09:15" else None,
+                      "eod": (full.get("day_volume_so_far") or {}).get("ratio_vs_same_time_average")}
+                oi = {"open": None, "alert": None, "close": None}
+                fkey = _fut_key(sym, today) if _futures_cache else None
+                if fkey:
+                    try:
+                        fq = urllib.parse.quote(fkey, safe="|")
+                        f5 = (_vol_fetch_candles(f"{base_url}{fq}/minutes/5/{date_str}/{date_str}", token) if date_str < today
+                              else _vol_fetch_candles(f"{base_url}intraday/{fq}/minutes/5", token))
+                        time.sleep(0.2)
+                        fd = [c for c in sorted(_vol_fetch_candles(f"{base_url}{fq}/days/1/{(day - timedelta(days=1)).strftime('%Y-%m-%d')}/{(day - timedelta(days=15)).strftime('%Y-%m-%d')}", token), key=lambda c: c[0]) if len(c) >= 7]
+                        time.sleep(0.2)
+                        prev_oi = float(fd[-1][6] or 0) if fd else 0
+                        f5 = sorted([c for c in f5 if c[0][:10] == date_str and len(c) >= 7 and c[6]], key=lambda c: c[0])
+                        if prev_oi and f5:
+                            def oipct(c):
+                                return round((float(c[6]) - prev_oi) / prev_oi * 100.0, 2)
+                            oi["open"], oi["close"] = oipct(f5[0]), oipct(f5[-1])
+                            if upto_alert:
+                                done = [c for c in f5 if c[0][11:16] < upto_alert]
+                                oi["alert"] = oipct(done[-1]) if done else None
+                    except urllib.error.HTTPError as e:
+                        if e.code == 429:
+                            raise
+                    except Exception:
+                        pass
+                sec = SECTOR_MAP.get(sym)
+                out[side].append({"symbol": sym, "rank": rank, "pct": round(pct, 2), "sector": sec,
+                                  "sector_pct": sec25.get(sec) if sec else None,
+                                  "alerts": {"n": len(al["names"]) if al else 0, "first": first_t, "names": sorted(al["names"]) if al else []},
+                                  "ratio": vs.get("ratio_vs_average"), "share": share, "pressure": pressure, "dayvol": dv, "oi": oi,
+                                  "before": before, "after": after, "status": full.get("status")})
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    raise RuntimeError("Upstox rate limit (429) - stopped; try again in a few minutes")
+                st["last_error"] = f"{sym}: HTTP {e.code}"
+            except RuntimeError:
+                raise
+            except Exception as e:
+                st["last_error"] = f"{sym}: {type(e).__name__}"
+            st["done"] += 1
+        st["rows"] = out
+        st["summary"] = {"gain": _autopsy_summary(out["gain"], "gain"), "lose": _autopsy_summary(out["lose"], "lose")}
+        st["state"] = "done"
+    except Exception as e:
+        st["state"] = "error"
+        st["error"] = f"{type(e).__name__}: {e}"[:220]
+        print(f"[autopsy] {st['error']}", flush=True)
+
+
+@app.route("/api/movers-autopsy")
+def api_movers_autopsy():
+    """?date=YYYY-MM-DD (default: latest ranked day) &n=10 &run=1 (starts the job). Poll until state != running."""
+    try:
+        latest, today = _autopsy_dates()
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    date_str = (request.args.get("date") or latest or "").strip()
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"state": "idle", "default_date": latest, "error": "no ranked day found yet - open the First Candle page once"}), 200
+    n = min(max(int(request.args.get("n", 10) or 10), 3), 15)
+    now = datetime.utcnow() + IST_OFFSET
+    st = _autopsy.get(date_str)
+    if st and st.get("n") != n and st["state"] != "running":
+        st = None
+    if request.args.get("run") and (not st or st["state"] in ("error",)):
+        token = get_setting("upstox_access_token")
+        if not token:
+            return jsonify({"state": "error", "error": "Upstox token missing", "default_date": latest}), 400
+        if date_str == today and now.strftime("%H:%M") < "15:45" and now.weekday() < 5:
+            return jsonify({"state": "error", "error": "today's ranking is final after 15:45 IST", "default_date": latest}), 400
+        with _autopsy_lock:
+            if any(v["state"] == "running" for v in _autopsy.values()):
+                return jsonify({"state": "error", "error": "another autopsy is still running", "default_date": latest}), 409
+            if len(_autopsy) >= 8:
+                for k in sorted(_autopsy)[:len(_autopsy) - 7]:
+                    _autopsy.pop(k, None)
+            st = {"state": "running", "n": n, "done": 0, "total": 0, "rows": None, "summary": None, "error": None, "last_error": None, "date": date_str}
+            _autopsy[date_str] = st
+            threading.Thread(target=_autopsy_job, args=(date_str, n, token), daemon=True, name="autopsy").start()
+    if not st:
+        return jsonify({"state": "idle", "date": date_str, "default_date": latest})
+    return jsonify(dict(st, default_date=latest, date=date_str))
+
+
 def _deep_size(obj, seen=None, depth=0) -> int:
     seen = seen if seen is not None else set()
     if id(obj) in seen or depth > 6:
