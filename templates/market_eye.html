@@ -80,6 +80,14 @@
   <div class="sub" id="oiNote" style="margin-top:8px;"></div>
   <div class="sub" style="margin-top:6px;">Reading: price up + OI up = long build-up; price down + OI up = short build-up; price up + OI down = short covering (weaker); price down + OI down = long unwinding.</div>
 
+  <h3 style="margin-top:28px;">Top movers autopsy</h3>
+  <div class="sub" style="margin-bottom:8px;">For one day: the biggest F&amp;O gainers and losers with the readings that were known <b>early</b> (9:15 volume ratio, buying/selling share, pressure, sector at 09:25, OI) and when each one's first alert came. Use it to see which conditions the winners shared, and how much of the move was already over when the alert fired. Press <b>Run autopsy</b>; it reads about 5 Upstox calls per stock at a gentle pace and is blocked for today until 15:45 IST.</div>
+  <div class="ctl">Date <input type="date" id="apDate" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;">
+    Top <select id="apN" style="background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:5px 8px;"><option>5</option><option selected>10</option><option>15</option></select>
+    <button id="apRun" style="padding:6px 12px;border-radius:6px;border:1px solid var(--border);background:var(--green);color:#fff;cursor:pointer;margin-left:6px;">Run autopsy</button>
+    <span id="apStatus" class="mut" style="margin-left:10px;"></span></div>
+  <div id="apOut"></div>
+
   <h3 style="margin-top:28px;">Memory &amp; feature switches</h3>
   <div class="sub" style="margin-bottom:8px;">Render's free plan restarts the service above 512 MB. Switch a feature OFF to stop its background work and free its memory; switch it back ON when you need it. Saved in settings, so it survives restarts.</div>
   <div id="memBox" class="sub" style="font-size:13px;margin-bottom:8px;">Loading...</div>
@@ -170,6 +178,57 @@
       loadSectors(date, token);
       loadOi(date, token);
     }
+    // ---------- Top movers autopsy ----------
+    let apTimer = null;
+    const nz = v => v === null || v === undefined;
+    const fx = (v, d) => nz(v) ? '<span class="mut">-</span>' : Number(v).toFixed(d == null ? 1 : d) + "&times;";
+    const fp = v => nz(v) ? '<span class="mut">-</span>' : (v > 0 ? "+" : "") + Number(v).toFixed(2) + "%";
+    function apOi(o) {
+      if (nz(o.open) && nz(o.alert) && nz(o.close)) return '<span class="mut">-</span>';
+      const f = v => nz(v) ? "-" : (v > 0 ? "+" : "") + v.toFixed(2);
+      const up = !nz(o.open) && !nz(o.alert) && o.alert > o.open;
+      return '<span class="' + (up ? "pos" : (!nz(o.open) && !nz(o.alert) && o.alert < o.open ? "neg" : "")) + '">' + f(o.open) + " &rarr; " + f(o.alert) + " &rarr; " + f(o.close) + "</span>";
+    }
+    function apTable(title, rows, side) {
+      const head = "<tr><th>#</th><th>Symbol</th><th>Day %</th><th>Alerts (count &middot; first)</th><th>Sector &#64;9:25</th><th>9:15 ratio</th><th>" + (side === "gain" ? "Buy" : "Sell") + " share</th><th>Pressure</th><th>Day vol 09:30</th><th>10:30</th><th>At alert</th><th>Whole day</th><th>OI % 09:15 &rarr; alert &rarr; close</th><th>Moved before alert</th><th>Moved after alert</th></tr>";
+      const body = rows.map(r => "<tr><td>" + r.rank + "</td><td><b>" + esc(r.symbol) + "</b></td><td>" + pct(r.pct) + "</td><td>" +
+        (r.alerts.n ? r.alerts.n + "x &middot; " + esc(r.alerts.first) : '<span class="neg">none</span>') + "</td><td>" +
+        (r.sector ? esc(r.sector) + (nz(r.sector_pct) ? " " + pct(r.sector_pct) : "") : '<span class="mut">-</span>') + "</td><td>" + fx(r.ratio) + "</td><td>" + (nz(r.share) ? '<span class="mut">-</span>' : r.share + "%") + "</td><td>" + fx(r.pressure) + "</td><td>" +
+        fx(r.dayvol["0930"]) + "</td><td>" + fx(r.dayvol["1030"]) + "</td><td>" + fx(r.dayvol.alert) + '</td><td><span class="mut">' + fx(r.dayvol.eod) + "</span></td><td>" + apOi(r.oi) + "</td><td>" + fp(r.before) + "</td><td>" + fp(r.after) + "</td></tr>").join("");
+      return "<h4 style=\"margin:16px 0 6px;\">" + title + '</h4><div class="wrap"><table><thead>' + head + "</thead><tbody>" + body + "</tbody></table></div>";
+    }
+    function apRender(d) {
+      const s = d.summary, g = s.gain, l = s.lose;
+      let html = '<h4 style="margin:16px 0 6px;">What the movers had in common (' + esc(d.date) + ")</h4><div class=\"wrap\"><table><thead><tr><th>Condition</th><th>Known at</th><th>Top gainers</th><th>Top losers</th></tr></thead><tbody>" +
+        g.map((x, i) => "<tr><td>" + esc(x.label) + "</td><td>" + esc(x.known) + "</td><td><b>" + x.pass + "</b> of " + x.of + "</td><td><b>" + l[i].pass + "</b> of " + l[i].of + "</td></tr>").join("") + "</tbody></table></div>" +
+        '<div class="sub" style="margin-top:6px;">Conditions marked "after close" cannot be used at entry. Day volume at 09:30, 10:30 and at the alert uses only candles up to that time, so it is a fair, no-hindsight test. OI uses the nearest unexpired future, which for older days may be the next-month contract. "Moved before alert" is the move from the previous close to the alert price in the direction of the alert; "after alert" is from the alert price to the close, so it is what a trade could have caught.</div>';
+      html += apTable("Top gainers (Buy side)", d.rows.gain, "gain") + apTable("Top losers (Sell side)", d.rows.lose, "lose");
+      $("apOut").innerHTML = html;
+    }
+    async function apLoad(run) {
+      clearTimeout(apTimer);
+      const date = $("apDate").value;
+      try {
+        const d = await (await fetch("/api/movers-autopsy?n=" + $("apN").value + (date ? "&date=" + date : "") + (run ? "&run=1" : ""))).json();
+        if (!$("apDate").value && d.default_date) $("apDate").value = d.default_date;
+        if (d.state === "running") {
+          $("apStatus").textContent = "Reading stocks: " + d.done + " of " + (d.total || "?") + "...";
+          apTimer = setTimeout(() => apLoad(false), 3000);
+        } else if (d.state === "done") {
+          $("apStatus").textContent = "Done." + (d.last_error ? " (some stocks skipped: " + d.last_error + ")" : "");
+          apRender(d);
+        } else if (d.state === "error" || d.error) {
+          $("apStatus").textContent = d.error || "Failed.";
+        } else {
+          $("apStatus").textContent = "Press Run autopsy for " + (d.date || date) + ".";
+        }
+      } catch (e) { $("apStatus").textContent = "Could not load."; }
+    }
+    $("apRun").onclick = () => { $("apOut").innerHTML = ""; apLoad(true); };
+    $("apDate").onchange = () => { $("apOut").innerHTML = ""; apLoad(false); };
+    $("apN").onchange = () => { $("apOut").innerHTML = ""; apLoad(false); };
+    apLoad(false);
+
     async function loadMemory() {
       try {
         const d = await (await fetch("/api/memory")).json();
