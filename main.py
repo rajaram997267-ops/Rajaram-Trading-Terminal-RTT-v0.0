@@ -4372,12 +4372,32 @@ def _autopsy_job(date_str: str, n: int, token: str) -> None:
     try:
         today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
         day = datetime.strptime(date_str, "%Y-%m-%d")
-        with get_db() as conn:
-            data = conn.execute("SELECT symbol, pct, close, prev_close FROM fno_daily_change WHERE date = ? AND pct IS NOT NULL",
-                                (date_str,)).fetchall()
-        data = [(r["symbol"], float(r["pct"]), r["close"], r["prev_close"]) for r in data]
+        def load_ranks():
+            with get_db() as conn:
+                rows = conn.execute("SELECT symbol, pct, close, prev_close FROM fno_daily_change WHERE date = ? AND pct IS NOT NULL",
+                                    (date_str,)).fetchall()
+            return [(r["symbol"], float(r["pct"]), r["close"], r["prev_close"]) for r in rows]
+        data = load_ranks()
         if len(data) < 150:
-            raise RuntimeError("no usable ranking for this date - open the First Candle page for it once, then run again")
+            # The day has not been ranked and stored yet (only the Benchmark / Run study stores it). Build it here with the
+            # same job those use: one daily-candle call per F&O stock (about a minute), then carry on.
+            st["phase"] = "ranking"
+            with _fno_rank_lock:
+                free = _fno_rank_state["state"] != "running"
+                if free:
+                    _fno_rank_state.update(state="running", done=0, total=0, error=None)
+            if free:
+                _fno_rank_worker(token, date_str, [date_str])
+            else:
+                waited = 0
+                while _fno_rank_state["state"] == "running" and waited < 240:
+                    time.sleep(3)
+                    waited += 3
+            data = load_ranks()
+            if len(data) < 150:
+                raise RuntimeError(f"could not rank {date_str}: " + (_fno_rank_state.get("last_error") or
+                                   "Upstox returned no daily data for that date (weekend or holiday?)"))
+            st["phase"] = "stocks"
         gain = sorted(data, key=lambda x: -x[1])[:n]
         lose = sorted(data, key=lambda x: x[1])[:n]
         # alerts of the day, per stock and per side
@@ -4519,12 +4539,13 @@ def api_movers_autopsy():
             if len(_autopsy) >= 8:
                 for k in sorted(_autopsy)[:len(_autopsy) - 7]:
                     _autopsy.pop(k, None)
-            st = {"state": "running", "n": n, "done": 0, "total": 0, "rows": None, "summary": None, "error": None, "last_error": None, "date": date_str}
+            st = {"state": "running", "n": n, "done": 0, "total": 0, "rows": None, "summary": None, "error": None, "last_error": None,
+                  "date": date_str, "phase": "stocks"}
             _autopsy[date_str] = st
             threading.Thread(target=_autopsy_job, args=(date_str, n, token), daemon=True, name="autopsy").start()
     if not st:
         return jsonify({"state": "idle", "date": date_str, "default_date": latest})
-    return jsonify(dict(st, default_date=latest, date=date_str))
+    return jsonify(dict(st, default_date=latest, date=date_str, rank_done=_fno_rank_state["done"], rank_total=_fno_rank_state["total"]))
 
 
 def _deep_size(obj, seen=None, depth=0) -> int:
