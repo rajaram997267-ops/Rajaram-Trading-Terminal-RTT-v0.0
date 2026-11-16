@@ -773,6 +773,16 @@ def init_db():
         )
         for _col in ("buy_val", "sell_val", "buy_stocks", "sell_stocks"):
             conn.execute(f"ALTER TABLE sector_0925 ADD COLUMN IF NOT EXISTS {_col} DOUBLE PRECISION")
+        # Pre-open context: ONE row per trading day (a small JSON summary, ~50 KB), the last 45 days kept.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS preopen_context (
+                date TEXT PRIMARY KEY,
+                built_at TEXT,
+                payload TEXT
+            )
+            """
+        )
         # ~09:25 IST snapshot of every F&O stock future's open interest (cannot be backfilled, so it is logged daily).
         conn.execute(
             """
@@ -3610,6 +3620,7 @@ FEATURE_SWITCHES = {
     "oi_snapshot": "Daily ~09:26 OI snapshot of all F&O futures (writes to the database once a day)",
     "sector_925": "Sector % / flow at 09:25 (calculated from 5-min candles of all F&O stocks)",
     "fno_rank": "Top F&O gainers / losers rank on the dashboard",
+    "preopen_context": "Pre-open context: nightly build of sector rotation, stage, breadth and volume spikes (after 16:00 IST)",
 }
 _feature_flags: dict = {"t": 0.0, "v": {}}
 
@@ -3639,6 +3650,8 @@ def _free_feature_memory(name: str) -> None:
         _sector0925_partial.clear()
     elif name == "fno_rank":
         _fno_movers_cache["data"] = None
+    elif name == "preopen_context":
+        _preopen_mem["payload"] = None
     gc.collect()
 
 
@@ -3929,6 +3942,374 @@ def market_eye_page():
                            today=(datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d"))
 
 
+# ---------------------------------------------------------------------------
+# Pre-open context: sector rotation (RRG), stock stage, daily breadth, yesterday's volume spikes and results flags.
+# Built to be light: ONE background job a day (after 16:00 IST, never while the market is open), one Upstox daily-candle
+# call per stock at ~3 calls/s that stops at the first rate-limit answer, one stock held in memory at a time (only a
+# small record is kept), ONE database row per day (last 45 days), and no database reads except when the page is opened.
+# ---------------------------------------------------------------------------
+PREOPEN_AUTO_WINDOW = ("16:00", "16:40")
+_preopen_state: dict = {"state": "idle", "done": 0, "total": 0, "ok": 0, "failed": 0, "last_error": None, "started": None}
+_preopen_lock = threading.Lock()
+_preopen_mem: dict = {"t": 0.0, "payload": None}
+
+
+def _preopen_market_open(now: datetime) -> bool:
+    return now.weekday() < 5 and "09:00" <= now.strftime("%H:%M") < "15:45"
+
+
+def _pct(a, b):
+    return round((a / b - 1.0) * 100.0, 2) if (a is not None and b) else None
+
+
+def _preopen_stock(candles: list, today: str, include_today: bool):
+    """(record, [(date, daily_return)...]) from one stock's daily candles, or (None, [])."""
+    rows = [c for c in sorted(candles, key=lambda c: c[0]) if len(c) >= 6 and c[4]]
+    if rows and rows[-1][0][:10] == today and not include_today:
+        rows = rows[:-1]
+    if len(rows) < 60:
+        return None, []
+    dates = [r[0][:10] for r in rows]
+    cl = [float(r[4]) for r in rows]
+    hi = [float(r[2] or r[4]) for r in rows]
+    lo = [float(r[3] or r[4]) for r in rows]
+    vo = [float(r[5] or 0) for r in rows]
+    last, prev = cl[-1], cl[-2]
+
+    def ma(n):
+        return sum(cl[-n:]) / n if len(cl) >= n else None
+    ma50, ma150, ma200 = ma(50), ma(150), ma(200)
+    ma200_old = sum(cl[-220:-20]) / 200 if len(cl) >= 220 else None
+    stage = None
+    if ma150 and ma200:
+        if last > ma150 and last > ma200 and ma150 > ma200 and ma200_old and ma200 > ma200_old:
+            stage = 2
+        elif last < ma150 and last < ma200 and ma150 < ma200 and ma200_old and ma200 < ma200_old:
+            stage = 4
+        else:
+            stage = 0
+    h252, l252 = max(hi[-252:]), min(lo[-252:])
+    new_high = len(hi) > 60 and hi[-1] >= max(hi[-252:-1])
+    new_low = len(lo) > 60 and lo[-1] <= min(lo[-252:-1])
+    avg20 = sum(vo[-21:-1]) / 20 if len(vo) >= 21 else 0
+    vratio = round(vo[-1] / avg20, 2) if avg20 > 0 else None
+    spike = None
+    if vo[-1] > 0:
+        if len(vo) >= 150 and vo[-1] >= max(vo[-253:-1]):
+            spike = "year"
+        elif len(vo) >= 64 and vo[-1] >= max(vo[-64:-1]):
+            spike = "quarter"
+    rec = {"c": round(last, 2), "chg": _pct(last, prev), "d50": _pct(last, ma50), "d150": _pct(last, ma150), "d200": _pct(last, ma200),
+           "st": stage, "pos": round((last - l252) / (h252 - l252) * 100, 0) if h252 > l252 else None,
+           "nh": 1 if new_high else 0, "nl": 1 if new_low else 0, "vr": vratio, "vs": spike,
+           "r1m": _pct(last, cl[-22]) if len(cl) >= 22 else None, "r3m": _pct(last, cl[-64]) if len(cl) >= 64 else None,
+           "d": dates[-1]}
+    rets = [(dates[i], cl[i] / cl[i - 1] - 1.0) for i in range(max(1, len(cl) - 130), len(cl))]
+    return rec, rets
+
+
+def _preopen_rrg(acc: dict, mkt: dict, counts: dict) -> list:
+    """Simplified RRG. Equal-weight index per sector and for the F&O universe; RS = sector / market;
+    RS-Ratio = 100 x RS / its 50-day average; Momentum = 100 x RS-Ratio / RS-Ratio 10 days ago."""
+    if not mkt:
+        return []
+    maxn = max(v[1] for v in mkt.values())
+    dates = sorted(d for d, v in mkt.items() if v[1] >= 0.5 * maxn)
+    if len(dates) < 75:
+        return []
+    mret = {d: mkt[d][0] / mkt[d][1] for d in dates}
+    midx, v = [], 1.0
+    for d in dates:
+        v *= 1.0 + mret[d]
+        midx.append(v)
+    out = []
+    for sec, n_members in counts.items():
+        sidx, v = [], 1.0
+        for d in dates:
+            t = acc.get(d, {}).get(sec)
+            v *= 1.0 + ((t[0] / t[1]) if (t and t[1] >= 2) else mret[d])
+            sidx.append(v)
+        rs = [sidx[i] / midx[i] for i in range(len(dates))]
+        rsr = [100.0 * rs[i] / (sum(rs[i - 49:i + 1]) / 50.0) for i in range(49, len(rs))]
+        if len(rsr) < 25:
+            continue
+        mom = [100.0 * rsr[i] / rsr[i - 10] for i in range(10, len(rsr))]
+        rs_now, mom_now = rsr[-1], mom[-1]
+        tail = [[round(rsr[-1 - k], 2), round(mom[-1 - k], 2)] for k in (12, 9, 6, 3, 0) if len(mom) > k]
+        quad = ("Leading" if mom_now >= 100 else "Weakening") if rs_now >= 100 else ("Improving" if mom_now >= 100 else "Lagging")
+        out.append({"name": sec, "n": n_members, "rs": round(rs_now, 2), "mom": round(mom_now, 2), "q": quad, "tail": tail,
+                    "r1m": round((sidx[-1] / sidx[-22] - 1.0) * 100.0, 2) if len(sidx) > 22 else None})
+    out.sort(key=lambda x: -(x["rs"] + x["mom"]))
+    return out
+
+
+def _preopen_fetch_events(symbols: set, today: str) -> tuple[dict, str]:
+    """Results dates from NSE's event calendar (best effort: NSE often blocks cloud servers).
+    Returns ({SYMBOL: [iso dates]}, note)."""
+    try:
+        import http.cookiejar
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        hdr = {"User-Agent": BROWSER_USER_AGENT, "Accept": "application/json, text/html, */*", "Accept-Language": "en-US,en;q=0.9",
+               "Accept-Encoding": "identity", "Referer": "https://www.nseindia.com/"}
+        opener.open(urllib.request.Request("https://www.nseindia.com", headers=hdr), timeout=10).read(2048)
+        raw = opener.open(urllib.request.Request("https://www.nseindia.com/api/event-calendar", headers=hdr), timeout=15).read()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        items = json.loads(raw.decode("utf-8", errors="replace"))
+        lo = datetime.strptime(today, "%Y-%m-%d") - timedelta(days=4)
+        hi = datetime.strptime(today, "%Y-%m-%d") + timedelta(days=7)
+        out: dict = {}
+        for it in items if isinstance(items, list) else []:
+            sym = (it.get("symbol") or "").strip().upper()
+            if sym in symbols and "result" in (it.get("purpose") or "").lower():
+                try:
+                    d = datetime.strptime(it.get("date") or "", "%d-%b-%Y")
+                except ValueError:
+                    continue
+                if lo <= d <= hi:
+                    out.setdefault(sym, []).append(d.strftime("%Y-%m-%d"))
+        return out, f"NSE event calendar read at {(datetime.utcnow() + IST_OFFSET).strftime('%H:%M')} IST: {len(out)} F&O stocks with results dates"
+    except Exception as e:
+        return {}, f"NSE event calendar could not be read ({type(e).__name__}) - add today's results stocks by hand below"
+
+
+def _preopen_job(token: str, today: str) -> None:
+    st = _preopen_state
+    try:
+        universe = _fno_universe()
+        st.update(total=len(universe), done=0, ok=0, failed=0, last_error=None,
+                  started=(datetime.utcnow() + IST_OFFSET).strftime("%H:%M:%S"))
+        if not universe:
+            raise RuntimeError("no F&O instrument keys (instrument master not loaded)")
+        include_today = (datetime.utcnow() + IST_OFFSET).strftime("%H:%M") >= "15:45"
+        frm = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=420)).strftime("%Y-%m-%d")
+        stocks: dict = {}
+        acc: dict = {}
+        mkt: dict = {}
+        counts: dict = {}
+        for symbol, key in universe:
+            try:
+                url = f"https://api.upstox.com/v3/historical-candle/{urllib.parse.quote(key, safe='|')}/days/1/{today}/{frm}"
+                req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": BROWSER_USER_AGENT,
+                                                           "Authorization": f"Bearer {token}"})
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    candles = ((json.loads(resp.read().decode()).get("data") or {}).get("candles")) or []
+                rec, rets = _preopen_stock(candles, today, include_today)
+                del candles
+                if rec:
+                    stocks[symbol] = rec
+                    sec = SECTOR_MAP.get(symbol)
+                    if sec and sec != "Unclassified":
+                        counts[sec] = counts.get(sec, 0) + 1
+                        for d, r in rets:
+                            a = acc.setdefault(d, {}).setdefault(sec, [0.0, 0])
+                            a[0] += r
+                            a[1] += 1
+                            m = mkt.setdefault(d, [0.0, 0])
+                            m[0] += r
+                            m[1] += 1
+                st["ok"] += 1
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    raise RuntimeError("Upstox rate limit (429) - stopped to protect trade monitoring; try again later")
+                st["failed"] += 1
+                st["last_error"] = f"{symbol}: HTTP {e.code}"
+            except RuntimeError:
+                raise
+            except Exception as e:
+                st["failed"] += 1
+                st["last_error"] = f"{symbol}: {type(e).__name__}"
+            st["done"] += 1
+            time.sleep(0.35)
+        if len(stocks) < 0.6 * len(universe):
+            raise RuntimeError(f"only {len(stocks)} of {len(universe)} stocks returned data - not saved")
+        vals = list(stocks.values())
+        as_of = max(v["d"] for v in vals)
+        n = len(vals)
+        with50 = [v for v in vals if v["d50"] is not None]
+        with200 = [v for v in vals if v["d200"] is not None]
+        pct50 = round(100.0 * sum(1 for v in with50 if v["d50"] > 0) / max(len(with50), 1), 1)
+        pct200 = round(100.0 * sum(1 for v in with200 if v["d200"] > 0) / max(len(with200), 1), 1)
+        adv = sum(1 for v in vals if (v["chg"] or 0) > 0)
+        dec = sum(1 for v in vals if (v["chg"] or 0) < 0)
+        regime = "Strong" if pct50 >= 60 and adv >= dec else ("Weak" if pct50 <= 40 and dec >= adv else "Mixed")
+        events, note = _preopen_fetch_events(set(stocks), today)
+        payload = {"as_of": as_of, "built_at": (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d %H:%M"), "n": n,
+                   "breadth": {"regime": regime, "pct50": pct50, "pct200": pct200, "adv": adv, "dec": dec,
+                               "nh": sum(v["nh"] for v in vals), "nl": sum(v["nl"] for v in vals),
+                               "s2": sum(1 for v in vals if v["st"] == 2), "s4": sum(1 for v in vals if v["st"] == 4)},
+                   "sectors": _preopen_rrg(acc, mkt, counts), "stocks": stocks, "events": events, "events_note": note}
+        with get_db() as conn:
+            conn.execute("INSERT INTO preopen_context (date, built_at, payload) VALUES (?, ?, ?) "
+                         "ON CONFLICT (date) DO UPDATE SET built_at = excluded.built_at, payload = excluded.payload",
+                         (as_of, payload["built_at"], json.dumps(payload, separators=(",", ":"))))
+            conn.execute("DELETE FROM preopen_context WHERE date < ?",
+                         ((datetime.strptime(as_of, "%Y-%m-%d") - timedelta(days=45)).strftime("%Y-%m-%d"),))
+            conn.commit()
+        _preopen_mem["payload"], _preopen_mem["t"] = payload, time.time()
+        st["state"] = "done"
+    except Exception as e:
+        st["state"] = "error"
+        st["last_error"] = f"{type(e).__name__}: {e}"[:200]
+        print(f"[preopen] {st['last_error']}", flush=True)
+
+
+def _preopen_payload(force_db: bool = False):
+    if not force_db and _preopen_mem["payload"] is not None and time.time() - _preopen_mem["t"] < 300:
+        return _preopen_mem["payload"]
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT payload FROM preopen_context ORDER BY date DESC LIMIT 1").fetchone()
+        if row:
+            _preopen_mem["payload"], _preopen_mem["t"] = json.loads(row["payload"]), time.time()
+    except Exception:
+        pass
+    return _preopen_mem["payload"]
+
+
+def _preopen_start(token: str, today: str) -> bool:
+    with _preopen_lock:
+        if _preopen_state["state"] == "running":
+            return False
+        _preopen_state["state"] = "running"
+    threading.Thread(target=_preopen_job, args=(token, today), daemon=True, name="preopen").start()
+    return True
+
+
+def _preopen_loop() -> None:
+    """Nightly auto-build: 16:00-16:40 IST on weekdays, once. Touches the database only inside that window."""
+    done_for = None
+    while True:
+        try:
+            now = datetime.utcnow() + IST_OFFSET
+            today = now.strftime("%Y-%m-%d")
+            if (now.weekday() < 5 and PREOPEN_AUTO_WINDOW[0] <= now.strftime("%H:%M") <= PREOPEN_AUTO_WINDOW[1]
+                    and done_for != today and _preopen_state["state"] != "running" and _feature_on("preopen_context")):
+                pl = _preopen_payload(force_db=True)
+                if pl and pl.get("as_of") == today:
+                    done_for = today
+                else:
+                    token = get_setting("upstox_access_token")
+                    if token and _preopen_start(token, today):
+                        done_for = today
+        except Exception as e:
+            print(f"[preopen-loop] {e}", flush=True)
+        time.sleep(120)
+
+
+_preopen_thread_started = False
+
+
+def ensure_preopen_loop_started() -> None:
+    global _preopen_thread_started
+    if _preopen_thread_started:
+        return
+    _preopen_thread_started = True
+    threading.Thread(target=_preopen_loop, daemon=True, name="preopen-loop").start()
+
+
+_preopen_manual_cache: dict = {"t": 0.0, "date": None, "v": []}
+
+
+def _preopen_manual_list() -> list:
+    """Hand-entered results list for today, cached 2 minutes so page polling does not read the database each time."""
+    today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    c = _preopen_manual_cache
+    if c["date"] == today and time.time() - c["t"] < 120:
+        return c["v"]
+    try:
+        d = json.loads(get_setting("preopen_results_manual", "") or "{}")
+        c["v"] = d.get("symbols", []) if d.get("date") == today else []
+        c["t"], c["date"] = time.time(), today
+    except Exception:
+        pass
+    return c["v"]
+
+
+@app.route("/preopen-context")
+def preopen_context_page():
+    return render_template("preopen_context.html", active_tab="preopen_context")
+
+
+@app.route("/api/preopen-context")
+def api_preopen_context():
+    now = datetime.utcnow() + IST_OFFSET
+    today = now.strftime("%Y-%m-%d")
+    pl = _preopen_payload()
+    st = _preopen_state
+    out = {"state": st["state"], "done": st["done"], "total": st["total"], "last_error": st["last_error"],
+           "market_open": _preopen_market_open(now), "enabled": _feature_on("preopen_context"), "today": today,
+           "manual": list(_preopen_manual_list()), "has_data": bool(pl)}
+    if not pl:
+        return jsonify(out)
+    as_of = pl["as_of"]
+    sec_q = {x["name"]: x["q"] for x in pl["sectors"]}
+    manual = set(_preopen_manual_list())
+    stocks = []
+    for sym, v in pl["stocks"].items():
+        res = None
+        dates = sorted((pl.get("events") or {}).get(sym, []))
+        for d in dates:
+            if d == today:
+                res = {"flag": "today", "date": d}
+                break
+            if d == as_of and as_of != today:
+                res = {"flag": "last session", "date": d}
+            elif d > today and res is None:
+                res = {"flag": "soon", "date": d}
+        if sym in manual:
+            res = {"flag": "today", "date": today, "manual": True}
+        sec = SECTOR_MAP.get(sym)
+        stocks.append(dict(v, symbol=sym, sector=sec, q=sec_q.get(sec), res=res))
+    out.update({"as_of": as_of, "built_at": pl["built_at"], "n": pl["n"], "breadth": pl["breadth"], "sectors": pl["sectors"],
+                "stocks": stocks, "events_note": pl.get("events_note")})
+    return jsonify(out)
+
+
+@app.route("/api/preopen-context/run", methods=["POST"])
+def api_preopen_run():
+    now = datetime.utcnow() + IST_OFFSET
+    if not _feature_on("preopen_context"):
+        return jsonify({"status": "error", "message": "switched OFF (Market EYE > Memory & feature switches)"}), 400
+    if _preopen_market_open(now):
+        return jsonify({"status": "error", "message": "not while the market is open - it would compete with trade monitoring. Run it after 15:45 IST."}), 400
+    token = get_setting("upstox_access_token")
+    if not token:
+        return jsonify({"status": "error", "message": "Upstox token missing"}), 400
+    started = _preopen_start(token, now.strftime("%Y-%m-%d"))
+    return jsonify({"status": "ok", "started": started})
+
+
+@app.route("/api/preopen-context/results", methods=["POST"])
+def api_preopen_results():
+    """Saves today's hand-entered results list and/or re-reads NSE's event calendar (one or two requests)."""
+    body = request.get_json(silent=True) or {}
+    today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    try:
+        if "symbols" in body:
+            syms = sorted({x.strip().upper() for x in re.split(r"[,\s]+", str(body["symbols"])) if x.strip()})[:200]
+            set_setting("preopen_results_manual", json.dumps({"date": today, "symbols": syms}))
+            _preopen_manual_cache.update(t=time.time(), date=today, v=syms)
+        note = None
+        if body.get("refresh"):
+            pl = _preopen_payload(force_db=True)
+            if pl:
+                events, note = _preopen_fetch_events(set(pl["stocks"]), today)
+                if events:
+                    pl["events"], pl["events_note"] = events, note
+                    with get_db() as conn:
+                        conn.execute("UPDATE preopen_context SET payload = ? WHERE date = ?",
+                                     (json.dumps(pl, separators=(",", ":")), pl["as_of"]))
+                        conn.commit()
+                    _preopen_mem["payload"], _preopen_mem["t"] = pl, time.time()
+                else:
+                    pl["events_note"] = note
+        return jsonify({"status": "ok", "note": note})
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"status": "error", "message": "database unavailable"}), 503
+
+
 def _deep_size(obj, seen=None, depth=0) -> int:
     seen = seen if seen is not None else set()
     if id(obj) in seen or depth > 6:
@@ -3959,7 +4340,8 @@ def api_memory():
     names = ["_instrument_cache", "_option_chain_cache", "_futures_cache", "_alerts_api_cache", "_vol_history_cache",
              "_vol_history_cache_past", "_vol_reading_cache", "_today_candle_cache", "_prev_session_candle_cache",
              "_fcv_cache", "_ws_price_cache", "_exit_lab_cache", "_lab_vol_cache", "_sector0925_full_mem", "_oi_prev",
-             "_oi_open", "_oi_latest", "_oi_quote_cache", "_fno_movers_cache", "_fib_close_cache", "_prev_close_cache"]
+             "_oi_open", "_oi_latest", "_oi_quote_cache", "_fno_movers_cache", "_fib_close_cache", "_prev_close_cache",
+             "_preopen_mem"]
     caches = []
     for n in names:
         if n in g:
@@ -13348,6 +13730,7 @@ except Exception as _init_err:
 ensure_exit_check_loop_started()  # same: starts on import, tab-independent from here on
 ensure_shadow_loop_started()
 ensure_oi_loop_started()
+ensure_preopen_loop_started()
 
 # ---------------------------------------------------------------------------
 # Date-wise "what if" reports (read-only, nothing is written to the DB):
