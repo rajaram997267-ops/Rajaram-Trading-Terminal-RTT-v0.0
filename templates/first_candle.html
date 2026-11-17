@@ -179,6 +179,8 @@
     <label><input type="checkbox" id="rcOnRatio" checked> 9:15 ratio &ge; <input type="number" id="rcRatio" value="3" min="0" step="0.5" style="width:60px;">&times;</label>
     <label><input type="checkbox" id="rcOnShare" checked> 9:15 buy share &ge; <input type="number" id="rcShare" value="70" min="0" max="100" step="5" style="width:60px;">%</label>
     <label><input type="checkbox" id="rcOnPress"> Dir. pressure &ge; <input type="number" id="rcPress" value="5" min="0" step="0.5" style="width:60px;">&times;</label>
+    <label><input type="checkbox" id="rcOnDv0930"> Day vol at 09:30 &ge; <input type="number" id="rcDv0930" value="1.5" min="0" step="0.25" style="width:60px;">&times;</label>
+    <label><input type="checkbox" id="rcOnDv1030"> Day vol at 10:30 &ge; <input type="number" id="rcDv1030" value="1.5" min="0" step="0.25" style="width:60px;">&times;</label>
     <label><input type="checkbox" id="rcOnDay" checked> Day volume (end of day) &ge; <input type="number" id="rcDay" value="1.5" min="0" step="0.5" style="width:60px;">&times;</label>
     <label><input type="checkbox" id="rcOnSec25"> Sector @9:25 with the alert &ge; <input type="number" id="rcSec25" value="0.5" min="0" step="0.1" style="width:60px;">%</label>
     <label><input type="checkbox" id="rcOnSec" checked> Sector (end of day)
@@ -604,6 +606,8 @@
     html += one("By 9:15 volume ratio", "first_candle_ratio", BANDS, x => bandOf(x), "9:15 ratio");
     html += one("By 9:15 buy share (selling share for Sell alerts)", "dir_share_pct", SHARE_BANDS, x => bandOf(x, "dir_share_pct"), "Buy share");
     html += one("By 9:15 direction pressure (buying for Buy, selling for Sell, vs its 10-session average)", "dir_pressure_ratio", BANDS, x => bandOf(x), "Dir. pressure");
+    html += one("By day volume at 09:30 (vs its usual by that time)", "dv0930", DAYVOL_BANDS, dayVolBand, "Day vol 09:30");
+    html += one("By day volume at 10:30 (vs its usual by that time)", "dv1030", DAYVOL_BANDS, dayVolBand, "Day vol 10:30");
     html += one("By day volume (whole day vs its usual level)", "day_volume_ratio", DAYVOL_BANDS, dayVolBand, "Day volume");
     {
       const groups = SECTOR_BANDS.map((nm, i) => ({ name: nm, st: msStat(rows.filter(r => r.sector_rel !== null && sectorBand(r.sector_rel, r.category) === i)) }));
@@ -634,7 +638,7 @@
 
   // ---------- Recipe tester ----------
   let msRows = [], rcNames = new Set(), rcNameKey = "";
-  const RC_IDS = ["rcOnPress", "rcPress", "rcOnSec25", "rcSec25", "rcOnRatio", "rcRatio", "rcOnShare", "rcShare", "rcOnDay", "rcDay", "rcOnSec", "rcSec"];
+  const RC_IDS = ["rcOnDv0930", "rcDv0930", "rcOnDv1030", "rcDv1030", "rcOnPress", "rcPress", "rcOnSec25", "rcSec25", "rcOnRatio", "rcRatio", "rcOnShare", "rcShare", "rcOnDay", "rcDay", "rcOnSec", "rcSec"];
 
   function rcBuildNames() {
     const all = new Set();
@@ -662,6 +666,8 @@
     if (msEl("rcOnShare").checked) steps.push({ name: "9:15 buy share \u2265 " + num("rcShare") + "%", test: r => r.dir_share_pct != null && r.dir_share_pct >= num("rcShare") });
     if (msEl("rcOnPress").checked) steps.push({ name: "Dir. pressure \u2265 " + num("rcPress") + "\u00d7", test: r => r.dir_pressure_ratio != null && r.dir_pressure_ratio >= num("rcPress") });
     if (msEl("rcOnSec25").checked) steps.push({ name: "Sector @9:25 with the alert \u2265 " + num("rcSec25") + "%", test: r => r.sector_pct_0925 != null && (r.category === "Sell" ? -r.sector_pct_0925 : r.sector_pct_0925) >= num("rcSec25") });
+    if (msEl("rcOnDv0930").checked) steps.push({ name: "Day vol at 09:30 \u2265 " + num("rcDv0930") + "\u00d7", test: r => r.dv0930 != null && r.dv0930 >= num("rcDv0930") });
+    if (msEl("rcOnDv1030").checked) steps.push({ name: "Day vol at 10:30 \u2265 " + num("rcDv1030") + "\u00d7", test: r => r.dv1030 != null && r.dv1030 >= num("rcDv1030") });
     if (msEl("rcOnDay").checked) steps.push({ name: "Day volume \u2265 " + num("rcDay") + "\u00d7 (end of day)", test: r => r.day_volume_ratio != null && r.day_volume_ratio >= num("rcDay") });
     if (msEl("rcOnSec").checked) {
       const mode = msEl("rcSec").value;
@@ -680,9 +686,9 @@
     }
     const list = cur.slice().sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0)).slice(0, 80);
     if (steps.length && list.length) {
-      html += '<h4 style="margin:16px 0 6px;">Stocks matching the recipe (latest first, up to 80)</h4><div class="wrap"><table><thead><tr><th>Date</th><th>Symbol</th><th>Alert</th><th>Alert name</th><th>9:15 ratio</th><th>Buy share</th><th>Pressure</th><th>Day vol</th><th>Sector</th><th>Top-N</th><th>Move</th></tr></thead><tbody>' +
+      html += '<h4 style="margin:16px 0 6px;">Stocks matching the recipe (latest first, up to 80)</h4><div class="wrap"><table><thead><tr><th>Date</th><th>Symbol</th><th>Alert</th><th>Alert name</th><th>9:15 ratio</th><th>Buy share</th><th>Pressure</th><th>Vol 09:30</th><th>Vol 10:30</th><th>Day vol</th><th>Sector</th><th>Top-N</th><th>Move</th></tr></thead><tbody>' +
         list.map(r => '<tr><td>' + esc(r.date) + '</td><td>' + esc(r.symbol) + '</td><td>' + esc(r.category) + '</td><td>' + esc((r.alert_names || []).join(", ")) + '</td><td>' +
-          (r.first_candle_ratio == null ? "-" : f1(r.first_candle_ratio) + "&times;") + '</td><td>' + (r.dir_share_pct == null ? "-" : f1(r.dir_share_pct) + "%") + '</td><td>' + (r.dir_pressure_ratio == null ? "-" : f1(r.dir_pressure_ratio) + "&times;") + '</td><td>' +
+          (r.first_candle_ratio == null ? "-" : f1(r.first_candle_ratio) + "&times;") + '</td><td>' + (r.dir_share_pct == null ? "-" : f1(r.dir_share_pct) + "%") + '</td><td>' + (r.dir_pressure_ratio == null ? "-" : f1(r.dir_pressure_ratio) + "&times;") + '</td><td>' + (r.dv0930 == null ? "-" : f1(r.dv0930) + "&times;") + '</td><td>' + (r.dv1030 == null ? "-" : f1(r.dv1030) + "&times;") + '</td><td>' +
           (r.day_volume_ratio == null ? "-" : f1(r.day_volume_ratio) + "&times;") + '</td><td>' + (r.sector_rel == null ? "-" : (r.sector_rel > 0 ? "+" : "") + f1(r.sector_rel)) + '</td><td class="' + (r._lab.hit ? "pos" : "") + '">' +
           (r._lab.hit ? "yes" : "no") + '</td><td>' + signed(dirMove(r)) + '</td></tr>').join("") + '</tbody></table></div>';
     } else if (steps.length) {
