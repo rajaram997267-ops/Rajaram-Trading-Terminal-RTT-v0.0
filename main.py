@@ -1523,6 +1523,61 @@ def create_paper_trades_for_batch(data: dict) -> None:
 # entry time are used (the two end-of-day conditions of the recipe tester - whole-day volume and the sector's
 # full-day move - cannot exist at entry, so they are not part of it).
 # ---------------------------------------------------------------------------
+def _daypace(slots: dict, candles: list, upto: str):
+    """Day volume so far vs the usual by the same clock time, using only candles that STARTED before `upto` (HH:MM):
+    the day's volume in those 5-minute slots divided by the sum of the same slots' average volume over previous
+    sessions. One definition shared by the Entry rule, the recipe tester and the Top movers autopsy.
+    None when a needed slot has no history. A slot with no candle counts as zero volume (thin stocks)."""
+    keys, h, m = [], 9, 15
+    while f"{h:02d}:{m:02d}" < upto:
+        keys.append(f"{h:02d}:{m:02d}")
+        m += 5
+        if m >= 60:
+            h, m = h + 1, m - 60
+    if not keys:
+        return None
+    by = {c[0][11:16]: float(c[5] or 0) for c in candles}
+    usual = today = 0.0
+    for k in keys:
+        sl = slots.get(k)
+        if not sl or sl["vol"] <= 0:
+            return None
+        usual += sl["vol"]
+        today += by.get(k, 0.0)
+    return round(today / usual, 2) if usual > 0 else None
+
+
+_entry_dv_cache: dict = {}
+
+
+def _entry_daypace(sym: str, token: str, upto: str):
+    """(ratio, error) at entry time for the snapshot `upto` ('09:30' or '10:30'). The value is fixed once its last
+    candle has closed, so it is cached for the day."""
+    now_ist = datetime.utcnow() + IST_OFFSET
+    today = now_ist.strftime("%Y-%m-%d")
+    ck = (sym, today, upto)
+    if ck in _entry_dv_cache:
+        return _entry_dv_cache[ck], None
+    need = datetime.strptime(upto, "%H:%M") + timedelta(minutes=2)
+    if now_ist.hour * 60 + now_ist.minute < need.hour * 60 + need.minute:
+        return None, f"day volume at {upto} is known after {need.strftime('%H:%M')}"
+    key = get_instrument_key(sym)
+    if not key:
+        return None, "no instrument key"
+    try:
+        slots = _get_volume_history(key, token) or {}
+        raw = _vol_fetch_candles(f"https://api.upstox.com/v3/historical-candle/intraday/{urllib.parse.quote(key, safe='|')}/minutes/5", token)
+    except Exception as e:
+        return None, f"day volume call failed ({type(e).__name__})"
+    ratio = _daypace(slots, [c for c in raw if c[0][:10] == today], upto)
+    if ratio is None:
+        return None, f"day volume at {upto} not available (no volume history)"
+    if len(_entry_dv_cache) > 800:
+        _entry_dv_cache.clear()
+    _entry_dv_cache[ck] = ratio
+    return ratio, None
+
+
 ENTRY_RULE_DEFAULT = {
     "enabled": False,
     "alerts": [],                                     # alert names, any of; empty = any alert
@@ -1531,12 +1586,15 @@ ENTRY_RULE_DEFAULT = {
     "pressure": {"on": False, "min": 3.0},            # 9:15 direction pressure >= x times
     "sector25": {"on": False, "min": 0.5},            # sector % at 09:25 moving WITH the alert >= x %
     "oi": {"on": False, "min": 0.0},                  # latest OI% > OI% at 09:15 by at least x points
+    "dv0930": {"on": False, "min": 1.5},              # day volume at 09:30 vs usual >= x times
+    "dv1030": {"on": False, "min": 1.5},              # day volume at 10:30 vs usual >= x times
     "opt_volume": {"on": False, "min": 50.0},         # the option to be bought has traded >= x lots today
     "opt_active": {"on": False, "min": 5.0},          # ... and traded in >= x of the last 10 minutes
     "if_missing": "skip",                             # "skip" or "allow" when a reading is not available yet
 }
 _ENTRY_RULE_LIMITS = {"ratio": (0.0, 100.0), "share": (0.0, 100.0), "pressure": (0.0, 100.0),
-                      "sector25": (0.0, 20.0), "oi": (0.0, 20.0), "opt_volume": (0.0, 100000.0), "opt_active": (0.0, 10.0)}
+                      "sector25": (0.0, 20.0), "oi": (0.0, 20.0), "opt_volume": (0.0, 100000.0), "opt_active": (0.0, 10.0),
+                      "dv0930": (0.0, 50.0), "dv1030": (0.0, 50.0)}
 _entry_rule_log: list = []
 
 
@@ -1698,6 +1756,14 @@ def entry_rule_decision(symbol: str, category: str, alert_name: str, scan_name: 
             ok = o_now - o_open > cfg["oi"]["min"] if cfg["oi"]["min"] > 0 else o_now > o_open
             need = f" by at least {cfg['oi']['min']:g} pts" if cfg["oi"]["min"] > 0 else ""
             (passed if ok else failed).append(f"OI {o_open:+.2f}% at 09:15 -> {o_now:+.2f}% now " + ("is rising" if ok else "is not rising") + need)
+    for k, hhmm in (("dv0930", "09:30"), ("dv1030", "10:30")):
+        if cfg[k]["on"]:
+            v, err = _entry_daypace(sym, token, hhmm) if token else (None, "no Upstox token")
+            if err:
+                missing.append(err)
+            else:
+                ok = v >= cfg[k]["min"]
+                (passed if ok else failed).append(f"day volume at {hhmm} {v}x " + ("meets" if ok else "is below") + f" {cfg[k]['min']:g}x")
     liq_pair = None
     if cfg["opt_volume"]["on"] or cfg["opt_active"]["on"]:
         lots, active, _lbl, err = (_entry_option_liquidity(sym, category, price_val, token) if token
@@ -4335,15 +4401,11 @@ def _floor5(hhmm: str) -> str:
 
 
 def _autopsy_dayvol(sym, date_str, hist, daily, raw_day, upto):
-    """Day volume so far vs the usual at that clock time, using only candles that started before `upto` (HH:MM)."""
-    rows = [c for c in raw_day if c[0][:10] == date_str and c[0][11:16] < upto]
-    if not rows:
-        return None
+    """Day volume so far vs the usual at that clock time (same definition as the Entry rule: _daypace)."""
     try:
-        st = _first_candle_stats(sym, date_str, hist, rows, daily)
+        return _daypace(_volume_slots_from_raw(hist), [c for c in raw_day if c[0][:10] == date_str], upto)
     except Exception:
         return None
-    return (st.get("day_volume_so_far") or {}).get("ratio_vs_same_time_average")
 
 
 def _autopsy_summary(rows: list, side: str) -> list:
@@ -10666,7 +10728,15 @@ def _first_candle_report(symbol: str, date_str: str, access_token: str, with_con
             raw_day = _vol_fetch_candles(f"{base_url}intraday/{q}/minutes/5", access_token)
     except Exception as e:
         return {"symbol": symbol, "date": date_str, "status": "error", "reason": f"{type(e).__name__}: {e}"[:200]}
-    return _first_candle_stats(symbol, date_str, hist, raw_day, daily)
+    stats = _first_candle_stats(symbol, date_str, hist, raw_day, daily)
+    try:   # day volume vs usual at 09:30 and 10:30 (same definition as the Entry rule)
+        slots = _volume_slots_from_raw(hist)
+        day_c = [c for c in raw_day if c[0][:10] == date_str]
+        stats["dv0930"] = _daypace(slots, day_c, "09:30")
+        stats["dv1030"] = _daypace(slots, day_c, "10:30")
+    except Exception:
+        pass
+    return stats
 
 
 @app.route("/api/first-candle-report")
@@ -10708,6 +10778,8 @@ def _fc_table_row(r: dict) -> dict:
         "first_candle_body_pct": (r.get("first_candle") or {}).get("body_pct"),
         "gap_open_pct": pr.get("gap_open_pct"),
         "day_volume_ratio": (r.get("day_volume_so_far") or {}).get("ratio_vs_same_time_average"),
+        "dv0930": r.get("dv0930"),
+        "dv1030": r.get("dv1030"),
         "below_20d_high_pct": (r.get("context") or {}).get("prev_close_vs_high_20d_pct"),
         "day_high_vs_prev_close_pct": pr.get("day_high_vs_prev_close_pct"),
         "last_close_vs_prev_close_pct": pr.get("last_close_vs_prev_close_pct"),
