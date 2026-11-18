@@ -1024,13 +1024,6 @@ def get_sector_filter_top_n() -> int:
         return 5
 
 
-# Exit strategies whose paper exit logic has NO matching live implementation: the live branch of the exit check only
-# knows RSI Momentum, Camarilla Ladder, 1st 5 Min FIB and Lab rules (plus the generic premium-% trail for the premium-based
-# strategies). These would silently run the generic +2% trail with a -2% broker stop on the live leg instead of their own
-# rule, so a live order is not placed for them (the paper trade still runs).
-_LIVE_NO_MATCHING_EXIT = ("RSI_SIMPLE", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "ATR_TRAIL")
-
-
 def get_live_entry_mode() -> str:
     """'SL' (default) - direct BUY entry, then a separate SL (Stop-Loss
     Limit) order for protection, already confirmed exchange-compliant
@@ -2133,9 +2126,6 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # on the trade and never blocks the paper trade itself.
     if get_live_trading_enabled() and auto_paper_only:
         _mark_live_failed(row["id"], "Auto (volume-driven) is paper-only until you allow it for live trades on the Exit Lab page")
-    elif get_live_trading_enabled() and entry_strategy in _LIVE_NO_MATCHING_EXIT:
-        _mark_live_failed(row["id"], f"Exit strategy {entry_strategy} has no matching live exit (live would run a different rule "
-                                     f"than paper) - live order skipped, paper only. Use RSI Momentum, Camarilla, 1st 5 Min FIB or a Lab rule for live.")
     elif get_live_trading_enabled():
         opt_type = "CE" if category == "Buy" else "PE"
         trade_id = row["id"]
@@ -2169,7 +2159,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                         _mark_live_failed(trade_id, "Could not fetch available Upstox funds - live order skipped")
                     else:
                         lot_size = option["lot_size"]
-                        lots = int(available_funds // (premium * lot_size))
+                        lots = int((available_funds * 0.95) // (premium * lot_size))  # 5% buffer: market fill can be above the quoted premium
                         label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
                         if lots < 1:
                             _mark_live_failed(
@@ -6602,15 +6592,20 @@ def compute_live_stats(open_trades: list[dict], closed_trades: list[dict]) -> di
     live_open = sum(1 for t in open_trades if t.get("live_status") == "OPEN")
     live_closed_trades = [t for t in closed_trades if t.get("live_status") == "CLOSED"]
     live_pnl = 0.0
+    live_unverified = 0
     for t in live_closed_trades:
         qty = t.get("live_quantity") or 0
-        entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
-        exit_p = t.get("live_exit_price") if t.get("live_exit_price") is not None else (t.get("exit_price") or 0)
-        live_pnl += (exit_p - entry) * qty
+        # Real fills only: a missing live fill price is NOT replaced by the
+        # paper price (that would show paper numbers as real money).
+        if t.get("live_entry_price") is None or t.get("live_exit_price") is None:
+            live_unverified += 1
+            continue
+        live_pnl += (t["live_exit_price"] - t["live_entry_price"]) * qty
     return {
         "live_open": live_open,
         "live_closed": len(live_closed_trades),
         "live_pnl": round(live_pnl, 2),
+        "live_unverified": live_unverified,
     }
 
 
@@ -10269,9 +10264,9 @@ def api_stats_pnl_curve():
     running_live = 0.0
     for r in live_rows:
         qty = r["live_quantity"] or 0
-        entry = r["live_entry_price"] if r["live_entry_price"] is not None else (r["entry_price"] or 0)
-        exit_p = r["live_exit_price"] if r["live_exit_price"] is not None else (r["exit_price"] or 0)
-        running_live += (exit_p - entry) * qty
+        if r["live_entry_price"] is None or r["live_exit_price"] is None:
+            continue  # unconfirmed live fill - not counted, never replaced by paper prices
+        running_live += (r["live_exit_price"] - r["live_entry_price"]) * qty
         live_points.append({"time": r["live_exit_time"], "pnl": round(running_live, 2)})
 
     return jsonify({"paper": paper_points, "live": live_points})
@@ -13091,8 +13086,13 @@ def live_trading_page():
     _attach_volume_to_trades(open_trades)
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
-        entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
-        exit_p = t.get("live_exit_price") if t.get("live_exit_price") is not None else (t.get("exit_price") or 0)
+        if t.get("live_entry_price") is None or t.get("live_exit_price") is None:
+            # Live fill price not confirmed - never substitute paper prices.
+            t["live_pnl_value"] = 0.0
+            t["live_pnl_pct"] = None
+            t["live_unverified"] = True
+            continue
+        entry, exit_p = t["live_entry_price"], t["live_exit_price"]
         t["live_pnl_value"] = round((exit_p - entry) * qty, 2)
         capital_used = entry * qty
         t["live_pnl_pct"] = round((t["live_pnl_value"] / capital_used) * 100, 2) if capital_used else None
@@ -13155,8 +13155,13 @@ def live_trading_data():
     _attach_volume_to_trades(open_trades)
     for t in closed_trades:
         qty = t.get("live_quantity") or 0
-        entry = t.get("live_entry_price") if t.get("live_entry_price") is not None else (t.get("entry_price") or 0)
-        exit_p = t.get("live_exit_price") if t.get("live_exit_price") is not None else (t.get("exit_price") or 0)
+        if t.get("live_entry_price") is None or t.get("live_exit_price") is None:
+            # Live fill price not confirmed - never substitute paper prices.
+            t["live_pnl_value"] = 0.0
+            t["live_pnl_pct"] = None
+            t["live_unverified"] = True
+            continue
+        entry, exit_p = t["live_entry_price"], t["live_exit_price"]
         t["live_pnl_value"] = round((exit_p - entry) * qty, 2)
         capital_used = entry * qty
         t["live_pnl_pct"] = round((t["live_pnl_value"] / capital_used) * 100, 2) if capital_used else None
