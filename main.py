@@ -1037,6 +1037,18 @@ def get_live_entry_mode() -> str:
     return get_setting("live_entry_mode", "SL")
 
 
+def get_live_funds_use_pct() -> float:
+    """Share of your available Upstox funds that live lot sizing may use
+    (editable in Settings next to the live trading toggle). Default 95 -
+    the unused 5% is a buffer so a market fill slightly above the quoted
+    premium doesn't get the order rejected for insufficient funds."""
+    try:
+        v = float(get_setting("live_funds_use_pct", "95"))
+    except (TypeError, ValueError):
+        return 95.0
+    return min(100.0, max(1.0, v))
+
+
 def get_gtt_trailing_gap_mode() -> str:
     """'percent' (default) or 'points'. The GTT API itself only accepts
     an absolute trailing_gap in price points - 'percent' mode computes
@@ -2159,7 +2171,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                         _mark_live_failed(trade_id, "Could not fetch available Upstox funds - live order skipped")
                     else:
                         lot_size = option["lot_size"]
-                        lots = int((available_funds * 0.95) // (premium * lot_size))  # 5% buffer: market fill can be above the quoted premium
+                        lots = int((available_funds * get_live_funds_use_pct() / 100.0) // (premium * lot_size))  # buffer: market fill can be above the quoted premium
                         label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
                         if lots < 1:
                             _mark_live_failed(
@@ -13037,6 +13049,7 @@ def settings_page():
         fcv_strategy_options=[(sid, _FCV_STRATEGY_LABELS.get(sid, sid)) for sid in VALID_STRATEGIES],
         theta_switch_enabled=get_theta_switch_enabled(),
         live_entry_mode=get_live_entry_mode(),
+        live_funds_use_pct=get_live_funds_use_pct(),
         gtt_trailing_gap_mode=get_gtt_trailing_gap_mode(),
         gtt_trailing_gap_value=get_gtt_trailing_gap_value(),
         atr_period_c=get_atr_period_c(),
@@ -13547,6 +13560,21 @@ def paper_trading_live_entry_mode():
         return jsonify({"status": "error", "message": "mode must be 'SL' or 'GTT'"}), 400
     set_setting("live_entry_mode", mode)
     return jsonify({"status": "ok", "live_entry_mode": mode})
+
+
+@app.route("/api/paper-trading/live-funds-use", methods=["POST"])
+def paper_trading_live_funds_use():
+    """Sets what % of available Upstox funds live lot sizing may use (1-100).
+    Takes effect on the next live trade only."""
+    data = request.get_json(silent=True) or {}
+    try:
+        pct = float(data.get("pct"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "pct must be a number between 1 and 100"}), 400
+    if not (1 <= pct <= 100):
+        return jsonify({"status": "error", "message": "pct must be between 1 and 100"}), 400
+    set_setting("live_funds_use_pct", f"{pct:g}")
+    return jsonify({"status": "ok", "live_funds_use_pct": pct})
 
 
 @app.route("/api/paper-trading/gtt-trailing-settings", methods=["POST"])
