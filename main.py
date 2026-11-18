@@ -1024,6 +1024,13 @@ def get_sector_filter_top_n() -> int:
         return 5
 
 
+# Exit strategies whose paper exit logic has NO matching live implementation: the live branch of the exit check only
+# knows RSI Momentum, Camarilla Ladder, 1st 5 Min FIB and Lab rules (plus the generic premium-% trail for the premium-based
+# strategies). These would silently run the generic +2% trail with a -2% broker stop on the live leg instead of their own
+# rule, so a live order is not placed for them (the paper trade still runs).
+_LIVE_NO_MATCHING_EXIT = ("RSI_SIMPLE", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "ATR_TRAIL")
+
+
 def get_live_entry_mode() -> str:
     """'SL' (default) - direct BUY entry, then a separate SL (Stop-Loss
     Limit) order for protection, already confirmed exchange-compliant
@@ -1470,7 +1477,7 @@ def create_paper_trades_for_batch(data: dict) -> None:
 
     with get_db() as conn:
         already_open = conn.execute(
-            "SELECT id FROM paper_trades WHERE status = 'OPEN' LIMIT 1"
+            "SELECT id FROM paper_trades WHERE status = 'OPEN' OR live_status = 'OPEN' LIMIT 1"
         ).fetchone()
     if already_open:
         _record_batch_skip(data, category, "A trade is already open")
@@ -2126,6 +2133,9 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     # on the trade and never blocks the paper trade itself.
     if get_live_trading_enabled() and auto_paper_only:
         _mark_live_failed(row["id"], "Auto (volume-driven) is paper-only until you allow it for live trades on the Exit Lab page")
+    elif get_live_trading_enabled() and entry_strategy in _LIVE_NO_MATCHING_EXIT:
+        _mark_live_failed(row["id"], f"Exit strategy {entry_strategy} has no matching live exit (live would run a different rule "
+                                     f"than paper) - live order skipped, paper only. Use RSI Momentum, Camarilla, 1st 5 Min FIB or a Lab rule for live.")
     elif get_live_trading_enabled():
         opt_type = "CE" if category == "Buy" else "PE"
         trade_id = row["id"]
@@ -5979,7 +5989,7 @@ def _open_trade_if_free(symbol: str, category: str, price_val: float,
     with _entry_lock:
         with get_db() as conn:
             already_open = conn.execute(
-                "SELECT id FROM paper_trades WHERE status = 'OPEN' LIMIT 1"
+                "SELECT id FROM paper_trades WHERE status = 'OPEN' OR live_status = 'OPEN' LIMIT 1"
             ).fetchone()
         if already_open:
             _record_alert_decision(symbol, category, "SKIPPED", "A trade is already open", price_val)
@@ -9395,7 +9405,7 @@ def api_manual_enter_alert(alert_id):
 
     with get_db() as conn:
         already_open = conn.execute(
-            "SELECT id FROM paper_trades WHERE status = 'OPEN' LIMIT 1"
+            "SELECT id FROM paper_trades WHERE status = 'OPEN' OR live_status = 'OPEN' LIMIT 1"
         ).fetchone()
     if already_open:
         return jsonify({"status": "error", "message": "A trade is already open - exit it first before manually entering another"}), 409
