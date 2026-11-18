@@ -260,6 +260,14 @@
   </div>
 
   <div class="settings-box">
+    <span>Live funds to use per trade (%):</span>
+    <input type="text" id="liveFundsUseInput" value="{{ '%g' % live_funds_use_pct }}" style="max-width: 80px; text-align: center;" onchange="saveLiveFundsUse()">
+    <span class="token-status" id="liveFundsUseStatus">
+      Live lots are sized off {{ '%g' % live_funds_use_pct }}% of your available Upstox funds (1-100). Lower it to leave a buffer so a market fill above the quoted premium isn't rejected. Applies to the next live trade.
+    </span>
+  </div>
+
+  <div class="settings-box">
     <span>Live entry mode:</span>
     <select id="liveEntryModeSelect" onchange="saveLiveEntryMode()">
       <option value="SL" {% if live_entry_mode == "SL" %}selected{% endif %}>SL - direct entry + separate Stop-Loss Limit order (default, battle-tested)</option>
@@ -1095,6 +1103,30 @@
       } catch (err) {
         statusEl.textContent = "Failed to update - see console";
         checkbox.checked = !enabled;
+        console.error(err);
+      }
+    }
+
+    async function saveLiveFundsUse() {
+      const input = document.getElementById("liveFundsUseInput");
+      const statusEl = document.getElementById("liveFundsUseStatus");
+      const pct = parseFloat(input.value);
+      if (!(pct >= 1 && pct <= 100)) {
+        statusEl.textContent = "Enter a number between 1 and 100";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/live-funds-use", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pct }),
+        });
+        const result = await res.json();
+        statusEl.textContent = res.ok
+          ? "Saved - live lots sized off " + result.live_funds_use_pct + "% of available funds, from the next live trade."
+          : (result.message || "Failed to save");
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
         console.error(err);
       }
     }
