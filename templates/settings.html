@@ -309,6 +309,7 @@
       <option value="CAMARILLA_LADDER" {% if exit_strategy == "CAMARILLA_LADDER" %}selected{% endif %}>11) Camarilla Ladder Exit (RSI pre-T1, ratchet stop post-T1)</option>
       <option value="RSI_SIMPLE" {% if exit_strategy == "RSI_SIMPLE" %}selected{% endif %}>12) RSI Simple Exit (bare 2-candle rule, no extras)</option>
       <option value="FIRST5MIN_FIB" {% if exit_strategy == "FIRST5MIN_FIB" %}selected{% endif %}>13) 1st 5 Min FIB levels strategy</option>
+      <option value="SUPERTREND" {% if exit_strategy == "SUPERTREND" %}selected{% endif %}>14) SuperTrend exit (5-min spot, flips against the trade)</option>
     </select>
     <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
     <div style="margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -317,6 +318,16 @@
       <span class="token-status">Switch ON to let the Exit Lab choose each new trade's exit rule (paper-only until allowed for live). OFF returns new trades to your previous strategy. <a href="/exit-lab">See the picks and details</a></span>
       <span id="autoMsgS" style="font-weight:600"></span>
     </div>
+  </div>
+
+  <div class="settings-box">
+    <span>SuperTrend exit settings (#14):</span>
+    <span>Length:</span>
+    <input type="text" id="stLengthInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ supertrend_length }}">
+    <span>Factor:</span>
+    <input type="text" id="stFactorInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ '%g' % supertrend_factor }}">
+    <button class="secondary" onclick="saveSupertrendSettings()">Save</button>
+    <span class="token-status" id="stSettingsStatus">Used only by "14) SuperTrend exit". Applies immediately, including to open trades using it.</span>
   </div>
 
   <div class="settings-box">
@@ -1103,6 +1114,26 @@
       } catch (err) {
         statusEl.textContent = "Failed to update - see console";
         checkbox.checked = !enabled;
+        console.error(err);
+      }
+    }
+
+    async function saveSupertrendSettings() {
+      const statusEl = document.getElementById("stSettingsStatus");
+      const length = parseInt(document.getElementById("stLengthInput").value, 10);
+      const factor = parseFloat(document.getElementById("stFactorInput").value);
+      try {
+        const res = await fetch("/api/paper-trading/supertrend-settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ length, factor }),
+        });
+        const result = await res.json();
+        statusEl.textContent = res.ok
+          ? "Saved - SuperTrend " + result.supertrend_length + " / " + result.supertrend_factor
+          : (result.message || "Failed to save");
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
         console.error(err);
       }
     }
