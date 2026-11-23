@@ -1037,6 +1037,22 @@ def get_live_entry_mode() -> str:
     return get_setting("live_entry_mode", "SL")
 
 
+def get_supertrend_length() -> int:
+    """SuperTrend ATR length (strategy #14). Default 10."""
+    try:
+        return min(100, max(2, int(get_setting("supertrend_length", "10"))))
+    except (TypeError, ValueError):
+        return 10
+
+
+def get_supertrend_factor() -> float:
+    """SuperTrend ATR factor/multiplier (strategy #14). Default 1.3."""
+    try:
+        return min(10.0, max(0.1, float(get_setting("supertrend_factor", "1.3"))))
+    except (TypeError, ValueError):
+        return 1.3
+
+
 def get_live_funds_use_pct() -> float:
     """Share of your available Upstox funds that live lot sizing may use
     (editable in Settings next to the live trading toggle). Default 95 -
@@ -2184,7 +2200,7 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                             live_quantity = lots * lot_size
                             label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
 
-                            if get_live_entry_mode() == "GTT" and entry_strategy not in ("RSI_MOMENTUM", "CAMARILLA_LADDER", "FIRST5MIN_FIB"):
+                            if get_live_entry_mode() == "GTT" and entry_strategy not in ("RSI_MOMENTUM", "CAMARILLA_LADDER", "FIRST5MIN_FIB", "SUPERTREND"):
                                 # GTT mode: entry AND trailing stop-loss are
                                 # ONE combined order - Upstox's engine
                                 # places the entry when the ENTRY leg fires
@@ -2337,6 +2353,11 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
                                             "RSI Momentum Exit: no broker-side stop placed by design (matches "
                                             "paper exactly, per your choice) - the RSI/EMA check is the only "
                                             "thing that closes this position. No safety net if this app goes down."
+                                        )
+                                    elif entry_strategy == "SUPERTREND":
+                                        sl_note = (
+                                            "SuperTrend exit: no broker-side stop placed by design - the SuperTrend "
+                                            "flip on a closed 5-min candle is the stop-loss. No safety net if this app goes down."
                                         )
                                     elif entry_strategy == "CAMARILLA_LADDER":
                                         sl_note = (
@@ -2627,6 +2648,55 @@ def check_rsi_simple_exit(
             if not (rsi_line[i] > put_warning_threshold):
                 return False, info
     return True, info
+
+
+def calculate_supertrend(candles: list, length: int = 10, factor: float = 1.3):
+    """SuperTrend on (open, high, low, close) candles, oldest first - the
+    standard charting definition: ATR by Wilder smoothing (calculate_atr),
+    bands at hl2 -/+ factor*ATR that only ratchet in the trend's favour,
+    trend flips when the close crosses the opposite band. Returns
+    (trend, line): trend[i] is 1 (bullish, line under price), -1 (bearish,
+    line over price) or None before ATR exists."""
+    n = len(candles)
+    atr = calculate_atr(candles, length)
+    up: list = [None] * n
+    dn: list = [None] * n
+    trend: list = [None] * n
+    line: list = [None] * n
+    cur = 1
+    for i in range(n):
+        if atr[i] is None:
+            continue
+        hl2 = (candles[i][1] + candles[i][2]) / 2.0
+        b_up = hl2 - factor * atr[i]
+        b_dn = hl2 + factor * atr[i]
+        close = candles[i][3]
+        if i > 0 and up[i - 1] is not None:
+            prev_close = candles[i - 1][3]
+            if prev_close > up[i - 1]:
+                b_up = max(b_up, up[i - 1])
+            if prev_close < dn[i - 1]:
+                b_dn = min(b_dn, dn[i - 1])
+            if cur == -1 and close > dn[i - 1]:
+                cur = 1
+            elif cur == 1 and close < up[i - 1]:
+                cur = -1
+        up[i], dn[i] = b_up, b_dn
+        trend[i] = cur
+        line[i] = b_up if cur == 1 else b_dn
+    return trend, line
+
+
+def check_supertrend_exit(direction: str, candles: list, *, length: int, factor: float) -> tuple[bool, dict]:
+    """SuperTrend Exit (strategy #14): on the UNDERLYING's last CLOSED 5-min
+    candle, exit a Buy (Call) once SuperTrend is bearish and a Sell (Put)
+    once it is bullish. Stateless - reads only the candle series."""
+    trend, line = calculate_supertrend(candles, length, factor)
+    if not trend or trend[-1] is None:
+        return False, {"trend": None, "line": None}
+    info = {"trend": trend[-1], "line": line[-1]}
+    against = (trend[-1] == -1) if direction == "Buy" else (trend[-1] == 1)
+    return against, info
 
 
 def _is_deep_itm_option(direction: str, strike: float | None, spot_price: float | None, moneyness_pct: float) -> bool:
@@ -6109,6 +6179,7 @@ _FCV_STRATEGY_LABELS = {
     "CAMARILLA_LADDER": "11) Camarilla Ladder Exit",
     "RSI_SIMPLE": "12) RSI Simple Exit",
     "FIRST5MIN_FIB": "13) 1st 5 Min FIB levels",
+    "SUPERTREND": "14) SuperTrend exit",
 }
 
 
@@ -7926,10 +7997,10 @@ def _run_paper_trade_check_impl() -> dict:
             # strategy - it's a second Upstox call on top of the option's
             # own, so no reason to pay for it otherwise.
             spot_candles = None
-            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE", "FIRST5MIN_FIB"):
+            if strategy in ("EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE", "FIRST5MIN_FIB", "SUPERTREND"):
                 spot_key = get_instrument_key(symbol)
                 if spot_key:
-                    spot_candles = get_5min_candles_with_warmup(spot_key, access_token)
+                    spot_candles = get_5min_candles_with_warmup(spot_key, access_token, min_candles=(75 if strategy == "SUPERTREND" else 30))
             # Current spot price - only the JOAT-inspired strategies need
             # this as a standalone value (for their spot-%-change and ATR
             # peak-tracking math); #7/#8 only ever needed the candle
@@ -8035,6 +8106,16 @@ def _run_paper_trade_check_impl() -> dict:
                 live_camarilla_current_stage = trade["live_camarilla_ratchet_stage"] or 0
                 live_camarilla_new_stage = camarilla_ratchet_stage_reached(
                     trade["direction"], spot_live_price, camarilla_tiers, live_camarilla_current_stage
+                )
+
+            # SuperTrend Exit's trigger (#14), computed once here so paper and
+            # live read the same answer (live can outlive paper).
+            supertrend_triggered = False
+            supertrend_info: dict = {}
+            if strategy == "SUPERTREND" and spot_candles:
+                supertrend_triggered, supertrend_info = check_supertrend_exit(
+                    trade["direction"], spot_candles,
+                    length=get_supertrend_length(), factor=get_supertrend_factor(),
                 )
 
             # RSI Simple Exit's trigger (#12), computed once here for the
@@ -8570,6 +8651,19 @@ def _run_paper_trade_check_impl() -> dict:
                                 exited, exit_price = True, last_price
                                 exit_reason = f"Camarilla Ladder stop hit (T{camarilla_current_stage} ratchet, stop {stop_premium:.2f})"
 
+            elif strategy == "SUPERTREND" and last_price is not None:
+                # #14 (SuperTrend Exit): spot 5-min SuperTrend flips against
+                # the trade on a CLOSED candle. No paper stop-loss, same as
+                # the RSI strategies.
+                if supertrend_triggered:
+                    exited, exit_price = True, last_price
+                    st_line = supertrend_info.get("line")
+                    st_disp = f"{st_line:.2f}" if st_line is not None else "?"
+                    exit_reason = (
+                        f"SuperTrend exit ({get_supertrend_length()}/{get_supertrend_factor():g}) - "
+                        f"turned {'bearish' if trade['direction'] == 'Buy' else 'bullish'} (line {st_disp}) on last closed 5m candle"
+                    )
+
             elif strategy == "RSI_SIMPLE" and last_price is not None:
                 # #12 (RSI Simple Exit): the bare 2-candle RSI-confirmation
                 # rule and nothing else - no EMA/structure check, no
@@ -8916,6 +9010,18 @@ def _run_paper_trade_check_impl() -> dict:
                     live_exited = True
                     rsi_disp = f"{fib_rsi_info['rsi']:.1f}" if fib_rsi_info.get("rsi") is not None else "?"
                     live_exit_reason_val = f"1st 5 Min FIB: RSI stoploss before T1 (RSI {rsi_disp}) - no broker floor, by design"
+            elif strategy == "SUPERTREND":
+                # #14, live side: the same trigger that decides paper's exit
+                # also closes live. No broker-side stop and no trail - the
+                # SuperTrend flip is the stop-loss, by explicit user choice.
+                if not live_exited and trade["live_status"] == "OPEN" and supertrend_triggered:
+                    live_exited = True
+                    st_line = supertrend_info.get("line")
+                    st_disp = f"{st_line:.2f}" if st_line is not None else "?"
+                    live_exit_reason_val = (
+                        f"SuperTrend exit ({get_supertrend_length()}/{get_supertrend_factor():g}) - "
+                        f"turned {'bearish' if trade['direction'] == 'Buy' else 'bullish'} (line {st_disp}) on last closed 5m candle"
+                    )
             elif isinstance(strategy, str) and strategy.startswith("LAB:"):
                 # Live follows the Lab rule's verdict (paper and live agree).
                 # The broker-side SL placed at entry sits at the rule's own
@@ -9910,6 +10016,33 @@ def attach_stop_info(open_trades: list[dict], access_token: str | None) -> None:
                 t1_disp = f", T1 {t1_val:.2f}" if t1_val is not None else ""
                 t["stop_info"] = f"1st 5 Min FIB (pre-T1): RSI {rsi_disp} (need {threshold_note} x{confirm_candles}){t1_disp} · last CLOSED 5m candle"
 
+        elif strategy == "SUPERTREND":
+            # #14 - fresh fetch, same pattern as RSI Simple below.
+            direction = t.get("direction")
+            spot_candles = None
+            spot_sym = t.get("symbol")
+            if spot_sym and access_token:
+                try:
+                    resolved_key = get_instrument_key(spot_sym)
+                    if resolved_key:
+                        spot_candles = get_5min_candles_with_warmup(resolved_key, access_token, min_candles=75)
+                except Exception:
+                    spot_candles = None
+            t["atr_value"] = None
+            t["rsi_value"] = None
+            if not spot_candles:
+                t["stop_info"] = "Waiting for underlying candle data"
+                continue
+            _, st_info = check_supertrend_exit(direction, spot_candles,
+                                               length=get_supertrend_length(), factor=get_supertrend_factor())
+            if st_info.get("trend") is None:
+                t["stop_info"] = "SuperTrend: not enough candles yet"
+            else:
+                state = "bullish" if st_info["trend"] == 1 else "bearish"
+                need = "bearish" if direction == "Buy" else "bullish"
+                t["stop_info"] = (f"SuperTrend {get_supertrend_length()}/{get_supertrend_factor():g}: {state}, line {st_info['line']:.2f} "
+                                  f"- exits when it turns {need} on a closed 5m candle")
+
         elif strategy == "RSI_SIMPLE":
             # #12 - same fresh-fetch pattern as RSI Momentum above, but
             # the bare rule: no EMA/structure check, no Deep-ITM
@@ -10054,7 +10187,7 @@ PAPER_HARD_STOP_PCT = 2.0
 # of that strategy's own PAPER-side logic - so the real contractual risk
 # on the live side is simpler and more uniform than the paper side.
 NO_BROKER_STOP_STRATEGIES_LIVE = frozenset({
-    "RSI_MOMENTUM", "CAMARILLA_LADDER", "FIRST5MIN_FIB",
+    "RSI_MOMENTUM", "CAMARILLA_LADDER", "FIRST5MIN_FIB", "SUPERTREND",
 })
 LIVE_HARD_STOP_PCT = 2.0
 
@@ -13050,6 +13183,8 @@ def settings_page():
         theta_switch_enabled=get_theta_switch_enabled(),
         live_entry_mode=get_live_entry_mode(),
         live_funds_use_pct=get_live_funds_use_pct(),
+        supertrend_length=get_supertrend_length(),
+        supertrend_factor=get_supertrend_factor(),
         gtt_trailing_gap_mode=get_gtt_trailing_gap_mode(),
         gtt_trailing_gap_value=get_gtt_trailing_gap_value(),
         atr_period_c=get_atr_period_c(),
@@ -13303,7 +13438,7 @@ def paper_trading_live_toggle():
     return jsonify({"status": "ok", "live_trading_enabled": enabled})
 
 
-VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE", "FIRST5MIN_FIB")
+VALID_STRATEGIES = ("HALF_HALF_HARD4", "TRAIL_FROM_2", "FULL_AT_2", "FULL_AT_4", "ATR_TRAIL", "EMA_SPOT_TRAIL", "EMA_SPOT_PURE", "JOAT_HYBRID", "JOAT_TEST_B", "JOAT_TEST_C", "RSI_MOMENTUM", "CAMARILLA_LADDER", "RSI_SIMPLE", "FIRST5MIN_FIB", "SUPERTREND")
 
 STRATEGY_DESCRIPTIONS = {
     "AUTO_VOL": "Auto (volume-driven): each new trade's exit rule is chosen automatically from the Exit Lab - by volume strength at entry and time of day - but only where a rule has proven clearly better than your previous strategy; otherwise the trade uses that previous strategy. Paper-only until you allow it for live trades on the Exit Lab page. Switch off any time.",
@@ -13320,6 +13455,7 @@ STRATEGY_DESCRIPTIONS = {
     "JOAT_TEST_C": "Test-C (JOAT-inspired, wider ATR): identical to Test-B, but reads its OWN separate ATR period/multiplier (set below, defaults to 14x2 vs Test-B's 8x2) - kept as a distinct strategy specifically so its results never mix with Test-B's in the Stats breakdown, even if the shared ATR settings change later.",
     "RSI_MOMENTUM": "10) RSI Momentum Exit (Rajaram's method): runs off the UNDERLYING's own RSI and EMA-of-Close (not the option premium) - Call exits once RSI has held below the CALL threshold for N consecutive 5-min candles AND that candle's Close is below the EMA (Put mirrors this: RSI above its threshold + Close above the EMA). Automatically widens its RSI threshold for a Deep ITM option (needs a bigger RSI move before exiting, since Deep ITM premium moves less per point of underlying) and tightens (fewer confirming candles needed) during the mid-day session when theta decay bites hardest. No fixed stop-loss floor - purely momentum/structure driven, per the original method. Every number (RSI/EMA periods, thresholds, candle counts, Deep-ITM %, mid-day window) is editable below so different combinations can be tested against each other. WARNING if live trading is on: by your own choice, live positions under this strategy have NO broker-side stop-loss at all (matches paper exactly) - the RSI/EMA check is the ONLY thing that closes them, so a position can sit fully unprotected if this app goes down, your connection drops, or (at the start of a trading day) there simply isn't enough candle history yet for RSI to be computable.",
     "CAMARILLA_LADDER": "11) Camarilla Ladder Exit (hybrid): before the underlying's price ever reaches its first Camarilla target (T1, standard public formula off the PREVIOUS day's High/Low/Close - not a guess at any proprietary indicator), this runs RSI Simple Exit's bare rule (#12) - RSI<70/>45 for 2 closed candles, no EMA leg - same no-broker-stop-until-triggered design (switched from RSI Momentum's EMA-gated check after a live example showed EMA confirmation firing too late). The moment spot price first reaches T1, that RSI check stops being used entirely and a real broker-side stop-loss order takes over instead: placed at breakeven (your entry price) the instant T1 hits, then MOVED UP (never down) each time a further tier is reached - to T1's own option premium once T2 hits, to T2's premium once T3 hits, and so on through T4. Exit happens when that stop is hit, whichever tier it's currently sitting at - there's no fixed target/booking, this only ever tightens the floor as price proves itself, using Upstox's regular Modify Order (not GTT - a plain SL order updated in place). WARNING if live trading is on: exactly like RSI Simple/Momentum, there is NO broker-side protection at all until spot first touches T1 - if this app goes down before that point, this position has nothing resting at the broker.",
+    "SUPERTREND": "14) SuperTrend Exit: runs on the UNDERLYING's 5-min candles. A Buy (Call) exits when SuperTrend turns bearish on a CLOSED candle, a Sell (Put) when it turns bullish. Length and Factor are editable in the SuperTrend box below (default 10 / 1.3). The exit is checked only on CLOSED 5-min candles, never on a live tick. There is NO stop-loss in paper or live - SuperTrend itself is the stop. WARNING for live: no broker-side stop is placed (same as #10, #11 and #13), so a live position has nothing protecting it if this app goes down, your connection drops, or candle data is unavailable. If SuperTrend is already against the trade when it opens, it exits on the first check.",
     "RSI_SIMPLE": "12) RSI Simple Exit: the bare rule with nothing else added - exit Buy once 2 consecutive CLOSED 5-min candles (of the underlying) show RSI<70, exit Sell once 2 consecutive closed candles show RSI>45. No EMA/structure check, no Deep-ITM widening, no mid-day tightening - added after live testing of #10 and #11 found the plain version working better than either one with more conditions layered on top. Shares #10's core RSI period/threshold/confirm-candles settings above (not its EMA period, Deep-ITM, or mid-day settings - none of those apply here). Live trading note: unlike #10/#11, this one is NOT wired into live's own exit trigger - a live position under this strategy still gets the normal broker-side -2% stop and 0.5% trail, same as strategies #2-#9. Say the word if you'd rather it match #10/#11's no-floor, RSI-only live behavior instead.",
     "FIRST5MIN_FIB": "13) 1st 5 Min FIB levels strategy: a separate strategy from #11/#12, though it shares the same pre-T1 RSI-only stoploss idea. T1-T8 are computed once at entry from TODAY's own FIRST 5-min candle (09:15-09:20 IST): that candle's High is the 1.00 level, Low is the 0.00 level, Range = High-Low - Buy's T1=High+Range*0.5 (1.50) through T8=High+Range*4.0 (5.00), stepping by 0.5*Range each tier; Sell mirrors this below the Low. A bigger opening candle produces bigger targets and vice versa, by design. Before spot ever reaches T1: pure RSI stoploss, no broker floor - RSI<70 (Buy) />the shared PUT threshold above (Sell) for 2 closed candles, identical rule to #12. Once T1 is reached, it's an 8-tier ratchet: the floor becomes whichever tier was last reached, advancing forward each time the next tier is hit; if spot instead falls back to the CURRENT floor before reaching the next tier, nothing happens yet - the trade exits only if a 5-minute candle then CLOSES at/through that floor (Buy: closes at or below it, Sell: at or above it); if the candle closes back on the right side the trade simply carries on. Reaching the next tier still counts the moment price touches it. Reaching T8 is always an immediate full exit - the final tier, nothing further to ratchet to. No partial booking at any stage, just the floor moving forward. Simpler than strategy #11 on purpose: no order-modification, no captured-premium tracking - just a plain market exit the instant an outcome fires, live and paper independently (each tracks its own stage separately, so one side closing early never affects the other's checks). WARNING if live trading is on: no broker-side protection at all, for the ENTIRE life of this trade, not just pre-T1 - if this app goes down at any point, this position has nothing resting at the broker.",
 }
@@ -13560,6 +13696,23 @@ def paper_trading_live_entry_mode():
         return jsonify({"status": "error", "message": "mode must be 'SL' or 'GTT'"}), 400
     set_setting("live_entry_mode", mode)
     return jsonify({"status": "ok", "live_entry_mode": mode})
+
+
+@app.route("/api/paper-trading/supertrend-settings", methods=["POST"])
+def paper_trading_supertrend_settings():
+    """Length (2-100) and Factor (0.1-10) for the SuperTrend exit (#14).
+    Read fresh every pass, so open SUPERTREND trades pick the change up."""
+    data = request.get_json(silent=True) or {}
+    try:
+        length = int(data.get("length"))
+        factor = float(data.get("factor"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "length must be a whole number and factor a number"}), 400
+    if not (2 <= length <= 100) or not (0.1 <= factor <= 10):
+        return jsonify({"status": "error", "message": "length must be 2-100 and factor 0.1-10"}), 400
+    set_setting("supertrend_length", str(length))
+    set_setting("supertrend_factor", f"{factor:g}")
+    return jsonify({"status": "ok", "supertrend_length": length, "supertrend_factor": factor})
 
 
 @app.route("/api/paper-trading/live-funds-use", methods=["POST"])
