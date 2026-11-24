@@ -799,6 +799,39 @@ def init_db():
             )
             """
         )
+        # OI range logger (read-only research): per scan, the stock's Max Call OI / Max Put OI strikes.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS oi_range_log (
+                id SERIAL PRIMARY KEY,
+                date TEXT NOT NULL,
+                slot TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                expiry TEXT,
+                spot DOUBLE PRECISION,
+                call_strike DOUBLE PRECISION,
+                call_oi DOUBLE PRECISION,
+                call_prev_oi DOUBLE PRECISION,
+                put_strike DOUBLE PRECISION,
+                put_oi DOUBLE PRECISION,
+                put_prev_oi DOUBLE PRECISION,
+                UNIQUE (date, slot, symbol)
+            )
+            """
+        )
+        # OI range logger: the stock's 5-min price path for the day (09:15-15:00), refreshed each scan.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS oi_range_day (
+                id SERIAL PRIMARY KEY,
+                date TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                path TEXT NOT NULL,
+                updated TEXT,
+                UNIQUE (date, symbol)
+            )
+            """
+        )
         # Each sector's % change at 09:25 IST (average over its F&O stocks: close of the 09:20-09:25
         # 5-min candle vs the previous close). Fixed once stored - it never changes later in the day.
         conn.execute(
@@ -3768,6 +3801,7 @@ FEATURE_SWITCHES = {
     "oi_snapshot": "Daily ~09:26 OI snapshot of all F&O futures (writes to the database once a day)",
     "sector_925": "Sector % / flow at 09:25 (calculated from 5-min candles of all F&O stocks)",
     "fno_rank": "Top F&O gainers / losers rank on the dashboard",
+    "oi_range": "OI range logger (read-only): every 30 min, option-chain Max Call/Put OI of today's alert stocks (about 1 API call per stock)",
     "preopen_context": "Pre-open context: nightly build of sector rotation, stage, breadth and volume spikes (after 16:00 IST)",
 }
 _feature_flags: dict = {"t": 0.0, "v": {}}
@@ -4066,6 +4100,285 @@ def _oi_snapshot_loop() -> None:
             _oi_state["last_error"] = f"{type(e).__name__}: {e}"
             print(f"[oi-snapshot] {e}", flush=True)
         time.sleep(45)
+
+
+
+# ---------------------------------------------------------------------------
+# OI range logger (read-only research, places NO orders): for the stocks that
+# have alerts today, every 30 min log the strike with the highest Call OI
+# (ceiling) and the highest Put OI (floor) from Upstox's option chain, so the
+# "stock stays between Max Call OI and Max Put OI" idea can be measured on
+# your own alerts. Cost: about 1 API call per alert stock per scan.
+# ---------------------------------------------------------------------------
+OI_RANGE_SCAN_TIMES = (
+    [f"{h:02d}:{m:02d}" for h in range(9, 16) for m in (0, 30) if "09:30" <= f"{h:02d}:{m:02d}" <= "15:00"] + ["15:25"]
+)
+_oi_range_state: dict = {"state": "idle", "last_scan": None, "last_count": 0, "last_error": None}
+
+
+def _fetch_oi_range(symbol: str, token: str, today: str) -> dict | None:
+    """One option-chain call -> {expiry, spot, call/put strike + oi + prev_oi} for the strikes with the highest OI."""
+    key = get_instrument_key(symbol)
+    contracts = _option_chain_cache.get(symbol.upper())
+    if not key or not contracts:
+        return None
+    expiries = sorted({c["expiry"] for c in contracts if c["expiry"] >= today})
+    if not expiries:
+        return None
+    expiry = expiries[0]
+    url = "https://api.upstox.com/v2/option/chain?" + urllib.parse.urlencode({"instrument_key": key, "expiry_date": expiry})
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": BROWSER_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        payload = json.loads(resp.read().decode())
+    spot = None
+    best_call = best_put = None
+    for r in payload.get("data") or []:
+        if r.get("underlying_spot_price"):
+            spot = r["underlying_spot_price"]
+        strike = r.get("strike_price")
+        cmd = (r.get("call_options") or {}).get("market_data") or {}   # edge strikes can come back empty
+        pmd = (r.get("put_options") or {}).get("market_data") or {}
+        if strike is None:
+            continue
+        if cmd.get("oi") is not None and (best_call is None or cmd["oi"] > best_call[1]):
+            best_call = (strike, cmd["oi"], cmd.get("prev_oi"))
+        if pmd.get("oi") is not None and (best_put is None or pmd["oi"] > best_put[1]):
+            best_put = (strike, pmd["oi"], pmd.get("prev_oi"))
+    if spot is None or not best_call or not best_put:
+        return None
+    return {"expiry": expiry, "spot": spot, "call": best_call, "put": best_put}
+
+
+def _fetch_day_path(symbol: str, token: str, today: str) -> list | None:
+    """Today's 5-min candles from 09:15 up to the 15:00 close, as [[HH:MM, open, high, low, close], ...]."""
+    key = get_instrument_key(symbol)
+    if not key:
+        return None
+    url = f"https://api.upstox.com/v3/historical-candle/intraday/{urllib.parse.quote(key, safe='|')}/minutes/5"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": BROWSER_USER_AGENT})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = (json.loads(resp.read().decode()).get("data") or {}).get("candles") or []
+    out = []
+    for c in sorted(raw, key=lambda c: c[0]):
+        if str(c[0])[:10] != today:
+            continue
+        hm = str(c[0])[11:16]
+        if "09:15" <= hm < "15:00":                       # a candle starting 14:55 closes at 15:00
+            out.append([hm, float(c[1]), float(c[2]), float(c[3]), float(c[4])])
+    return out or None
+
+
+def _oi_range_scan(token: str, today: str, slot: str, only_new: bool = False) -> None:
+    if not _option_chain_cache:
+        get_instrument_key("RELIANCE")                     # loads the instrument master + option contracts
+    syms = sorted({(a.get("symbol") or "").strip().upper() for a in _alerts_for_ist_date(today) if a.get("symbol")})
+    if only_new:                                           # a stock alerted since the last scan: get its range now
+        with get_db() as conn:
+            seen = {r["symbol"] for r in conn.execute("SELECT DISTINCT symbol FROM oi_range_log WHERE date = ?", (today,)).fetchall()}
+        syms = [x for x in syms if x not in seen][:15]
+        if not syms:
+            return
+    _oi_range_state.update({"state": "running", "last_error": None})
+    rows = []
+    paths: dict = {}
+    for sym in syms:
+        try:
+            res = _fetch_oi_range(sym, token, today)
+        except urllib.error.HTTPError as e:
+            if e.code == 429:                              # Upstox says too many requests: stop this scan
+                _oi_range_state["last_error"] = "Upstox rate limit (429) - scan stopped, retries next slot"
+                break
+            continue
+        except Exception:
+            continue
+        if res:
+            c, p = res["call"], res["put"]
+            rows.append((today, slot, sym, res["expiry"], res["spot"], c[0], c[1], c[2], p[0], p[1], p[2]))
+        time.sleep(1.0)                                    # ~1 call/second, far below Upstox's per-second limit
+        try:
+            path = _fetch_day_path(sym, token, today)      # day's price path, replaced on every scan
+        except urllib.error.HTTPError as e:
+            path = None
+            if e.code == 429:
+                _oi_range_state["last_error"] = "Upstox rate limit (429) - scan stopped, retries next slot"
+                break
+        except Exception:
+            path = None
+        if path:
+            paths[sym] = path
+        time.sleep(1.0)
+    if rows or paths:
+        with get_db() as conn:
+            for sym, path in paths.items():
+                conn.execute(
+                    "INSERT INTO oi_range_day (date, symbol, path, updated) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT (date, symbol) DO UPDATE SET path = excluded.path, updated = excluded.updated",
+                    (today, sym, json.dumps(path, separators=(",", ":")), slot))
+            for r in rows:
+                conn.execute(
+                    "INSERT INTO oi_range_log (date, slot, symbol, expiry, spot, call_strike, call_oi, call_prev_oi, "
+                    "put_strike, put_oi, put_prev_oi) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT (date, slot, symbol) DO NOTHING", r)
+            conn.commit()
+    _oi_range_state.update({"state": "idle", "last_scan": f"{today} {slot}", "last_count": len(rows)})
+
+
+def _oi_range_loop() -> None:
+    done: set = set()
+    while True:
+        try:
+            now = datetime.utcnow() + IST_OFFSET
+            today, hm = now.strftime("%Y-%m-%d"), now.strftime("%H:%M")
+            done = {k for k in done if k[0] == today}
+            if now.weekday() < 5 and _feature_on("oi_range") and "09:20" <= hm <= "15:25":
+                token0 = get_setting("upstox_access_token")
+                if token0 and hm >= "09:30":
+                    _oi_range_scan(token0, today, hm, only_new=True)
+            if now.weekday() < 5 and _feature_on("oi_range"):
+                due = [t for t in OI_RANGE_SCAN_TIMES if t <= hm]
+                if due:
+                    slot = due[-1]
+                    late = (int(hm[:2]) * 60 + int(hm[3:])) - (int(slot[:2]) * 60 + int(slot[3:]))
+                    if late <= 20 and (today, slot) not in done:
+                        token = get_setting("upstox_access_token")
+                        if token:
+                            _oi_range_scan(token, today, slot)
+                            done.add((today, slot))
+        except Exception as e:
+            _oi_range_state.update({"state": "error", "last_error": f"{type(e).__name__}: {e}"})
+            print(f"[oi-range] {e}", flush=True)
+        time.sleep(45)
+
+
+_oi_range_thread_started = False
+
+
+def ensure_oi_range_loop_started() -> None:
+    global _oi_range_thread_started
+    if _oi_range_thread_started:
+        return
+    _oi_range_thread_started = True
+    threading.Thread(target=_oi_range_loop, daemon=True, name="oi-range").start()
+
+
+_oi_range_levels: dict = {"t": 0.0, "date": None, "map": {}}
+
+
+def _oi_range_levels_today(today: str) -> dict:
+    """{symbol: (floor, ceiling)} from each stock's FIRST OI scan today. Cached 60s so dashboard polls stay cheap."""
+    c = _oi_range_levels
+    if c["date"] == today and time.time() - c["t"] < 60:
+        return c["map"]
+    m: dict = {}
+    with get_db() as conn:
+        for r in conn.execute("SELECT symbol, put_strike, call_strike FROM oi_range_log WHERE date = ? ORDER BY slot", (today,)).fetchall():
+            if r["symbol"] not in m and r["call_strike"] > r["put_strike"]:
+                m[r["symbol"]] = (r["put_strike"], r["call_strike"])
+    c.update({"t": time.time(), "date": today, "map": m})
+    return m
+
+
+def _oi_range_break_state(last: float, hi: float, lo: float, floor: float, ceil: float) -> dict:
+    """ceil_state / floor_state: 2 = price is beyond the level now, 1 = it crossed earlier today and is back inside, 0 = no."""
+    cs = 2 if last > ceil else (1 if hi > ceil else 0)
+    fs = 2 if last < floor else (1 if lo < floor else 0)
+    return {
+        "ceiling": ceil, "floor": floor, "last": last, "ceil_state": cs, "floor_state": fs,
+        "ceil_over_pct": round(((last if cs == 2 else hi) - ceil) / ceil * 100, 2) if cs else 0,
+        "floor_over_pct": round((floor - (last if fs == 2 else lo)) / floor * 100, 2) if fs else 0,
+    }
+
+
+def _attach_oi_range(items: list, is_today: bool) -> None:
+    """Adds 'oi_range' (ceiling/floor from the OI Range logger + break state) to today's alerts that have both
+    a logged range and a live first-candle reading. Read-only; any failure just leaves the chip off."""
+    if not is_today:
+        return
+    try:
+        levels = _oi_range_levels_today((datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d"))
+    except Exception:
+        return
+    for a in items:
+        fc = a.get("fc")
+        lv = levels.get((a.get("symbol") or "").strip().upper())
+        if not lv or not fc or fc.get("last_px") is None or fc.get("day_high_px") is None or fc.get("day_low_px") is None:
+            continue
+        a["oi_range"] = _oi_range_break_state(fc["last_px"], fc["day_high_px"], fc["day_low_px"], lv[0], lv[1])
+
+
+def _oi_range_summarize(rows: list[dict], paths: dict | None = None) -> list[dict]:
+    """rows: oi_range_log rows of ONE day, any order. One summary per stock. The range is the FIRST scan's
+    (put max-OI strike = floor, call max-OI strike = ceiling), so later OI shifts don't move the goalposts."""
+    by_sym: dict = {}
+    for r in sorted(rows, key=lambda x: x["slot"]):
+        by_sym.setdefault(r["symbol"], []).append(r)
+    def _chg(oi, prev):
+        return round((oi - prev) / prev * 100, 1) if (oi is not None and prev) else None
+    paths = paths or {}
+    out = []
+    for sym, rs in by_sym.items():
+        f, l = rs[0], rs[-1]
+        floor, ceil = f["put_strike"], f["call_strike"]
+        valid = ceil > floor
+        pos = round((f["spot"] - floor) / (ceil - floor) * 100, 1) if valid else None
+        path = paths.get(sym) or []                         # [[HH:MM, o, h, l, c], ...] 09:15-15:00
+        last_px = path[-1][4] if path else l["spot"]
+        open_px = path[0][1] if path else None
+        hi = max(path, key=lambda c: c[2]) if path else None
+        lo = min(path, key=lambda c: c[3]) if path else None
+        broke_ceil = next((c[0] for c in path if valid and c[2] > ceil), None)
+        broke_floor = next((c[0] for c in path if valid and c[3] < floor), None)
+        if not valid:
+            result = "Inverted (floor above ceiling)"
+        elif last_px > ceil:
+            result = "Above ceiling"
+        elif last_px < floor:
+            result = "Below floor"
+        else:
+            result = "Inside range"
+        call_chg = _chg(l["call_oi"], l["call_prev_oi"])
+        put_chg = _chg(l["put_oi"], l["put_prev_oi"])
+        out.append({
+            "symbol": sym, "scans": len(rs), "first_slot": f["slot"], "last_slot": l["slot"], "expiry": f["expiry"],
+            "floor": floor, "ceiling": ceil, "spot_first": f["spot"], "spot_last": last_px, "pos_pct": pos,
+            "open_0915": open_px, "price_1500": last_px if path else None, "path_end": path[-1][0] if path else None,
+            "day_move_pct": round((last_px - open_px) / open_px * 100, 2) if open_px else None,
+            "day_high": hi[2] if hi else None, "day_high_time": hi[0] if hi else None,
+            "day_low": lo[3] if lo else None, "day_low_time": lo[0] if lo else None,
+            "broke_ceiling": broke_ceil, "broke_floor": broke_floor,
+            "closes": [[c[0], c[4]] for c in path],
+            "move_pct": round((last_px - f["spot"]) / f["spot"] * 100, 2) if f["spot"] else None,
+            "any_outside": bool(broke_ceil or broke_floor) if path else bool(valid and any(x["spot"] > ceil or x["spot"] < floor for x in rs)),
+            "result": result, "call_oi_chg": call_chg, "put_oi_chg": put_chg,
+            "call_unwind": call_chg is not None and call_chg <= -20,
+            "put_unwind": put_chg is not None and put_chg <= -20,
+            "strikes_shifted": (l["call_strike"] != f["call_strike"]) or (l["put_strike"] != f["put_strike"]),
+        })
+    return sorted(out, key=lambda x: x["symbol"])
+
+
+@app.route("/oi-range")
+def oi_range_page():
+    return render_template("oi_range.html", active_tab="oi_range")
+
+
+@app.route("/api/oi-range")
+def api_oi_range():
+    today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+    date = request.args.get("date") or today
+    with get_db() as conn:
+        dates = [r["date"] for r in conn.execute("SELECT DISTINCT date FROM oi_range_log ORDER BY date DESC LIMIT 60").fetchall()]
+        rows = [dict(r) for r in conn.execute("SELECT * FROM oi_range_log WHERE date = ?", (date,)).fetchall()]
+        paths = {}
+        for r in conn.execute("SELECT symbol, path FROM oi_range_day WHERE date = ?", (date,)).fetchall():
+            try:
+                paths[r["symbol"]] = json.loads(r["path"])
+            except Exception:
+                pass
+    return jsonify({"date": date, "dates": dates, "stocks": _oi_range_summarize(rows, paths),
+                    "state": dict(_oi_range_state), "enabled": _feature_on("oi_range")})
 
 
 _oi_thread_started = False
@@ -5672,6 +5985,10 @@ def _fc_dashboard_info(prev_close, today_candles: list, first_c) -> dict | None:
         "buy_share": round(buy / vol * 100.0, 1) if vol > 0 else None,
         "after_pct": _fc_pct(last, first_c[4]),
         "last_at": today_candles[-1][0][11:16],
+        # absolute prices, used by the dashboard's OI ceiling/floor breakout chip
+        "last_px": last,
+        "day_high_px": max(float(x[2]) for x in today_candles),
+        "day_low_px": min(float(x[3]) for x in today_candles),
     }
     if prev_close:
         out["day_high_pct"] = _fc_pct(max(float(x[2]) for x in today_candles), prev_close)
@@ -5775,6 +6092,9 @@ def _fc_for_alert(symbol: str | None, category: str) -> dict | None:
         "extreme_pct": info.get("day_high_pct") if is_buy else info.get("day_low_pct"),
         "last_pct": info.get("last_pct"),
         "last_at": info.get("last_at"),
+        "last_px": info.get("last_px"),
+        "day_high_px": info.get("day_high_px"),
+        "day_low_px": info.get("day_low_px"),
     }
 
 
@@ -9379,6 +9699,7 @@ def index():
             _attach_sector_0925(_items, selected_date, access_token)
             _attach_fno_rank(_items, access_token, selected_date == today_str)
             _attach_oi_trend(_items, access_token, selected_date == today_str)
+            _attach_oi_range(_items, selected_date == today_str)
             _items.sort(key=_volume_rank)   # Strong volume first (stable)
 
         html = render_template(
@@ -9466,6 +9787,7 @@ def api_alerts():
     _attach_sector_0925(merged_alerts, selected_date, access_token)
     _attach_fno_rank(merged_alerts, access_token, selected_date == today_str)
     _attach_oi_trend(merged_alerts, access_token, selected_date == today_str)
+    _attach_oi_range(merged_alerts, selected_date == today_str)
     # Strong volume first within each column (stable: newest-first kept within a rank)
     _cat_pos = {name: i for i, name in enumerate(CATEGORY_ORDER)}
     merged_alerts.sort(key=lambda a: (_cat_pos.get(a.get("category"), len(_cat_pos)), _volume_rank(a)))
@@ -14237,6 +14559,7 @@ ensure_exit_check_loop_started()  # same: starts on import, tab-independent from
 ensure_shadow_loop_started()
 ensure_oi_loop_started()
 ensure_preopen_loop_started()
+ensure_oi_range_loop_started()
 
 # ---------------------------------------------------------------------------
 # Date-wise "what if" reports (read-only, nothing is written to the DB):
