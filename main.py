@@ -4381,6 +4381,215 @@ def api_oi_range():
                     "state": dict(_oi_range_state), "enabled": _feature_on("oi_range")})
 
 
+# ---------------------------------------------------------------------------
+# CPR test (read-only research): for EVERY closed paper trade in the history, work out that day's CPR from the
+# previous day's daily candle and compare results by CPR width (narrow / normal / wide) and by whether the trade
+# direction matched the side of the CPR the stock opened on. Uses daily candles only (1 call per stock),
+# kept in memory; nothing is written to the database and no orders are placed.
+# ---------------------------------------------------------------------------
+_cpr_state: dict = {"status": "idle", "done": 0, "total": 0, "rows": [], "skipped": 0, "error": None,
+                    "started": None, "finished": None, "trades": 0}
+_cpr_daily_cache: dict = {}          # symbol -> (fetched_epoch, [candles ascending])
+CPR_HISTORY_DAYS = 20                # a CPR width is ranked against the previous 20 trading days
+CPR_MIN_HISTORY = 10
+
+
+def _cpr_levels(h: float, l: float, c: float) -> dict:
+    """Standard CPR from one day's H/L/C. The video's TC can land below BC (close below the day's midpoint), so
+    top/bottom are simply the higher/lower of the two lines."""
+    pivot = (h + l + c) / 3.0
+    bc = (h + l) / 2.0
+    tc = 2.0 * pivot - bc
+    top, bottom = max(tc, bc), min(tc, bc)
+    return {"pivot": pivot, "top": top, "bottom": bottom, "width_pct": (top - bottom) / pivot * 100.0 if pivot else 0.0}
+
+
+def _cpr_classify(prior_widths: list, width: float) -> tuple[float | None, str]:
+    """Rank today's CPR width against the previous days': share of them that were as narrow or narrower.
+    Low rank = unusually narrow. Narrow <= 25, Wide >= 75."""
+    if len(prior_widths) < CPR_MIN_HISTORY:
+        return None, "n/a"
+    rank = round(sum(1 for w in prior_widths if w <= width) / len(prior_widths) * 100.0, 1)
+    return rank, ("Narrow" if rank <= 25 else ("Wide" if rank >= 75 else "Normal"))
+
+
+def _cpr_fetch_daily(symbol: str, token: str, from_date: str, to_date: str) -> list | None:
+    """Daily candles [{date,o,h,l,c}] ascending, oldest..newest, fetched in <=150-day chunks and cached for 6h."""
+    hit = _cpr_daily_cache.get(symbol)
+    if hit and time.time() - hit[0] < 6 * 3600 and hit[1] and hit[1][0]["date"] <= from_date:
+        return hit[1]
+    key = get_instrument_key(symbol)
+    if not key:
+        return None
+    out: dict = {}
+    start = datetime.strptime(from_date, "%Y-%m-%d")
+    end = datetime.strptime(to_date, "%Y-%m-%d")
+    while start <= end:
+        chunk_end = min(start + timedelta(days=150), end)
+        url = (f"https://api.upstox.com/v3/historical-candle/{urllib.parse.quote(key, safe='|')}"
+               f"/days/1/{chunk_end.strftime('%Y-%m-%d')}/{start.strftime('%Y-%m-%d')}")
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {token}", "Accept": "application/json", "User-Agent": BROWSER_USER_AGENT})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            for c in (json.loads(resp.read().decode()).get("data") or {}).get("candles") or []:
+                out[str(c[0])[:10]] = {"date": str(c[0])[:10], "o": float(c[1]), "h": float(c[2]), "l": float(c[3]), "c": float(c[4])}
+        start = chunk_end + timedelta(days=1)
+        time.sleep(0.35)
+    candles = [out[d] for d in sorted(out)]
+    _cpr_daily_cache[symbol] = (time.time(), candles)
+    return candles
+
+
+def _cpr_trade_row(t: dict, candles: list) -> dict | None:
+    """One closed trade -> its CPR reading and outcome. candles: ascending daily candles for the stock."""
+    day = t["date"]
+    idx = [i for i, c in enumerate(candles) if c["date"] < day]
+    if not idx:
+        return None
+    m = idx[-1]                                              # last completed day BEFORE the trade day
+    lv = _cpr_levels(candles[m]["h"], candles[m]["l"], candles[m]["c"])
+    prior = [_cpr_levels(candles[i]["h"], candles[i]["l"], candles[i]["c"])["width_pct"]
+             for i in range(max(0, m - CPR_HISTORY_DAYS), m)]
+    rank, wclass = _cpr_classify(prior, lv["width_pct"])
+    day_c = candles[m + 1] if m + 1 < len(candles) and candles[m + 1]["date"] == day else None
+    row = {"trade_id": t["id"], "date": day, "symbol": t["symbol"], "direction": t["direction"],
+           "strategy": t.get("strategy"), "pnl_pct": t.get("pnl_pct"), "live_pnl_pct": t.get("live_pnl_pct"),
+           "cpr_width_pct": round(lv["width_pct"], 3), "width_rank": rank, "width_class": wclass,
+           "pivot": round(lv["pivot"], 2), "top": round(lv["top"], 2), "bottom": round(lv["bottom"], 2),
+           "open": None, "pos": None, "align": None, "day_move_pct": None, "fav_pct": None, "range_pct": None}
+    if day_c and day_c["o"]:
+        o = day_c["o"]
+        row["open"] = o
+        row["pos"] = "Above CPR" if o > lv["top"] else ("Below CPR" if o < lv["bottom"] else "Inside CPR")
+        buy = t["direction"] == "Buy"
+        row["align"] = ("Aligned" if row["pos"] == "Above CPR" else "Against" if row["pos"] == "Below CPR" else "Inside") if buy \
+            else ("Aligned" if row["pos"] == "Below CPR" else "Against" if row["pos"] == "Above CPR" else "Inside")
+        sign = 1.0 if buy else -1.0
+        row["day_move_pct"] = round(sign * (day_c["c"] - o) / o * 100.0, 2)           # direction-adjusted open -> close
+        row["fav_pct"] = round(((day_c["h"] - o) if buy else (o - day_c["l"])) / o * 100.0, 2)   # best move in trade direction
+        row["range_pct"] = round((day_c["h"] - day_c["l"]) / o * 100.0, 2)
+    return row
+
+
+def _cpr_summarize(rows: list[dict]) -> list[dict]:
+    """Group summaries. P&L is the trade's own paper P&L %; day move / favourable move are the STOCK's, measured
+    from the day's open in the trade's direction."""
+    def avg(v):
+        v = [x for x in v if x is not None]
+        return round(sum(v) / len(v), 2) if v else None
+    groups = [
+        ("All trades", lambda r: True),
+        ("Narrow CPR", lambda r: r["width_class"] == "Narrow"),
+        ("Normal CPR", lambda r: r["width_class"] == "Normal"),
+        ("Wide CPR", lambda r: r["width_class"] == "Wide"),
+        ("Aligned with CPR", lambda r: r["align"] == "Aligned"),
+        ("Inside CPR at open", lambda r: r["align"] == "Inside"),
+        ("Against CPR", lambda r: r["align"] == "Against"),
+        ("Narrow + Aligned", lambda r: r["width_class"] == "Narrow" and r["align"] == "Aligned"),
+        ("Wide + Against", lambda r: r["width_class"] == "Wide" and r["align"] == "Against"),
+    ]
+    out = []
+    for label, pred in groups:
+        g = [r for r in rows if pred(r)]
+        p = [r["pnl_pct"] for r in g if r["pnl_pct"] is not None]
+        out.append({
+            "group": label, "n": len(g),
+            "win_pct": round(sum(1 for x in p if x > 0) / len(p) * 100, 1) if p else None,
+            "avg_pnl_pct": avg(p), "sum_pnl_pct": round(sum(p), 2) if p else None,
+            "avg_day_move_pct": avg([r["day_move_pct"] for r in g]),
+            "avg_fav_pct": avg([r["fav_pct"] for r in g]),
+            "avg_range_pct": avg([r["range_pct"] for r in g]),
+        })
+    return out
+
+
+def _cpr_run() -> None:
+    st = _cpr_state
+    st.update({"status": "running", "done": 0, "total": 0, "rows": [], "skipped": 0, "error": None,
+               "started": (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d %H:%M:%S"), "finished": None})
+    try:
+        token = get_setting("upstox_access_token")
+        if not token:
+            raise RuntimeError("No Upstox access token - log in to Upstox first")
+        with get_db() as conn:
+            trades = []
+            for r in conn.execute(
+                "SELECT id, symbol, direction, entry_time, pnl_pct, strategy, live_status, live_entry_price, "
+                "live_exit_price FROM paper_trades WHERE status = 'CLOSED' AND pnl_pct IS NOT NULL ORDER BY id"
+            ).fetchall():
+                t = dict(r)
+                try:
+                    t["date"] = (datetime.fromisoformat(t["entry_time"]) + IST_OFFSET).strftime("%Y-%m-%d")
+                except Exception:
+                    continue
+                t["symbol"] = (t["symbol"] or "").strip().upper()
+                if t["live_entry_price"] and t["live_exit_price"]:
+                    t["live_pnl_pct"] = round((t["live_exit_price"] - t["live_entry_price"]) / t["live_entry_price"] * 100, 2)
+                else:
+                    t["live_pnl_pct"] = None
+                trades.append(t)
+        st["trades"] = len(trades)
+        by_sym: dict = {}
+        for t in trades:
+            by_sym.setdefault(t["symbol"], []).append(t)
+        st["total"] = len(by_sym)
+        if not _option_chain_cache:
+            get_instrument_key("RELIANCE")
+        today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+        for sym, ts in by_sym.items():
+            try:
+                first = min(t["date"] for t in ts)
+                from_date = (datetime.strptime(first, "%Y-%m-%d") - timedelta(days=60)).strftime("%Y-%m-%d")
+                candles = _cpr_fetch_daily(sym, token, from_date, today)
+            except urllib.error.HTTPError as e:
+                candles = None
+                if e.code == 429:
+                    time.sleep(10)
+            except Exception:
+                candles = None
+            if not candles:
+                st["skipped"] += len(ts)
+            else:
+                for t in ts:
+                    row = _cpr_trade_row(t, candles)
+                    if row:
+                        st["rows"].append(row)
+                    else:
+                        st["skipped"] += 1
+            st["done"] += 1
+        st.update({"status": "done", "finished": (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d %H:%M:%S")})
+    except Exception as e:
+        st.update({"status": "error", "error": f"{type(e).__name__}: {e}"})
+
+
+@app.route("/cpr-test")
+def cpr_test_page():
+    return render_template("cpr_test.html", active_tab="cpr_test")
+
+
+@app.route("/api/cpr-test/run", methods=["POST"])
+def api_cpr_test_run():
+    if _cpr_state["status"] == "running":
+        return jsonify({"status": "already_running"})
+    threading.Thread(target=_cpr_run, daemon=True, name="cpr-test").start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/api/cpr-test")
+def api_cpr_test():
+    strategy = request.args.get("strategy") or "ALL"
+    direction = request.args.get("direction") or "ALL"
+    rows = [r for r in _cpr_state["rows"]
+            if (strategy == "ALL" or r["strategy"] == strategy) and (direction == "ALL" or r["direction"] == direction)]
+    return jsonify({
+        "state": {k: _cpr_state[k] for k in ("status", "done", "total", "skipped", "error", "started", "finished", "trades")},
+        "strategies": sorted({r["strategy"] for r in _cpr_state["rows"] if r["strategy"]}),
+        "summary": _cpr_summarize(rows),
+        "rows": sorted(rows, key=lambda r: (r["date"], r["trade_id"]), reverse=True)[:600],
+        "row_count": len(rows),
+    })
+
+
 _oi_thread_started = False
 
 
