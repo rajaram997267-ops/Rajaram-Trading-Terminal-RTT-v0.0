@@ -5568,6 +5568,9 @@ def fetch_prev_session_5min_candles(instrument_key: str, access_token: str) -> l
 
 _today_candle_cache: dict[str, tuple[float, list]] = {}  # instrument_key -> (fetched_at_monotonic, candles)
 _CANDLE_CACHE_TTL_SECONDS = 30
+_candle_cooldown_until: dict[str, float] = {}   # instrument_key -> monotonic time before which we don't retry after a 429
+_CANDLE_429_COOLDOWN_SECONDS = 30
+_CANDLE_STALE_MAX_SECONDS = 600           # last good candles may be reused this long while Upstox is rate-limiting us
 
 
 def fetch_5min_candles_cached(instrument_key: str, access_token: str) -> list[tuple[float, float, float, float]]:
@@ -5592,7 +5595,21 @@ def fetch_5min_candles_cached(instrument_key: str, access_token: str) -> list[tu
     now = time.monotonic()
     if cached and (now - cached[0]) < _CANDLE_CACHE_TTL_SECONDS:
         return cached[1]
-    result = fetch_5min_candles(instrument_key, access_token)
+    # Upstox answered 429 recently: don't re-hit it every 5s from the exit loop (that keeps the block alive).
+    # Serve the last good candles (up to 10 min old) if we have them, otherwise fail fast as before.
+    if now < _candle_cooldown_until.get(instrument_key, 0.0):
+        if cached and (now - cached[0]) < _CANDLE_STALE_MAX_SECONDS:
+            return cached[1]
+        raise RuntimeError("Upstox candle fetch paused briefly after a rate-limit (429) error")
+    try:
+        result = fetch_5min_candles(instrument_key, access_token)
+    except urllib.error.HTTPError as e:
+        if e.code == 429:
+            _candle_cooldown_until[instrument_key] = now + _CANDLE_429_COOLDOWN_SECONDS
+            print(f"[candles] Upstox 429 for {instrument_key} - pausing its fetches {_CANDLE_429_COOLDOWN_SECONDS}s", flush=True)
+            if cached and (now - cached[0]) < _CANDLE_STALE_MAX_SECONDS:
+                return cached[1]
+        raise
     _today_candle_cache[instrument_key] = (now, result)
     return result
 
