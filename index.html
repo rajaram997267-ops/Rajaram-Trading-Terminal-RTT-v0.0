@@ -1,0 +1,1287 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Rajaram Trading Terminal - RTT v0.0</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: #131722;
+      --border: #1e222d;
+      --text: #e6e9f0;
+      --muted: #6b7280;
+      --green: #00c896;
+      --gold: #ffb800;
+      --red: #ff5370;
+    }
+    :root[data-theme="light-gray"] {
+      --red: #dc2626;
+      --bg: #e9ebee;
+      --panel: #ffffff;
+      --border: #d0d4da;
+      --text: #1a1d23;
+      --muted: #6b7280;
+      --green: #0e9f6e;
+      --gold: #b45309;
+    }
+    :root[data-theme="sky-blue"] {
+      --red: #dc2626;
+      --bg: #eaf4fb;
+      --panel: #ffffff;
+      --border: #bfe0f2;
+      --text: #10222c;
+      --muted: #4a6572;
+      --green: #0e9f6e;
+      --gold: #b45309;
+    }
+    :root[data-theme="off-white"] {
+      --red: #dc2626;
+      --bg: #f7f5f0;
+      --panel: #ffffff;
+      --border: #e2ddd2;
+      --text: #1f1c16;
+      --muted: #6b6455;
+      --green: #0e9f6e;
+      --gold: #b45309;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+    }
+    .topbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    h2 { margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 13px; }
+    .sub code {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 2px 6px;
+      border-radius: 4px;
+      color: var(--green);
+    }
+    .pulse {
+      display: inline-block;
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: var(--green);
+      margin-right: 6px;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(0,200,150,0.5); }
+      70% { box-shadow: 0 0 0 8px rgba(0,200,150,0); }
+      100% { box-shadow: 0 0 0 0 rgba(0,200,150,0); }
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    select {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 13px;
+      padding: 8px 12px;
+      border-radius: 8px;
+    }
+    .count {
+      font-size: 12px;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      border-radius: 8px;
+      white-space: nowrap;
+    }
+    .count b { color: var(--text); }
+    button {
+      background: #ff5370;
+      color: #fff;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    button:hover { opacity: 0.9; }
+    .btn-enter {
+      background: var(--green);
+      color: #06110d;
+      border: none;
+      padding: 3px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .btn-enter:hover { opacity: 0.85; }
+    .btn-chart {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      padding: 3px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 600;
+      margin-left: 6px;
+    }
+    .btn-chart:hover { opacity: 0.85; border-color: var(--green); }
+
+    .chart-modal-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    .chart-modal-overlay.open { display: flex; }
+    .chart-modal {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px;
+      width: min(900px, 92vw);
+      max-height: 85vh;
+      overflow: auto;
+    }
+    .chart-modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .chart-modal-header h3 { margin: 0; font-size: 16px; }
+    .chart-modal-close {
+      background: var(--border);
+      color: var(--text);
+      border: none;
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .chart-modal-body { position: relative; height: 400px; }
+    .chart-modal-status { color: var(--muted); font-size: 13px; text-align: center; padding: 40px 0; }
+
+    /* --- List row (replaces the old card grid) --- */
+    .category-list {
+      display: flex;
+      flex-direction: column;
+    }
+    .list-row {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 7px 8px;
+      border-bottom: 1px solid var(--border);
+      border-left: 2px solid transparent;
+      cursor: default;
+    }
+    .list-row:hover { background: rgba(127,127,127,0.12); }
+    .list-row.confirmed {
+      border-left-color: var(--gold);
+      background: rgba(255,184,0,0.04);
+    }
+    .row-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 8px;
+    }
+    .sym-wrap { display: flex; align-items: baseline; gap: 6px; min-width: 0; overflow: hidden; }
+    .sec-chip { font-size: 10px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 170px; padding: 1px 6px; border-radius: 8px; background: rgba(127,127,127,0.14); color: var(--muted); }
+    .dp-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 6px; border-radius: 8px; border: 1px solid var(--border); color: var(--muted); cursor: help; }
+    .oi-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 7px; border-radius: 8px; border: 1px solid transparent; cursor: help; background: rgba(127,127,127,0.18); color: var(--muted); }
+    .oi-chip.up { background: #0a6b3f; border-color: #0a6b3f; color: #fff; }
+    .oi-chip.down { background: #c62839; border-color: #c62839; color: #fff; }
+    .rng-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 7px; border-radius: 8px; border: 1px solid transparent; cursor: help; color: #fff; }
+    .rng-chip.up { background: #0a6b3f; border-color: #0a6b3f; }
+    .rng-chip.down { background: #c62839; border-color: #c62839; }
+    .rng-chip.fail { background: transparent; color: var(--muted); border-style: dashed; border-color: currentColor; }
+    .rng-chip.fail.up { color: var(--green); }
+    .rng-chip.fail.down { color: #ff5370; }
+    .fs-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 7px; border-radius: 8px; border: 1px solid var(--border); color: var(--muted); cursor: help; }
+    .fs-chip.up { background: #0a6b3f; border-color: #0a6b3f; color: #fff; }
+    .fs-chip.down { background: #c62839; border-color: #c62839; color: #fff; }
+    .mv-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 6px; border-radius: 8px; border: 1px solid currentColor; cursor: help; }
+    .mv-chip.pos { color: var(--green); }
+    .mv-chip.neg { color: #ff5370; }
+    .dp-chip.good { color: var(--green); border-color: var(--green); }
+    .sec-chip.pos { color: var(--green); }
+    .sec-chip.neg { color: #ff5370; }
+    .row-top .sym {
+      font-size: 14px;
+      font-weight: 700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .row-top .price {
+      color: var(--gold);
+      font-weight: 600;
+      font-size: 13px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .row-top .price::before { content: "Rs "; opacity: 0.7; font-weight: 400; }
+    .row-vol {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 10px;
+      color: var(--muted);
+    }
+    .vol-pill {
+      font-size: 10px;
+      font-weight: 600;
+      padding: 0 6px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: transparent;
+      white-space: nowrap;
+      cursor: help;
+    }
+    .vol-pill.strong { color: var(--green); border-color: var(--green); }
+    .vol-pill.moderate { color: var(--gold); border-color: var(--gold); }
+    .vol-pill.weak { color: var(--muted); }
+    .vol-pill.fc { color: var(--text); }
+    .row-fc { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 10px; font-size: 10px; color: var(--muted); margin-top: 2px; }
+    .fc-share { font-size: 11px; font-weight: 700; padding: 0 7px; border-radius: 8px; border: 1px solid var(--border); color: var(--text); white-space: nowrap; cursor: help; }
+    .fc-share.hot { background: var(--green); border-color: var(--green); color: #04130e; }
+    .fc-share.good { color: var(--green); border-color: var(--green); }
+    .fc-share.low { color: var(--red); border-color: var(--red); }
+    .fc-stat { white-space: nowrap; cursor: help; }
+    .fc-stat b { font-weight: 600; }
+    .fc-stat b.pos { color: var(--green); }
+    .fc-stat b.neg { color: var(--red); }
+    .pct-change {
+      font-size: 11px;
+      font-weight: 600;
+      margin-left: 6px;
+      white-space: nowrap;
+    }
+    .pct-change.pos { color: var(--green); }
+    .pct-change.neg { color: var(--red); }
+    .btn-refresh-price {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      padding: 1px 6px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 11px;
+      margin-left: 6px;
+      line-height: 1.4;
+    }
+    .btn-refresh-price:hover { color: var(--text); border-color: var(--green); }
+    .btn-refresh-price:disabled { opacity: 0.4; cursor: default; }
+    .row-bottom {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .badges-inline {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      min-width: 0;
+    }
+    .badge {
+      display: inline-block;
+      background: rgba(0,200,150,0.1);
+      color: var(--green);
+      border: 1px solid rgba(0,200,150,0.25);
+      padding: 2px 7px;
+      border-radius: 999px;
+      font-size: 10px;
+      white-space: nowrap;
+    }
+    .time-inline {
+      color: var(--muted);
+      font-size: 11px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .confirm-badge {
+      display: inline-block;
+      background: rgba(255,184,0,0.12);
+      color: var(--gold);
+      border: 1px solid rgba(255,184,0,0.35);
+      padding: 1px 6px;
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 600;
+      margin-left: 6px;
+    }
+    /* A stock that triggered on 3+ scans at once - stronger signal than
+       the regular 2x confirmed border, so it blinks to stand out. */
+    @keyframes triple-blink {
+      0%, 100% { box-shadow: inset 0 0 0 1px var(--gold), 0 0 8px rgba(255,184,0,0.55); }
+      50% { box-shadow: inset 0 0 0 1px rgba(255,184,0,0.15), 0 0 0 rgba(255,184,0,0); }
+    }
+    .list-row.triple-confirmed {
+      border-left-color: var(--gold);
+      animation: triple-blink 1.1s ease-in-out infinite;
+    }
+    .list-row.triple-confirmed .confirm-badge {
+      background: var(--gold);
+      color: #16130a;
+      border-color: var(--gold);
+    }
+    /* --- end list row --- */
+
+    .empty {
+      padding: 60px 20px;
+      text-align: center;
+      color: var(--muted);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+    .section {
+      margin-bottom: 28px;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+    .section-header h3 {
+      margin: 0;
+      font-size: 15px;
+      letter-spacing: 0.02em;
+    }
+    .section-count {
+      font-size: 11px;
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      border-radius: 999px;
+    }
+    .section-header.sell h3 { color: #ff5370; }
+    .section-header.buy h3 { color: var(--green); }
+    .section-header.others h3 { color: var(--gold); }
+    .side-switch {
+      position: relative;
+      display: inline-block;
+      width: 32px;
+      height: 18px;
+      flex: none;
+      margin-left: 4px;
+    }
+    .side-switch input { opacity: 0; width: 0; height: 0; }
+    .side-slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: var(--border);
+      transition: .15s;
+      border-radius: 18px;
+    }
+    .side-slider:before {
+      position: absolute;
+      content: "";
+      height: 13px; width: 13px;
+      left: 2.5px; bottom: 2.5px;
+      background-color: var(--text);
+      transition: .15s;
+      border-radius: 50%;
+    }
+    .section-header.sell .side-switch input:checked + .side-slider { background-color: #ff5370; }
+    .section-header.buy .side-switch input:checked + .side-slider { background-color: var(--green); }
+    .side-switch input:checked + .side-slider:before { transform: translateX(14px); }
+    .category-column.side-off {
+      opacity: 0.4;
+    }
+    .side-off-label {
+      font-size: 10px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-left: 2px;
+    }
+    .section-line {
+      flex: 1;
+      height: 1px;
+      background: var(--border);
+    }
+    .tabbar {
+      display: flex;
+      gap: 4px;
+      margin: 20px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .tabbar a {
+      padding: 10px 18px;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      text-decoration: none;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+    }
+    .tabbar a.active { color: var(--text); border-bottom-color: var(--green); }
+    .tabbar a:hover { color: var(--text); }
+    .layout {
+      display: flex;
+      align-items: flex-start;
+      gap: 24px;
+    }
+    .sidebar {
+      width: 220px;
+      flex-shrink: 0;
+      border-right: 1px solid var(--border);
+      padding-right: 20px;
+      position: sticky;
+      top: 24px;
+    }
+    .sidebar h4 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .sidebar select {
+      width: 100%;
+    }
+    .sector-list {
+      display: flex;
+      flex-direction: column;
+      max-height: calc(100vh - 100px);
+      overflow-y: auto;
+    }
+    .sector-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 8px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      border-left: 2px solid transparent;
+    }
+    .sector-row:hover { background: rgba(127,127,127,0.12); }
+    .sector-row.selected {
+      background: rgba(0,200,150,0.08);
+      border-left-color: var(--green);
+    }
+    .sector-row .name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .sector-row.all .name { color: var(--text); font-weight: 600; }
+    .sector-row .pct {
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .sector-row .pct.pos { color: var(--green); }
+    .sector-row .pct.neg { color: #ff5370; }
+    .sector-row .pct.na { color: var(--muted); font-weight: 400; }
+    .main-content {
+      flex: 1;
+      min-width: 0;
+    }
+    .categories-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 0;
+    }
+    .category-column {
+      flex: 1;
+      min-width: 0;
+      padding: 0 20px;
+      border-right: 1px solid var(--border);
+    }
+    .category-column:first-child { padding-left: 0; }
+    .category-column:last-child { border-right: none; padding-right: 0; }
+    @media (max-width: 900px) {
+      .layout {
+        flex-direction: column;
+      }
+      .sidebar {
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        padding: 0 0 16px 0;
+        position: static;
+      }
+    }
+    @media (max-width: 640px) {
+      .categories-row {
+        flex-direction: column;
+      }
+      .category-column {
+        border-right: none;
+        border-bottom: 1px solid var(--border);
+        padding: 0 0 20px 0;
+        margin-bottom: 20px;
+        width: 100%;
+      }
+      .category-column:last-child { border-bottom: none; margin-bottom: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div>
+      <h2><span class="pulse"></span>Rajaram Trading Terminal <span style="color: var(--muted); font-weight: 400; font-size: 14px;">RTT v0.0</span></h2>
+      <div class="sub">Webhook endpoint: <code>/webhook/chartink</code> &middot; auto-refreshes every 5s</div>
+    </div>
+    <div class="controls">
+      <select id="dateSelect" onchange="location.href = '/?date=' + this.value;">
+        {% for d in available_dates %}
+          <option value="{{ d }}" {% if d == selected_date %}selected{% endif %}>
+            {{ d }}{% if d == today_str %} (today){% endif %}
+          </option>
+        {% endfor %}
+        {% if not available_dates %}
+          <option value="{{ today_str }}" selected>{{ today_str }} (today)</option>
+        {% endif %}
+      </select>
+      <select id="sortSelect" title="How alerts are ordered inside each column. 9:15 buy share = how much of the 9:15 candle agreed with the alert (highest first). Direction pressure = the 9:15 candle's buying (selling for Sell) volume vs its 10-session average (highest first). Today only." onchange="setSortMode(this.value)">
+        <option value="volume">Sort: volume strength</option>
+        <option value="share">Sort: 9:15 buy share</option>
+        <option value="pressure">Sort: direction pressure</option>
+        <option value="oipct">Sort: OI % (latest)</option>
+        <option value="oirise">Sort: OI % rise since 9:15</option>
+        <option value="breakout">Sort: OI ceiling breakout</option>
+        <option value="breakdown">Sort: OI floor breakdown</option>
+        <option value="futpct">Sort: Futures % move (strongest first)</option>
+        <option value="futlead">Sort: Futures lead over spot</option>
+      </select>
+      <div class="count">alerts this day: <b id="dayCount">{{ alerts_count }}</b></div>
+      <form method="post" action="/clear" onsubmit="return confirm('Clear all saved alerts (all days)?');">
+        <button type="submit">Clear All</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="tabbar">
+    <a href="/" class="{% if active_tab == 'dashboard' %}active{% endif %}">Dashboard</a>
+    <a href="/paper-trading" class="{% if active_tab == 'paper' %}active{% endif %}">Paper Trading</a>
+    <a href="/live-trading" class="{% if active_tab == 'live' %}active{% endif %}">Live Trading</a>
+    <a href="/stats" class="{% if active_tab == 'stats' %}active{% endif %}">Stats</a>
+    <a href="/websocket-stats" class="{% if active_tab == 'websocket_stats' %}active{% endif %}">WS Speed</a>
+    <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
+    <a href="/shadow" class="{% if active_tab == 'shadow' %}active{% endif %}">Manual vs RSI</a>
+    <a href="/exit-lab" class="{% if active_tab == 'exit_lab' %}active{% endif %}">Exit Lab</a>
+    <a href="/first-candle" class="{% if active_tab == 'first_candle' %}active{% endif %}">First Candle</a>
+    <a href="/exit-compare" class="{% if active_tab == 'exit_compare' %}active{% endif %}">Exit Compare</a>
+    <a href="/market-eye" class="{% if active_tab == 'market_eye' %}active{% endif %}">Market EYE &#128065;&#65039;</a>
+    <a href="/preopen-context" class="{% if active_tab == 'preopen_context' %}active{% endif %}">Pre-Open Context</a>
+    <a href="/oi-range" class="{% if active_tab == 'oi_range' %}active{% endif %}">OI Range</a>
+    <a href="/fut-spot" class="{% if active_tab == 'fut_spot' %}active{% endif %}">Futures vs Spot</a>
+  </div>
+
+  <div class="layout">
+    <div class="sidebar">
+      <h4>Sector</h4>
+      <div class="sector-list" id="sectorList">
+        <div class="sector-row all selected" data-sector="" onclick="selectSector('')">
+          <span class="name">All sectors</span>
+        </div>
+        {% for s in all_sector_names %}
+        <div class="sector-row" data-sector="{{ s }}" onclick='selectSector({{ s|tojson }})'>
+          <span class="name">{{ s }}</span>
+          <span class="pct na" data-sector-pct="{{ s }}">-</span>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="main-content">
+      <div id="alertsContainer">
+        {% if grouped %}
+          <div class="categories-row">
+            {% for category, items in grouped %}
+            <div class="category-column{% if category == 'Buy' and not buy_alerts_enabled %} side-off{% elif category == 'Sell' and not sell_alerts_enabled %} side-off{% endif %}" data-category="{{ category }}">
+              <div class="section-header {{ category|lower }}">
+                <h3>{{ category }}</h3>
+                <span class="section-count">{{ items|length }}</span>
+                {% if category in ('Buy', 'Sell') %}
+                <label class="side-switch">
+                  <input type="checkbox" {% if (category == 'Buy' and buy_alerts_enabled) or (category == 'Sell' and sell_alerts_enabled) %}checked{% endif %} onchange="toggleSide('{{ category }}', this)">
+                  <span class="side-slider"></span>
+                </label>
+                <span class="side-off-label" style="display:{% if (category == 'Buy' and buy_alerts_enabled) or (category == 'Sell' and sell_alerts_enabled) %}none{% else %}inline{% endif %};">off</span>
+                {% endif %}
+                <div class="section-line"></div>
+              </div>
+              <div class="category-list">
+                {% for alert in items %}
+                <div class="list-row{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}{% if alert['confirmed_count'] and alert['confirmed_count'] >= 3 %} triple-confirmed{% endif %}" data-sector="{{ alert['sector'] }}" {% if alert["alert_name"] %}title="{{ alert['alert_name'] }}"{% endif %}>
+                  <div class="row-top">
+                    <span class="sym-wrap"><span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>{% if alert.get("sector") and alert.get("sector") != "Unclassified" %}<span class="sec-chip{% if alert.get('sector_0925') is not none %}{{ ' pos' if alert['sector_0925'] > 0 else (' neg' if alert['sector_0925'] < 0 else '') }}{% endif %}" title="Sector {{ alert['sector'] }}{% if alert.get('sector_0925') is not none %}: {{ '%+.2f'|format(alert['sector_0925']) }}% at 09:25 IST (fixed for the day){% else %}: 09:25 value not available yet{% endif %}">{{ alert['sector'] }}{% if alert.get('sector_0925') is not none %} {{ '%+.2f'|format(alert['sector_0925']) }}%{% endif %}</span>{% endif %}{% set _fcp = alert.get("fc") %}{% if _fcp and _fcp.get("pressure") is not none %}<span class="dp-chip{{ ' good' if _fcp['pressure'] >= 3 else '' }}" title="Dir. pressure {{ '%.2f'|format(_fcp['pressure']) }}x: estimated {{ _fcp['side'] }}ing volume of the 9:15 candle vs its 10-session average">Pressure {{ '%.1f'|format(_fcp['pressure']) }}&times;</span>{% endif %}{% set _mv = alert.get("fno_rank") %}{% if _mv %}<span class="mv-chip {{ 'pos' if _mv['type'] == 'gain' else 'neg' }}" title="{{ 'Top F&O gainer' if _mv['type'] == 'gain' else 'Top F&O loser' }} #{{ _mv['rank'] }} vs the previous close, as of {{ _mv['as_of'] }}">{{ '&uarr;'|safe if _mv['type'] == 'gain' else '&darr;'|safe }} #{{ _mv['rank'] }} {{ '%+.2f'|format(_mv['pct']) }}%</span>{% endif %}{% set _ot = alert.get("oi_trend") %}{% if _ot %}<span class="oi-chip {{ _ot['dir'] }}" title="Open interest vs previous day">OI {% if _ot['open_pct'] is not none %}{{ '%+.2f'|format(_ot['open_pct']) }}% &rarr; {% endif %}{{ '%+.2f'|format(_ot['now_pct']) }}%{{ ' &#9650;'|safe if _ot['dir'] == 'up' else (' &#9660;'|safe if _ot['dir'] == 'down' else '') }}</span>{% endif %}{% set _rg = alert.get("oi_range") %}{% if _rg %}{% if _rg['ceil_state'] %}<span class="rng-chip up{{ ' fail' if _rg['ceil_state'] == 1 else '' }}" title="OI ceiling {{ '%.2f'|format(_rg['ceiling']) }} (strike with the most Call OI, first scan today): {{ 'price is above it now' if _rg['ceil_state'] == 2 else 'price crossed it earlier today and is back inside' }} ({{ '%+.2f'|format(_rg['ceil_over_pct']) }}% beyond)">Breakout &#9650;{{ ' (back inside)' if _rg['ceil_state'] == 1 else '' }}</span>{% endif %}{% if _rg['floor_state'] %}<span class="rng-chip down{{ ' fail' if _rg['floor_state'] == 1 else '' }}" title="OI floor {{ '%.2f'|format(_rg['floor']) }} (strike with the most Put OI, first scan today): {{ 'price is below it now' if _rg['floor_state'] == 2 else 'price crossed it earlier today and is back inside' }} ({{ '%+.2f'|format(_rg['floor_over_pct']) }}% beyond)">Breakdown &#9660;{{ ' (back inside)' if _rg['floor_state'] == 1 else '' }}</span>{% endif %}{% endif %}{% set _fs = alert.get("fut_spot") %}{% if _fs and _fs['fut_pct'] is not none and _fs['spot_pct'] is not none %}{% set _ld = _fs['lead_dir_pp'] or 0 %}<span class="fs-chip{{ ' up' if _ld >= 0.1 else (' down' if _ld <= -0.1 else '') }}" title="Nearest future ({{ _fs['expiry'] }}) {{ '%.2f'|format(_fs['fut_ltp']) }}, {{ '%+.2f'|format(_fs['fut_pct']) }}% vs prev close. Spot {{ '%.2f'|format(_fs['spot_ltp']) }}, {{ '%+.2f'|format(_fs['spot_pct']) }}%. Future premium over spot {{ '%+.2f'|format(_fs['premium_pct'] or 0) }}%. Future % minus spot % in the alert's direction: {{ '%+.2f'|format(_ld) }} pp (green = futures leading, red = lagging).">Fut {{ '%+.2f'|format(_fs['fut_pct']) }}% / Spot {{ '%+.2f'|format(_fs['spot_pct']) }}%</span>{% endif %}</span>
+                    <span class="price-wrap"><span class="price">{{ (alert["trigger_price"] or "-")|inr }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '{{ (alert['symbol'] or '')|escape }}')" title="Fetch live price">&#8635;</button>
+                  </div>
+                  {% if alert.get("volume") %}
+                  <div class="row-vol"><span class="vol-pill {{ alert['volume']['label']|lower }}" title="{{ 'Buy' if category == 'Buy' else 'Sell' }}-side directional volume is {{ alert['volume']['ratio'] }}x its usual level for this time of day{% if alert['volume']['prev_ratio'] is not none %} (previous candle: {{ alert['volume']['prev_ratio'] }}x){% endif %}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of {{ alert['volume']['asof'] }}.">Vol {{ alert['volume']['label'] }} &middot; {{ alert['volume']['ratio'] }}&times;</span>{% if alert['volume'].get('first_ratio') is not none %}<span class="vol-pill fc" title="First 5-min candle (9:15) volume is {{ alert['volume']['first_ratio'] }}x its average over the previous 10 sessions.">9:15 vol {{ alert['volume']['first_ratio'] }}&times;</span>{% endif %}<span>as of {{ alert['volume']['asof'] }}</span></div>
+                  {% endif %}
+                  {% if alert.get("fc") %}{% set fc = alert["fc"] %}
+                  <div class="row-fc"><span class="fc-share{% if fc['share'] >= 95 %} hot{% elif fc['share'] >= 70 %} good{% elif fc['share'] < 50 %} low{% endif %}" title="The 9:15 candle closed at {{ fc['share'] }}% of its range in the alert's direction - an estimated {{ fc['side'] }} share of its volume (100% = closed exactly at its {{ 'high' if fc['side'] == 'buy' else 'low' }}). Estimated from candle structure, not true buy/sell volume.">9:15 {{ fc['side'] }} {{ "%.1f"|format(fc['share']) }}%</span>{% if fc['after_pct'] is not none %}<span class="fc-stat" title="Move from the 9:15 candle's close to the latest price (as of {{ fc['last_at'] }})">After 9:15 <b class="{{ 'pos' if fc['after_pct'] > 0 else 'neg' if fc['after_pct'] < 0 else '' }}">{{ "%+.2f"|format(fc['after_pct']) }}%</b></span>{% endif %}{% if fc['extreme_pct'] is not none %}<span class="fc-stat" title="{{ fc['extreme_label'] }} so far today vs the previous close">{{ fc['extreme_label'] }} <b class="{{ 'pos' if fc['extreme_pct'] > 0 else 'neg' if fc['extreme_pct'] < 0 else '' }}">{{ "%+.2f"|format(fc['extreme_pct']) }}%</b></span>{% endif %}{% if fc['last_pct'] is not none %}<span class="fc-stat" title="Latest price vs the previous close (as of {{ fc['last_at'] }})">Last <b class="{{ 'pos' if fc['last_pct'] > 0 else 'neg' if fc['last_pct'] < 0 else '' }}">{{ "%+.2f"|format(fc['last_pct']) }}%</b></span>{% endif %}</div>
+                  {% endif %}
+                  <div class="row-bottom">
+                    <span class="badges-inline">
+                      {% for sn in alert.get("scan_names", [alert.get("scan_name", "Scan alert")]) %}
+                      <span class="badge">{{ sn or "Scan alert" }}</span>
+                      {% endfor %}
+                    </span>
+                    <span class="time-inline">{{ alert["triggered_at"] or alert["created_at"][11:19] }}</span>
+                    {% if category in ('Buy', 'Sell') and alert.get('id') %}
+                    <button class="btn-enter" onclick="manualEnterAlert({{ alert['id'] }}, '{{ (alert['symbol'] or '')|escape }}', '{{ category }}')">Enter</button>
+                    {% endif %}
+                    {% if alert.get('symbol') %}
+                    <button class="btn-chart" onclick="openChart('{{ (alert['symbol'] or '')|escape }}', '{{ category }}')">Chart</button>
+                    {% endif %}
+                  </div>
+                </div>
+                {% endfor %}
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty">No alerts yet for this day. Point your Chartink alert's webhook URL at <code>/webhook/chartink</code> and they'll show up here.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="chart-modal-overlay" id="chartModalOverlay" onclick="if(event.target===this) closeChart()">
+    <div class="chart-modal">
+      <div class="chart-modal-header">
+        <h3 id="chartModalTitle">Chart</h3>
+        <button class="chart-modal-close" onclick="closeChart()">Close</button>
+      </div>
+      <div class="chart-modal-body">
+        <canvas id="chartModalCanvas"></canvas>
+        <div class="chart-modal-status" id="chartModalStatus" style="display:none;"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const SELECTED_DATE = {{ selected_date|tojson }};
+    const TODAY_STR = {{ today_str|tojson }};
+    let buyAlertsEnabled = {{ buy_alerts_enabled|tojson }};
+    let sellAlertsEnabled = {{ sell_alerts_enabled|tojson }};
+    const CATEGORY_ORDER = ["Sell", "Buy", "Others"];
+    // Remembers the globally chosen sector so it survives the 5s
+    // auto-refresh instead of resetting to "All sectors" every time.
+    let globalSector = "";
+
+    function categorize(alert) {
+      const text = ((alert.scan_name || "") + " " + (alert.alert_name || "")).toLowerCase();
+      if (text.includes("sell")) return "Sell";
+      if (text.includes("buy")) return "Buy";
+      return "Others";
+    }
+
+    function rowHTML(a) {
+      const isConfirmed = a.confirmed_count && a.confirmed_count > 1;
+      const isTripleConfirmed = a.confirmed_count && a.confirmed_count >= 3;
+      const confirmBadge = isConfirmed
+        ? `<span class="confirm-badge">${a.confirmed_count}x</span>`
+        : "";
+      const scanNames = (a.scan_names && a.scan_names.length) ? a.scan_names : [a.scan_name || "Scan alert"];
+      const badgesHtml = scanNames.map(sn => `<span class="badge">${escapeHtml(sn || "Scan alert")}</span>`).join("");
+      const titleAttr = a.alert_name ? ` title="${escapeHtml(a.alert_name)}"` : "";
+      const timeText = a.triggered_at || (a.created_at || "").slice(11, 19);
+      const cat = categorize(a);
+      // Manual entry: lets a missed alert (one that fired while another
+      // trade was already open, so the system skipped it) be entered by
+      // hand once the coast is clear - same entry logic as the automatic
+      // path, just triggered by a click. Only shown for actual Buy/Sell
+      // alerts, not "Others".
+      const enterBtn = (cat === "Buy" || cat === "Sell") && a.id
+        ? `<button class="btn-enter" onclick="manualEnterAlert(${a.id}, '${escapeHtml(a.symbol || "")}', '${cat}')">Enter</button>`
+        : "";
+      const chartBtn = a.symbol
+        ? `<button class="btn-chart" onclick="openChart('${escapeHtml(a.symbol)}', '${cat}')">Chart</button>`
+        : "";
+      const pctBadge = (a.pct_change_today !== null && a.pct_change_today !== undefined)
+        ? `<span class="pct-change ${a.pct_change_today >= 0 ? "pos" : "neg"}">${a.pct_change_today >= 0 ? "+" : ""}${a.pct_change_today}%</span>`
+        : "";
+      let volHtml = "";
+      if (a.volume && a.volume.label) {
+        const v = a.volume;
+        const side = cat === "Buy" ? "Buy" : "Sell";
+        const prevTxt = (v.prev_ratio !== null && v.prev_ratio !== undefined) ? ` (previous candle: ${v.prev_ratio}x)` : "";
+        const tip = `${side}-side directional volume is ${v.ratio}x its usual level for this time of day${prevTxt}. Estimated from candle structure, not true buy/sell volume. Latest closed 5-min candle, as of ${v.asof}.`;
+        volHtml = `<div class="row-vol"><span class="vol-pill ${escapeHtml(v.label.toLowerCase())}" title="${escapeHtml(tip)}">Vol ${escapeHtml(v.label)} &middot; ${v.ratio}&times;</span>${(v.first_ratio !== null && v.first_ratio !== undefined) ? `<span class="vol-pill fc" title="First 5-min candle (9:15) volume is ${v.first_ratio}x its average over the previous 10 sessions.">9:15 vol ${v.first_ratio}&times;</span>` : ""}<span>as of ${escapeHtml(v.asof)}</span></div>`;
+      }
+      const fcHtml = fcLineHtml(a.fc);
+      return `
+        <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
+          <div class="row-top">
+            <span class="sym-wrap"><span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>${secChipHtml(a)}${dirChipHtml(a)}${moverChipHtml(a)}${oiChipHtml(a)}${rangeChipHtml(a)}${futChipHtml(a)}</span>
+            <span class="price-wrap"><span class="price">${escapeHtml(String(inr(a.trigger_price || "-")))}</span>${pctBadge}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '${escapeHtml(a.symbol || "")}')" title="Fetch live price">&#8635;</button>
+          </div>
+          ${volHtml}
+          ${fcHtml}
+          <div class="row-bottom">
+            <span class="badges-inline">${badgesHtml}</span>
+            <span class="time-inline">${escapeHtml(timeText)}</span>
+            ${enterBtn}
+            ${chartBtn}
+          </div>
+        </div>
+      `;
+    }
+
+    // The first-candle line under an alert: 9:15 buy/sell share (the important one), the move
+    // since the 9:15 candle, the day's extreme and the latest price, all vs the previous close.
+    // Sector name + the sector's FIXED % at 09:25 IST, shown next to the stock name.
+    function secChipHtml(a) {
+      if (!a.sector || a.sector === "Unclassified") return "";
+      const p = a.sector_0925;
+      const has = p !== null && p !== undefined;
+      const cls = has ? (p > 0 ? " pos" : p < 0 ? " neg" : "") : "";
+      const tip = "Sector " + a.sector + (has ? ": " + (p > 0 ? "+" : "") + Number(p).toFixed(2) + "% at 09:25 IST (fixed for the day)" : ": 09:25 value not available yet");
+      return `<span class="sec-chip${cls}" title="${escapeHtml(tip)}">${escapeHtml(a.sector)}${has ? " " + (p > 0 ? "+" : "") + Number(p).toFixed(2) + "%" : ""}</span>`;
+    }
+
+    // Direction pressure of the 9:15 candle: buying (Buy alert) or selling (Sell alert) volume vs its 10-session average.
+    function dirChipHtml(a) {
+      const p = a.fc && a.fc.pressure;
+      if (p === null || p === undefined) return "";
+      const tip = "Dir. pressure " + Number(p).toFixed(2) + "x: estimated " + a.fc.side + "ing volume of the 9:15 candle vs its 10-session average (from where the candle closed in its range)";
+      return `<span class="dp-chip${p >= 3 ? " good" : ""}" title="${escapeHtml(tip)}">Pressure ${Number(p).toFixed(1)}&times;</span>`;
+    }
+
+    // Rank among today's top F&O gainers / losers (vs previous close), e.g. "↑ #1 +4.68%".
+    function moverChipHtml(a) {
+      const m = a.fno_rank;
+      if (!m) return "";
+      const up = m.type === "gain";
+      const tip = (up ? "Top F&O gainer #" : "Top F&O loser #") + m.rank + " vs the previous close, as of " + (m.as_of || "");
+      return `<span class="mv-chip ${up ? "pos" : "neg"}" title="${escapeHtml(tip)}">${up ? "&uarr;" : "&darr;"} #${m.rank} ${m.pct > 0 ? "+" : ""}${m.pct}%</span>`;
+    }
+
+    // Futures vs spot: nearest-expiry future % and spot % vs the previous close. Green = the future is moving more than spot
+    // in the alert's own direction (by 0.1 pp or more), red = less, grey = in line. The tooltip has the prices and premium.
+    function futChipHtml(a) {
+      const f = a.fut_spot;
+      if (!f || f.fut_pct === null || f.fut_pct === undefined || f.spot_pct === null || f.spot_pct === undefined) return "";
+      const ld = f.lead_dir_pp || 0, sg = v => (v > 0 ? "+" : "") + Number(v).toFixed(2);
+      const tip = "Nearest future (" + f.expiry + ") " + Number(f.fut_ltp).toFixed(2) + ", " + sg(f.fut_pct) + "% vs prev close. Spot " +
+        Number(f.spot_ltp).toFixed(2) + ", " + sg(f.spot_pct) + "%. Future premium over spot " + sg(f.premium_pct || 0) +
+        "%. Future % minus spot % in the alert's direction: " + sg(ld) + " pp (green = futures leading, red = lagging).";
+      return `<span class="fs-chip${ld >= 0.1 ? " up" : (ld <= -0.1 ? " down" : "")}" title="${escapeHtml(tip)}">Fut ${sg(f.fut_pct)}% / Spot ${sg(f.spot_pct)}%</span>`;
+    }
+
+    // OI ceiling/floor (strikes with the most Call / Put OI, from the OI Range logger): green = price is beyond it now,
+    // dashed = it crossed earlier today and is back inside.
+    function rangeChipHtml(a) {
+      const r = a.oi_range;
+      if (!r || (!r.ceil_state && !r.floor_state)) return "";
+      const f = v => Number(v).toFixed(2);
+      let h = "";
+      if (r.ceil_state) h += `<span class="rng-chip up${r.ceil_state === 1 ? " fail" : ""}" title="${escapeHtml("OI ceiling " + f(r.ceiling) + " (strike with the most Call OI, first scan today): " + (r.ceil_state === 2 ? "price is above it now" : "price crossed it earlier today and is back inside") + " (" + f(r.ceil_over_pct) + "% beyond)")}">Breakout &#9650;${r.ceil_state === 1 ? " (back inside)" : ""}</span>`;
+      if (r.floor_state) h += `<span class="rng-chip down${r.floor_state === 1 ? " fail" : ""}" title="${escapeHtml("OI floor " + f(r.floor) + " (strike with the most Put OI, first scan today): " + (r.floor_state === 2 ? "price is below it now" : "price crossed it earlier today and is back inside") + " (" + f(r.floor_over_pct) + "% beyond)")}">Breakdown &#9660;${r.floor_state === 1 ? " (back inside)" : ""}</span>`;
+      return h;
+    }
+
+    // OI change vs the previous day at the 09:15 candle and now. Dark green = OI rising since 09:15, red = falling.
+    function oiChipHtml(a) {
+      const o = a.oi_trend;
+      if (!o) return "";
+      const f = v => (v > 0 ? "+" : "") + Number(v).toFixed(2) + "%";
+      const arrow = o.dir === "up" ? " &#9650;" : o.dir === "down" ? " &#9660;" : "";
+      const text = (o.open_pct === null || o.open_pct === undefined) ? "OI " + f(o.now_pct) : "OI " + f(o.open_pct) + " &rarr; " + f(o.now_pct);
+      const tip = "Open interest vs previous day: " + (o.open_pct === null || o.open_pct === undefined ? "09:15 value not available" : "09:15 candle " + f(o.open_pct)) + ", now " + f(o.now_pct) + (o.dir === "up" ? " (rising)" : o.dir === "down" ? " (falling)" : "");
+      return `<span class="oi-chip ${o.dir}" title="${escapeHtml(tip)}">${text}${arrow}</span>`;
+    }
+
+    function fcLineHtml(fc) {
+      if (!fc || fc.share === null || fc.share === undefined) return "";
+      const sg = (v) => (v > 0 ? "+" : "") + v.toFixed(2) + "%";
+      const cl = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "");
+      const have = (v) => v !== null && v !== undefined;
+      const shareCls = fc.share >= 95 ? " hot" : fc.share >= 70 ? " good" : fc.share < 50 ? " low" : "";
+      const tipShare = `The 9:15 candle closed at ${fc.share}% of its range in the alert's direction - an estimated ${fc.side} share of its volume (100% = closed exactly at its ${fc.side === "buy" ? "high" : "low"}). Estimated from candle structure, not true buy/sell volume.`;
+      let h = `<div class="row-fc"><span class="fc-share${shareCls}" title="${escapeHtml(tipShare)}">9:15 ${escapeHtml(fc.side)} ${fc.share.toFixed(1)}%</span>`;
+      if (have(fc.after_pct)) h += `<span class="fc-stat" title="Move from the 9:15 candle's close to the latest price (as of ${escapeHtml(fc.last_at || "")})">After 9:15 <b class="${cl(fc.after_pct)}">${sg(fc.after_pct)}</b></span>`;
+      if (have(fc.extreme_pct)) h += `<span class="fc-stat" title="${escapeHtml(fc.extreme_label)} so far today vs the previous close">${escapeHtml(fc.extreme_label)} <b class="${cl(fc.extreme_pct)}">${sg(fc.extreme_pct)}</b></span>`;
+      if (have(fc.last_pct)) h += `<span class="fc-stat" title="Latest price vs the previous close (as of ${escapeHtml(fc.last_at || "")})">Last <b class="${cl(fc.last_pct)}">${sg(fc.last_pct)}</b></span>`;
+      return h + "</div>";
+    }
+
+    function sectionHTML(category, items) {
+      const isToggleable = category === "Buy" || category === "Sell";
+      const isEnabled = category === "Buy" ? buyAlertsEnabled : (category === "Sell" ? sellAlertsEnabled : true);
+      const switchHtml = isToggleable ? `
+            <label class="side-switch">
+              <input type="checkbox" ${isEnabled ? "checked" : ""} onchange="toggleSide('${category}', this)">
+              <span class="side-slider"></span>
+            </label>
+            <span class="side-off-label" style="display:${isEnabled ? "none" : "inline"};">off</span>
+      ` : "";
+      return `
+        <div class="category-column${!isEnabled ? " side-off" : ""}" data-category="${category}">
+          <div class="section-header ${category.toLowerCase()}">
+            <h3>${category}</h3>
+            <span class="section-count">${items.length}</span>
+            ${switchHtml}
+            <div class="section-line"></div>
+          </div>
+          <div class="category-list">${items.map(rowHTML).join("")}</div>
+        </div>
+      `;
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement("div");
+      div.textContent = str;
+      return div.innerHTML;
+    }
+
+    // Called when a sector row in the sidebar is clicked - clicking the
+    // already-selected sector again resets to "All sectors". Filters both
+    // Buy and Sell columns at once since rows share the same data-sector
+    // attribute the columns already use.
+    function selectSector(sector) {
+      globalSector = (globalSector === sector) ? "" : sector;
+      document.querySelectorAll("#sectorList .sector-row").forEach(row => {
+        row.classList.toggle("selected", row.dataset.sector === globalSector);
+      });
+      applyGlobalFilter();
+    }
+
+    function applyGlobalFilter() {
+      document.querySelectorAll("#alertsContainer .list-row").forEach(row => {
+        row.style.display = (!globalSector || row.dataset.sector === globalSector) ? "" : "none";
+      });
+    }
+
+    // Toggles whether Buy-side or Sell-side alerts create a trade. The
+    // alert feed itself is never hidden by this - only trade creation.
+    async function toggleSide(category, checkbox) {
+      const enabled = checkbox.checked;
+      try {
+        const res = await fetch("/api/paper-trading/category-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ category, enabled }),
+        });
+        const result = await res.json();
+        if (category === "Buy") buyAlertsEnabled = result.enabled;
+        if (category === "Sell") sellAlertsEnabled = result.enabled;
+        const column = checkbox.closest(".category-column");
+        if (column) column.classList.toggle("side-off", !result.enabled);
+        const label = checkbox.parentElement.nextElementSibling;
+        if (label && label.classList.contains("side-off-label")) {
+          label.style.display = result.enabled ? "none" : "inline";
+        }
+      } catch (err) {
+        checkbox.checked = !enabled;
+        console.error("Toggle failed", err);
+      }
+    }
+
+    // Fetches each sector's today's % change and fills in the sidebar,
+    // polled on the same 5s cadence as alerts - the previous-close half of
+    // this is cached server-side for the whole day, so this call is just
+    // one cheap batched LTP lookup, safe to refresh this often.
+    async function refreshSectorPerf() {
+      try {
+        const res = await fetch("/api/sectors");
+        const sectors = await res.json();
+        sectors.forEach(s => {
+          const el = document.querySelector(`[data-sector-pct="${CSS.escape(s.sector)}"]`);
+          if (!el) return;
+          if (s.pct_change === null || s.pct_change === undefined) {
+            el.textContent = "-";
+            el.className = "pct na";
+          } else {
+            const sign = s.pct_change > 0 ? "+" : "";
+            el.textContent = `${sign}${s.pct_change.toFixed(2)}%`;
+            el.className = "pct " + (s.pct_change > 0 ? "pos" : s.pct_change < 0 ? "neg" : "na");
+          }
+        });
+      } catch (err) {
+        console.error("Sector refresh failed", err);
+      }
+    }
+    refreshSectorPerf();
+    setInterval(() => { if (!document.hidden) refreshSectorPerf(); }, 60000);
+
+    // Apply any filter already set as soon as the page loads.
+    applyGlobalFilter();
+
+    // Poll for new alerts every 5 seconds and re-render, without a full
+    // page reload. Only auto-refreshes while viewing today - a past day's
+    // list won't change, so there's no need to keep polling for it.
+    // Sort choice for the alert columns. "volume" = the server's order (Strong volume first);
+    // "share" = highest 9:15 buy share first (selling share for Sell alerts), alerts with no
+    // reading yet last, ties keeping the server order. Remembered in this browser.
+    const SORT_KEYS = ["share", "pressure", "oipct", "oirise", "breakout", "breakdown", "futpct", "futlead"];
+    let sortMode = "volume";
+    try { const sv = localStorage.getItem("rtt_dash_sort"); if (SORT_KEYS.indexOf(sv) >= 0) sortMode = sv; } catch (e) {}
+    function shareOf(a) { return (a && a.fc && typeof a.fc.share === "number") ? a.fc.share : null; }
+    function oiPctOf(a) { return (a && a.oi_trend && typeof a.oi_trend.now_pct === "number") ? a.oi_trend.now_pct : null; }
+    function oiRiseOf(a) {
+      const o = a && a.oi_trend;
+      return (o && typeof o.now_pct === "number" && typeof o.open_pct === "number") ? o.now_pct - o.open_pct : null;
+    }
+    function pressureOf(a) { return (a && a.fc && typeof a.fc.pressure === "number") ? a.fc.pressure : null; }
+    // Breakout / breakdown sort: beyond the level now ranks first, then crossed-and-back-inside, then no break
+    // (stocks with no logged OI range yet go last). Within a group, the bigger overshoot comes first.
+    function rangeKey(a, which) {
+      const r = a && a.oi_range;
+      if (!r) return null;
+      const st = which === "ceil" ? r.ceil_state : r.floor_state;
+      const ov = which === "ceil" ? r.ceil_over_pct : r.floor_over_pct;
+      return st * 100 + Math.min(ov || 0, 99);
+    }
+    // Futures sorts. Futures % move: strongest in the alert's own direction first (Buy: highest, Sell: most negative).
+    // Futures lead: future % minus spot % in the alert's direction. Stocks with no future / quote go last.
+    function futPctKey(a) { const f = a && a.fut_spot; return (f && typeof f.fut_pct === "number") ? f.fut_pct * (a.category === "Sell" ? -1 : 1) : null; }
+    function futLeadKey(a) { const f = a && a.fut_spot; return (f && typeof f.lead_dir_pp === "number") ? f.lead_dir_pp : null; }
+    function sortAlerts(list) {
+      if (SORT_KEYS.indexOf(sortMode) < 0) return list;
+      const keyOf = { share: shareOf, pressure: pressureOf, oipct: oiPctOf, oirise: oiRiseOf, breakout: a => rangeKey(a, "ceil"), breakdown: a => rangeKey(a, "floor"), futpct: futPctKey, futlead: futLeadKey }[sortMode];
+      return list.map((a, i) => [a, i]).sort((x, y) => {
+        const sx = keyOf(x[0]), sy = keyOf(y[0]);
+        if (sx === null && sy === null) return x[1] - y[1];
+        if (sx === null) return 1;
+        if (sy === null) return -1;
+        return (sy - sx) || (x[1] - y[1]);
+      }).map(p => p[0]);
+    }
+    function setSortMode(v) {
+      sortMode = SORT_KEYS.indexOf(v) >= 0 ? v : "volume";
+      try { localStorage.setItem("rtt_dash_sort", sortMode); } catch (e) {}
+      refreshAlerts();
+    }
+    (function initSort() {
+      const sel = document.getElementById("sortSelect");
+      if (!sel) return;
+      sel.value = sortMode;
+      if (SELECTED_DATE !== TODAY_STR) { sel.disabled = true; sel.title = "Sorting by 9:15 buy share or direction pressure works on today's alerts only."; }
+    })();
+
+    async function refreshAlerts() {
+      if (SELECTED_DATE !== TODAY_STR) return;
+      if (document.hidden) return;   // no polling from a background tab
+      try {
+        const res = await fetch("/api/alerts?date=" + encodeURIComponent(SELECTED_DATE));
+        if (!res.ok) return;         // e.g. database briefly unavailable: keep what's on screen
+        const alerts = await res.json();
+        const container = document.getElementById("alertsContainer");
+        document.getElementById("dayCount").textContent = alerts.length;
+        if (alerts.length === 0) {
+          container.innerHTML = '<div class="empty">No alerts yet for this day. Point your Chartink alert\'s webhook URL at <code>/webhook/chartink</code> and they\'ll show up here.</div>';
+          return;
+        }
+        const buckets = { Sell: [], Buy: [], Others: [] };
+        alerts.forEach(a => buckets[categorize(a)].push(a));
+        const columns = CATEGORY_ORDER
+          .filter(cat => buckets[cat].length > 0)
+          .map(cat => sectionHTML(cat, sortAlerts(buckets[cat])))
+          .join("");
+        container.innerHTML = `<div class="categories-row">${columns}</div>`;
+        applyGlobalFilter();
+      } catch (err) {
+        console.error("Refresh failed", err);
+      }
+    }
+    setInterval(refreshAlerts, 10000);
+    if (sortMode !== "volume") refreshAlerts();   // the first paint is the server's volume order; re-sort right away
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshAlerts(); });
+
+    async function manualEnterAlert(id, symbol, category) {
+      if (!confirm(`Manually enter a ${category} trade for ${symbol}? This only works if no trade is currently open.`)) {
+        return;
+      }
+      try {
+        const res = await fetch(`/api/alerts/${id}/enter`, { method: "POST" });
+        const result = await res.json();
+        if (res.ok) {
+          alert(`Trade opened for ${result.symbol} (${result.category}).`);
+          await refreshAlerts();
+        } else {
+          alert(result.message || "Failed to enter trade");
+        }
+      } catch (err) {
+        alert("Failed to enter trade - see console");
+        console.error(err);
+      }
+    }
+
+    let lastChartData = null;
+
+    async function refreshLivePrice(btn, symbol) {
+      // On-demand only - fetches exactly one symbol's price, exactly
+      // once, only when this button is clicked. No WebSocket
+      // subscription, no polling, no effect on the trading-critical
+      // connection - see /api/live-price/<symbol> on the backend.
+      const wrap = btn.parentElement.querySelector(".price-wrap");
+      const originalHtml = wrap.innerHTML;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/live-price/${encodeURIComponent(symbol)}`);
+        const data = await res.json();
+        if (res.ok && data.status === "ok") {
+          let html = `<span class="price">${inr(data.ltp)}</span>`;
+          if (data.pct_change_today !== null && data.pct_change_today !== undefined) {
+            const cls = data.pct_change_today >= 0 ? "pos" : "neg";
+            const sign = data.pct_change_today >= 0 ? "+" : "";
+            html += `<span class="pct-change ${cls}">${sign}${data.pct_change_today}%</span>`;
+          }
+          wrap.innerHTML = html;
+        } else {
+          alert(data.message || "Failed to fetch live price");
+        }
+      } catch (err) {
+        alert("Failed to fetch live price - see console");
+        console.error(err);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function openChart(symbol, direction) {
+      const overlay = document.getElementById("chartModalOverlay");
+      const title = document.getElementById("chartModalTitle");
+      const canvas = document.getElementById("chartModalCanvas");
+      const statusEl = document.getElementById("chartModalStatus");
+
+      title.textContent = `${symbol} - 5m chart`;
+      overlay.classList.add("open");
+      canvas.style.display = "none";
+      statusEl.style.display = "block";
+      statusEl.textContent = "Loading...";
+      lastChartData = null;
+
+      try {
+        const res = await fetch(`/api/chart/${encodeURIComponent(symbol)}?direction=${encodeURIComponent(direction || "Buy")}`);
+        const data = await res.json();
+        if (!res.ok || data.status !== "ok") {
+          statusEl.textContent = data.message || "Failed to load chart";
+          return;
+        }
+
+        lastChartData = data;
+        statusEl.style.display = "none";
+        canvas.style.display = "block";
+        drawCandlestickChart(canvas, data);
+      } catch (err) {
+        statusEl.textContent = "Failed to load chart - see console";
+        console.error(err);
+      }
+    }
+
+    function closeChart() {
+      document.getElementById("chartModalOverlay").classList.remove("open");
+      lastChartData = null;
+    }
+
+    // Hand-drawn candlestick chart - no external charting plugin. This
+    // is deliberate: the natural choice (chartjs-chart-financial) turns
+    // out to only ship an ESM build with no ready-to-use browser
+    // <script> version, which would mean guessing at a CDN setup we
+    // can't easily verify works. Drawing directly on canvas also makes
+    // the two custom asks (inside-bar highlighting, PDH/PDL lines)
+    // straightforward - just more pixels, not fighting a plugin's API.
+    function drawCandlestickChart(canvas, data) {
+      const dpr = window.devicePixelRatio || 1;
+      const cssWidth = canvas.parentElement.clientWidth;
+      const cssHeight = 400;
+      canvas.style.width = cssWidth + "px";
+      canvas.style.height = cssHeight + "px";
+      canvas.width = cssWidth * dpr;
+      canvas.height = cssHeight * dpr;
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+      const ohlc = data.ohlc || [];
+      const labels = data.labels || [];
+      const n = ohlc.length;
+      if (n === 0) return;
+
+      const leftPad = 55, rightPad = 15, topPad = 15, bottomPad = 30;
+      const plotW = cssWidth - leftPad - rightPad;
+      const plotH = cssHeight - topPad - bottomPad;
+
+      // Price range - includes candle highs/lows, the EMA line, and
+      // PDH/PDL and 1st 5-Min FIB T1-T4 if present, so nothing gets
+      // drawn outside the visible area.
+      let minP = Math.min(...ohlc.map(c => c.l));
+      let maxP = Math.max(...ohlc.map(c => c.h));
+      (data.ema || []).forEach(v => { if (v !== null && v !== undefined) { minP = Math.min(minP, v); maxP = Math.max(maxP, v); } });
+      if (data.prev_day_high) maxP = Math.max(maxP, data.prev_day_high);
+      if (data.prev_day_low) minP = Math.min(minP, data.prev_day_low);
+      [data.fib_t1, data.fib_t2, data.fib_t3, data.fib_t4, data.fib_t5, data.fib_t6, data.fib_t7, data.fib_t8].forEach(v => {
+        if (v !== null && v !== undefined) { minP = Math.min(minP, v); maxP = Math.max(maxP, v); }
+      });
+      const pad = (maxP - minP) * 0.08 || 1;
+      minP -= pad;
+      maxP += pad;
+
+      // Spacing: the old layout stretched however many candles existed across the
+      // whole plot width, so early in the day (4-5 candles) each one sat in a
+      // ~150px slot with a 14px body - far apart. Now each candle gets at most
+      // MAX_SLOT px, with the candle and the gap about the same size, and the
+      // series starts at the left like a live chart. Once a full day of candles
+      // no longer fits at that spacing, it shrinks to fit exactly as before.
+      const MAX_SLOT = 26;
+      const slot = Math.min(plotW / n, MAX_SLOT);
+      const xForIndex = (i) => leftPad + slot * (i + 0.5);
+      const yForPrice = (p) => topPad + plotH * (1 - (p - minP) / (maxP - minP));
+      const candleW = Math.max(2, Math.min(14, slot * (slot >= MAX_SLOT ? 0.5 : 0.6)));
+
+      // Y-axis gridlines + labels
+      ctx.strokeStyle = "#1e222d";
+      ctx.fillStyle = "#6b7280";
+      ctx.font = "11px Arial";
+      ctx.textAlign = "right";
+      ctx.textBaseline = "middle";
+      const gridLines = 6;
+      for (let g = 0; g <= gridLines; g++) {
+        const price = minP + ((maxP - minP) * g) / gridLines;
+        const y = yForPrice(price);
+        ctx.beginPath();
+        ctx.moveTo(leftPad, y);
+        ctx.lineTo(cssWidth - rightPad, y);
+        ctx.stroke();
+        ctx.fillText(inr(price.toFixed(2)), leftPad - 8, y);
+      }
+
+      // PDH / PDL reference lines
+      function drawRefLine(price, color, label) {
+        if (price === null || price === undefined) return;
+        const y = yForPrice(price);
+        ctx.save();
+        ctx.strokeStyle = color;
+        ctx.setLineDash([6, 4]);
+        ctx.beginPath();
+        ctx.moveTo(leftPad, y);
+        ctx.lineTo(cssWidth - rightPad, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = color;
+        ctx.textAlign = "left";
+        ctx.font = "10px Arial";
+        ctx.fillText(`${label} ${inr(price.toFixed(2))}`, leftPad + 4, y - 6);
+        ctx.restore();
+      }
+      drawRefLine(data.prev_day_high, "#ffb800", "PDH");
+      drawRefLine(data.prev_day_low, "#c792ea", "PDL");
+      // 1st 5-Min FIB levels (strategy #13) - an escalating cyan-to-violet
+      // ladder, deliberately a distinct color family from PDH/PDL's
+      // amber/purple AND from "#0d47a1" (already used for inside-bar
+      // candles below) so all reference lines stay easy to tell apart.
+      drawRefLine(data.fib_t1, "#00e5ff", "T1");
+      drawRefLine(data.fib_t2, "#00b8d4", "T2");
+      drawRefLine(data.fib_t3, "#2979ff", "T3");
+      drawRefLine(data.fib_t4, "#7c4dff", "T4");
+      drawRefLine(data.fib_t5, "#aa00ff", "T5");
+      drawRefLine(data.fib_t6, "#d500f9", "T6");
+      drawRefLine(data.fib_t7, "#ff4081", "T7");
+      drawRefLine(data.fib_t8, "#ff1744", "T8");
+
+      // Candles - inside bars override to dark blue regardless of
+      // bullish/bearish, since that's the pattern being highlighted.
+      for (let i = 0; i < n; i++) {
+        const c = ohlc[i];
+        const x = xForIndex(i);
+        const isInside = data.is_inside_bar && data.is_inside_bar[i];
+        const bullish = c.c >= c.o;
+        const color = isInside ? "#0d47a1" : (bullish ? "#00c896" : "#ff5370");
+
+        // Wick
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(x, yForPrice(c.h));
+        ctx.lineTo(x, yForPrice(c.l));
+        ctx.stroke();
+
+        // Body
+        const bodyTop = yForPrice(Math.max(c.o, c.c));
+        const bodyBottom = yForPrice(Math.min(c.o, c.c));
+        const bodyH = Math.max(1, bodyBottom - bodyTop);
+        ctx.fillStyle = color;
+        ctx.fillRect(x - candleW / 2, bodyTop, candleW, bodyH);
+      }
+
+      // EMA overlay line
+      const ema = data.ema || [];
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      let started = false;
+      for (let i = 0; i < ema.length; i++) {
+        if (ema[i] === null || ema[i] === undefined) continue;
+        const x = xForIndex(i);
+        const y = yForPrice(ema[i]);
+        if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+      }
+      ctx.stroke();
+
+      // X-axis time labels (sparse, to avoid overlap)
+      ctx.fillStyle = "#6b7280";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "top";
+      ctx.font = "10px Arial";
+      const step = Math.max(1, Math.ceil(60 / slot));   // keep time labels at least ~60px apart
+      for (let i = 0; i < n; i += step) {
+        ctx.fillText(labels[i] || "", xForIndex(i), cssHeight - bottomPad + 8);
+      }
+
+      // Legend
+      ctx.textAlign = "left";
+      ctx.font = "11px Arial";
+      let legendX = leftPad;
+      const legendY = 8;
+      const legendItems = [
+        { color: "#00c896", label: "Bullish" },
+        { color: "#ff5370", label: "Bearish" },
+        { color: "#0d47a1", label: "Inside bar" },
+        { color: "#ffffff", label: data.ema_label || "EMA5" },
+      ];
+      legendItems.forEach(item => {
+        ctx.fillStyle = item.color;
+        ctx.fillRect(legendX, legendY, 10, 10);
+        ctx.fillStyle = "#e6e9f0";
+        ctx.fillText(item.label, legendX + 14, legendY + 1);
+        legendX += ctx.measureText(item.label).width + 34;
+      });
+    }
+
+    window.addEventListener("resize", () => {
+      const canvas = document.getElementById("chartModalCanvas");
+      if (lastChartData && canvas.style.display !== "none") {
+        drawCandlestickChart(canvas, lastChartData);
+      }
+    });
+  </script>
+</body>
+</html>

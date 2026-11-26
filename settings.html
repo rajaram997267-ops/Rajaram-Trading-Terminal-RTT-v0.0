@@ -1,0 +1,1289 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - Settings</title>
+  <style>
+    :root {
+      --bg: #0b0e14;
+      --panel: #131722;
+      --border: #1e222d;
+      --text: #e6e9f0;
+      --muted: #6b7280;
+      --green: #00c896;
+      --gold: #ffb800;
+      --red: #ff5370;
+    }
+    :root[data-theme="light-gray"] {
+      --bg: #e9ebee;
+      --panel: #ffffff;
+      --border: #d0d4da;
+      --text: #1a1d23;
+      --muted: #6b7280;
+      --green: #0e9f6e;
+      --gold: #b45309;
+      --red: #dc2626;
+    }
+    :root[data-theme="sky-blue"] {
+      --bg: #eaf4fb;
+      --panel: #ffffff;
+      --border: #bfe0f2;
+      --text: #10222c;
+      --muted: #4a6572;
+      --green: #0e9f6e;
+      --gold: #b45309;
+      --red: #dc2626;
+    }
+    :root[data-theme="off-white"] {
+      --bg: #f7f5f0;
+      --panel: #ffffff;
+      --border: #e2ddd2;
+      --text: #1f1c16;
+      --muted: #6b6455;
+      --green: #0e9f6e;
+      --gold: #b45309;
+      --red: #dc2626;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      padding: 24px;
+    }
+    a { color: var(--green); text-decoration: none; }
+    h2 { margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 13px; }
+    .tabbar {
+      display: flex;
+      gap: 4px;
+      margin: 20px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .tabbar a {
+      padding: 10px 18px;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+    }
+    .tabbar a.active { color: var(--text); border-bottom-color: var(--green); }
+    .tabbar a:hover { color: var(--text); }
+    .sw { position:relative; display:inline-block; width:46px; height:24px; vertical-align:middle; }
+    .sw input { opacity:0; width:0; height:0; }
+    .sw .slider { position:absolute; inset:0; background:var(--border); border-radius:24px; cursor:pointer; transition:.2s; }
+    .sw .slider:before { content:""; position:absolute; height:18px; width:18px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; }
+    .sw input:checked + .slider { background:var(--green); }
+    .sw input:checked + .slider:before { transform:translateX(22px); }
+    .settings-box {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .settings-box input[type=text] {
+      flex: 1;
+      min-width: 240px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-family: monospace;
+    }
+    button {
+      background: var(--green);
+      color: #06110d;
+      border: none;
+      padding: 9px 16px;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    button.secondary {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    button:hover { opacity: 0.9; }
+    select {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .token-status { font-size: 12px; color: var(--muted); }
+    /* Entry rule (recipe) card */
+    .er-card { flex-direction: column; align-items: stretch; gap: 14px; }
+    .er-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .er-title { font-weight: 700; font-size: 15px; }
+    .er-pill { font-size: 11px; font-weight: 700; letter-spacing: .06em; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+    .er-pill.on { color: #fff; background: var(--red); border-color: var(--red); }
+    .er-pill.live { color: #06110d; background: #f5c542; border-color: #f5c542; }
+    .er-sub { font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .er-section { font-size: 11px; font-weight: 700; letter-spacing: .08em; color: var(--muted); text-transform: uppercase; margin-top: 2px; }
+    .er-grid { display: grid; grid-template-columns: 44px minmax(210px, 1.3fr) 28px 130px minmax(160px, 2fr); align-items: center; column-gap: 12px; row-gap: 0; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .er-grid > div { padding: 11px 0; border-bottom: 1px solid var(--border); }
+    .er-grid > div:nth-last-child(-n+5) { border-bottom: none; }
+    .er-row-off { opacity: .45; }
+    .er-name { font-weight: 600; font-size: 13px; }
+    .er-hint { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .er-op { text-align: center; color: var(--muted); font-weight: 700; }
+    .er-grid select { width: 100%; }
+    .er-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+    .er-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; cursor: pointer; user-select: none; }
+    .er-chip.sel { border-color: var(--green); color: var(--green); background: rgba(0,200,150,.08); }
+    .er-chip input { display: none; }
+    .er-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .er-saved { font-size: 12px; color: var(--green); min-height: 16px; }
+    .er-log { font-size: 12px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .er-log div { padding: 7px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 10px; }
+    .er-log div:last-child { border-bottom: none; }
+    .er-badge { min-width: 62px; font-weight: 700; }
+    .token-status.saved { color: var(--green); }
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 40px;
+      height: 22px;
+      flex: none;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: var(--border);
+      transition: .2s;
+      border-radius: 22px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 16px; width: 16px;
+      left: 3px; bottom: 3px;
+      background-color: var(--text);
+      transition: .2s;
+      border-radius: 50%;
+    }
+    input:checked + .slider { background-color: var(--red); }
+    input:checked + .slider:before { transform: translateX(18px); }
+  </style>
+</head>
+<body>
+  <div>
+    <h2>Settings <span style="color: var(--muted); font-weight: 400; font-size: 14px;">RTT v0.0</span></h2>
+    <div class="sub">Token, capital, live trading, exit strategy, and sector filter all live here</div>
+  </div>
+
+  <div class="tabbar">
+    <a href="/" class="{% if active_tab == 'dashboard' %}active{% endif %}">Dashboard</a>
+    <a href="/paper-trading" class="{% if active_tab == 'paper' %}active{% endif %}">Paper Trading</a>
+    <a href="/live-trading" class="{% if active_tab == 'live' %}active{% endif %}">Live Trading</a>
+    <a href="/stats" class="{% if active_tab == 'stats' %}active{% endif %}">Stats</a>
+    <a href="/websocket-stats" class="{% if active_tab == 'websocket_stats' %}active{% endif %}">WS Speed</a>
+    <a href="/settings" class="{% if active_tab == 'settings' %}active{% endif %}">Settings</a>
+    <a href="/shadow" class="{% if active_tab == 'shadow' %}active{% endif %}">Manual vs RSI</a>
+    <a href="/exit-lab" class="{% if active_tab == 'exit_lab' %}active{% endif %}">Exit Lab</a>
+    <a href="/first-candle" class="{% if active_tab == 'first_candle' %}active{% endif %}">First Candle</a>
+    <a href="/exit-compare" class="{% if active_tab == 'exit_compare' %}active{% endif %}">Exit Compare</a>
+    <a href="/market-eye" class="{% if active_tab == 'market_eye' %}active{% endif %}">Market EYE &#128065;&#65039;</a>
+    <a href="/preopen-context" class="{% if active_tab == 'preopen_context' %}active{% endif %}">Pre-Open Context</a>
+    <a href="/oi-range" class="{% if active_tab == 'oi_range' %}active{% endif %}">OI Range</a>
+    <a href="/fut-spot" class="{% if active_tab == 'fut_spot' %}active{% endif %}">Futures vs Spot</a>
+  </div>
+
+  <div class="settings-box">
+    <span>Theme:</span>
+    <select id="themeSelect" onchange="saveTheme()">
+      <option value="dark">Dark (current)</option>
+      <option value="light-gray">Light gray</option>
+      <option value="sky-blue">Light sky blue</option>
+      <option value="off-white">Off-white</option>
+    </select>
+    <span class="token-status" id="themeStatus">Applies instantly, on this device, across all pages</span>
+  </div>
+
+  <div class="settings-box">
+    <span>Upstox access token:</span>
+    <input type="password" id="tokenInput" placeholder="Paste today's Upstox access token here">
+    <button class="secondary" onclick="saveToken()">Save token</button>
+    <span class="token-status {% if token_saved %}saved{% endif %}" id="tokenStatus">
+      {% if token_saved %}Token saved for today{% else %}No token saved yet{% endif %}
+    </span>
+  </div>
+
+  <div class="settings-box">
+    <span>Starting capital (Rs):</span>
+    <input type="text" id="capitalInput" style="max-width: 160px; flex: none;" value="{{ capital|int }}">
+    <button class="secondary" onclick="saveCapital()">Save amount</button>
+    <span class="token-status" id="capitalStatus">The seed for the account. Changing it re-bases the whole history (every "Balance after" shifts) - to just add money, use "Add / remove paper funds" below.</span>
+    <button style="background: var(--red); margin-left: auto;" onclick="resetPaperTrading()">Reset paper trading</button>
+  </div>
+
+  <div class="settings-box">
+    <span>Add / remove paper funds (Rs):</span>
+    <input type="text" id="fundsAmount" placeholder="e.g. 50000" style="max-width: 130px; flex: none; text-align: right;">
+    <input type="text" id="fundsNote" placeholder="note (optional)" style="max-width: 200px; flex: none;">
+    <button class="secondary" onclick="addFunds()">Add funds</button>
+    <span class="token-status" id="fundsStatus">Paper balance now: Rs {{ current_capital|inr }}. Adds to the balance only - no trade, P&amp;L, win rate or Stats number changes, and history stays exactly as it is. Use a negative amount to remove funds.</span>
+    {% if capital_adjustments %}
+    <div id="fundsLog" style="flex-basis: 100%; font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.6;">
+      <div style="font-weight: 600; color: var(--text);">Funds history (total {{ adjustments_total|inr(2, true) }})</div>
+      {% for a in capital_adjustments %}
+      <div>{{ a.when_ist }} IST &middot; <span style="color: {% if a.amount > 0 %}var(--green){% else %}var(--red){% endif %};">{{ a.amount|inr(2, true) }}</span>{% if a.note %} &middot; {{ a.note }}{% endif %}</div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+
+  <div class="settings-box" style="border-color: {% if live_trading_enabled %}var(--red){% else %}var(--border){% endif %};">
+    <label class="switch">
+      <input type="checkbox" id="liveToggle" {% if live_trading_enabled %}checked{% endif %} onchange="toggleLiveTrading()">
+      <span class="slider"></span>
+    </label>
+    <span>Live trading (real Upstox orders)</span>
+    <span class="token-status" id="liveStatus" style="{% if live_trading_enabled %}color: var(--red);{% endif %}">
+      {% if live_trading_enabled %}ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. {% if live_entry_mode == "GTT" %}Entry + a trailing stop are combined into one GTT order at entry (GTT mode - see below).{% else %}A real -2% SL (Stop-Loss Limit) order is placed with Upstox at entry, so it protects the position even if this app is down.{% endif %}{% else %}OFF - paper trading only{% endif %}
+    </span>
+  </div>
+
+  <div class="settings-box">
+    <span>Live funds to use per trade (%):</span>
+    <input type="text" id="liveFundsUseInput" value="{{ '%g' % live_funds_use_pct }}" style="max-width: 80px; text-align: center;" onchange="saveLiveFundsUse()">
+    <span class="token-status" id="liveFundsUseStatus">
+      Live lots are sized off {{ '%g' % live_funds_use_pct }}% of your available Upstox funds (1-100). Lower it to leave a buffer so a market fill above the quoted premium isn't rejected. Applies to the next live trade.
+    </span>
+  </div>
+
+  <div class="settings-box">
+    <span>Live entry mode:</span>
+    <select id="liveEntryModeSelect" onchange="saveLiveEntryMode()">
+      <option value="SL" {% if live_entry_mode == "SL" %}selected{% endif %}>SL - direct entry + separate Stop-Loss Limit order (default, battle-tested)</option>
+      <option value="GTT" {% if live_entry_mode == "GTT" %}selected{% endif %}>GTT - entry + broker-side trailing stop combined into one order (newer, verify carefully)</option>
+    </select>
+    <span class="token-status" id="liveEntryModeStatus">
+      {% if live_entry_mode == "GTT" %}GTT mode - Upstox's own engine trails the stop server-side using the gap below. Recommended: verify your first GTT trade's fill and stop behavior directly in your Upstox order book before relying on it.{% else %}SL mode - this app polls and manages the exit itself every 5s, with the broker-side SL order as a downside floor.{% endif %}
+    </span>
+  </div>
+
+  <div class="settings-box">
+    <span>GTT trailing gap (used only in GTT mode):</span>
+    <select id="gttGapModeSelect" onchange="saveGttTrailingSettings()">
+      <option value="percent" {% if gtt_trailing_gap_mode == "percent" %}selected{% endif %}>Percent of entry price</option>
+      <option value="points" {% if gtt_trailing_gap_mode == "points" %}selected{% endif %}>Fixed points</option>
+    </select>
+    <input type="text" id="gttGapValueInput" value="{{ gtt_trailing_gap_value }}" style="max-width: 80px; text-align: center;" onchange="saveGttTrailingSettings()">
+    <span class="token-status" id="gttTrailingStatus">
+      Current: {{ gtt_trailing_gap_value }}{% if gtt_trailing_gap_mode == "percent" %}% of entry price{% else %} points{% endif %}, computed fresh at entry time
+    </span>
+  </div>
+
+  <div class="settings-box">
+    <span>Exit strategy for new trades:</span>
+    <select id="strategySelect" onchange="setStrategy(this.value)">
+      {% if exit_strategy.startswith("LAB:") %}<option value="{{ exit_strategy }}" selected>Lab rule: {{ lab_label or exit_strategy }}</option>{% endif %}
+      <option value="AUTO_VOL" {% if exit_strategy == "AUTO_VOL" %}selected{% endif %}>Auto (volume-driven: picks the exit rule per trade)</option>
+      <option value="HALF_HALF_HARD4" {% if exit_strategy == "HALF_HALF_HARD4" %}selected{% endif %}>2) -2% SL, 2% half book, 4% full exit</option>
+      <option value="TRAIL_FROM_2" {% if exit_strategy == "TRAIL_FROM_2" %}selected{% endif %}>3) -2% SL, trail 100% qty from 2% (0.2% steps)</option>
+      <option value="FULL_AT_2" {% if exit_strategy == "FULL_AT_2" %}selected{% endif %}>4) -2% SL, full exit at 2%</option>
+      <option value="FULL_AT_4" {% if exit_strategy == "FULL_AT_4" %}selected{% endif %}>5) -2% SL, full exit at 4%</option>
+      <option value="ATR_TRAIL" {% if exit_strategy == "ATR_TRAIL" %}selected{% endif %}>6) ATR stop until +2%, then trail 0.5% steps</option>
+      <option value="EMA_SPOT_TRAIL" {% if exit_strategy == "EMA_SPOT_TRAIL" %}selected{% endif %}>7) 5-EMA (spot) trail, -2% floor</option>
+      <option value="EMA_SPOT_PURE" {% if exit_strategy == "EMA_SPOT_PURE" %}selected{% endif %}>8) Pure 5-EMA (spot) trail, no floor</option>
+      <option value="JOAT_HYBRID" {% if exit_strategy == "JOAT_HYBRID" %}selected{% endif %}>9) JOAT Hybrid: spot ATR -&gt; book 50% -&gt; spot 5-EMA trail</option>
+      <option value="JOAT_TEST_B" {% if exit_strategy == "JOAT_TEST_B" %}selected{% endif %}>Test-B: spot ATR (shared) -&gt; spot 5-EMA trail</option>
+      <option value="JOAT_TEST_C" {% if exit_strategy == "JOAT_TEST_C" %}selected{% endif %}>Test-C: spot ATR (own period) -&gt; spot 5-EMA trail</option>
+      <option value="RSI_MOMENTUM" {% if exit_strategy == "RSI_MOMENTUM" %}selected{% endif %}>10) RSI Momentum Exit (spot RSI + EMA9)</option>
+      <option value="CAMARILLA_LADDER" {% if exit_strategy == "CAMARILLA_LADDER" %}selected{% endif %}>11) Camarilla Ladder Exit (RSI pre-T1, ratchet stop post-T1)</option>
+      <option value="RSI_SIMPLE" {% if exit_strategy == "RSI_SIMPLE" %}selected{% endif %}>12) RSI Simple Exit (bare 2-candle rule, no extras)</option>
+      <option value="FIRST5MIN_FIB" {% if exit_strategy == "FIRST5MIN_FIB" %}selected{% endif %}>13) 1st 5 Min FIB levels strategy</option>
+      <option value="SUPERTREND" {% if exit_strategy == "SUPERTREND" %}selected{% endif %}>14) SuperTrend exit (5-min spot, flips against the trade)</option>
+    </select>
+    <span class="token-status" id="strategyStatus">{{ strategy_descriptions.get(exit_strategy, "") }}</span>
+    <div style="margin-top:10px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+      <label class="sw"><input type="checkbox" id="autoSwitchS" {% if exit_strategy == "AUTO_VOL" %}checked{% endif %} onchange="autoToggle(this)"><span class="slider"></span></label>
+      <b>Auto exit picker (volume-driven): <span id="autoStateS">{{ "ON" if exit_strategy == "AUTO_VOL" else "OFF" }}</span></b>
+      <span class="token-status">Switch ON to let the Exit Lab choose each new trade's exit rule (paper-only until allowed for live). OFF returns new trades to your previous strategy. <a href="/exit-lab">See the picks and details</a></span>
+      <span id="autoMsgS" style="font-weight:600"></span>
+    </div>
+  </div>
+
+  <div class="settings-box">
+    <span>SuperTrend exit settings (#14):</span>
+    <span>Length:</span>
+    <input type="text" id="stLengthInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ supertrend_length }}">
+    <span>Factor:</span>
+    <input type="text" id="stFactorInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ '%g' % supertrend_factor }}">
+    <button class="secondary" onclick="saveSupertrendSettings()">Save</button>
+    <span class="token-status" id="stSettingsStatus">Used only by "14) SuperTrend exit". Applies immediately, including to open trades using it.</span>
+  </div>
+
+  <div class="settings-box">
+    <span>ATR trailing stop settings:</span>
+    <span>Period:</span>
+    <input type="text" id="atrPeriodInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_period }}">
+    <span>Multiplier:</span>
+    <input type="text" id="atrMultiplierInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_multiplier }}">
+    <button class="secondary" onclick="saveAtrSettings()">Save</button>
+    <span class="token-status" id="atrSettingsStatus">Used by "6) ATR trailing stop", "9) JOAT Hybrid", and "Test-B" above. Changes apply immediately to any open trade using them too, not just new ones.</span>
+  </div>
+
+  <div class="settings-box">
+    <span>ATR settings for Test-C only:</span>
+    <span>Period:</span>
+    <input type="text" id="atrPeriodCInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_period_c }}">
+    <span>Multiplier:</span>
+    <input type="text" id="atrMultiplierCInput" style="max-width: 60px; flex: none; text-align: center;" value="{{ atr_multiplier_c }}">
+    <button class="secondary" onclick="saveAtrSettingsC()">Save</button>
+    <span class="token-status" id="atrSettingsCStatus">Kept separate from the shared ATR settings above specifically so Test-C's results stay distinct from Test-B's in the Stats breakdown.</span>
+  </div>
+
+  <div class="settings-box" style="flex-wrap: wrap; row-gap: 10px;">
+    <span style="flex-basis: 100%; font-weight: 600;">RSI Momentum Exit (10) settings - every value below is editable so different combinations can be tested against each other:</span>
+
+    <span>RSI period:</span>
+    <input type="text" id="rsiPeriodInput" style="max-width: 50px; flex: none; text-align: center;" value="{{ rsi_period }}">
+    <span>EMA (structure) period:</span>
+    <input type="text" id="rsiEmaPeriodInput" style="max-width: 50px; flex: none; text-align: center;" value="{{ rsi_ema_period }}">
+    <span>Confirm candles:</span>
+    <input type="text" id="rsiConfirmCandlesInput" style="max-width: 50px; flex: none; text-align: center;" value="{{ rsi_confirm_candles }}">
+
+    <div style="flex-basis: 100%; height: 0;"></div>
+    <span>CALL warning (RSI &lt;):</span>
+    <input type="text" id="rsiCallThresholdInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_call_threshold }}">
+    <span>PUT strong (RSI &le;):</span>
+    <input type="text" id="rsiPutStrongInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_put_strong_threshold }}">
+    <span>PUT warning (RSI &gt;):</span>
+    <input type="text" id="rsiPutWarningInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_put_warning_threshold }}">
+
+    <div style="flex-basis: 100%; height: 0;"></div>
+    <span>Deep ITM moneyness (%):</span>
+    <input type="text" id="rsiDeepItmMoneynessInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_deep_itm_moneyness_pct }}">
+    <span>Deep ITM CALL threshold:</span>
+    <input type="text" id="rsiDeepItmCallInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_deep_itm_call_threshold }}">
+    <span>Deep ITM PUT threshold:</span>
+    <input type="text" id="rsiDeepItmPutInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_deep_itm_put_warning_threshold }}">
+
+    <div style="flex-basis: 100%; height: 0;"></div>
+    <span>Mid-day window (IST):</span>
+    <input type="text" id="rsiMiddayStartInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_midday_start }}">
+    <span>to</span>
+    <input type="text" id="rsiMiddayEndInput" style="max-width: 55px; flex: none; text-align: center;" value="{{ rsi_midday_end }}">
+    <span>Mid-day confirm candles:</span>
+    <input type="text" id="rsiMiddayConfirmCandlesInput" style="max-width: 50px; flex: none; text-align: center;" value="{{ rsi_midday_confirm_candles }}">
+
+    <div style="flex-basis: 100%; height: 0;"></div>
+    <button class="secondary" onclick="saveRsiSettings()">Save RSI Momentum settings</button>
+    <span class="token-status" id="rsiSettingsStatus">Used by "10) RSI Momentum Exit" above, off the UNDERLYING's candles. Changes apply immediately to any open trade already using it, not just new ones.</span>
+  </div>
+
+  <div class="settings-box">
+    <span>Earliest entry time (IST):</span>
+    <input type="text" id="entryTimeFilterInput" placeholder="e.g. 09:45" style="max-width: 100px; flex: none; text-align: center;" value="{{ entry_time_filter }}">
+    <button class="secondary" onclick="saveEntryTimeFilter()">Save</button>
+    <button class="secondary" onclick="clearEntryTimeFilter()">Clear</button>
+    <span class="token-status" id="entryTimeFilterStatus">{% if entry_time_filter %}ON - no new trades open before {{ entry_time_filter }} IST{% else %}OFF - trades can open any time the market's open{% endif %}</span>
+  </div>
+
+  <div class="settings-box">
+    <span>Stop new entries from (IST):</span>
+    <input type="text" id="entryCutoffInput" placeholder="e.g. 15:00" style="max-width: 100px; flex: none; text-align: center;" value="{{ entry_cutoff_time }}">
+    <button class="secondary" onclick="saveEntryCutoff()">Save</button>
+    <button class="secondary" onclick="clearEntryCutoff()">Clear</button>
+    <span class="token-status" id="entryCutoffStatus">{% if entry_cutoff_time %}ON - no new trades open from {{ entry_cutoff_time }} IST onward{% else %}OFF - new trades can open until the market closes{% endif %}</span>
+  </div>
+
+  <div class="settings-box">
+    <span>Auto-exit open trades at (IST):</span>
+    <input type="text" id="autoExitInput" placeholder="e.g. 15:25" style="max-width: 100px; flex: none; text-align: center;" value="{{ auto_exit_time }}">
+    <button class="secondary" onclick="saveAutoExit()">Save</button>
+    <button class="secondary" onclick="clearAutoExit()">Clear</button>
+    <span class="token-status" id="autoExitStatus">{% if auto_exit_time %}ON - anything still open at {{ auto_exit_time }} IST is closed automatically, paper and live{% else %}OFF - nothing closes open trades at the end of the day except their own exit strategy{% endif %}</span>
+    <span class="token-status">Since 3 Aug 2026 the underlying stock stops trading at 15:15 (closing auction) while options trade until 15:40, so RSI/EMA exits can't see anything new after 15:15. Live orders are carry-forward, so the broker won't close them for you. A time like 15:25 closes everything before the options market shuts. Live trades are closed with a real market SELL.</span>
+  </div>
+
+  <div class="settings-box">
+    <label class="switch">
+      <input type="checkbox" id="volumeEntryToggle" {% if volume_entry_enabled %}checked{% endif %} onchange="toggleVolumeRule('entry')">
+      <span class="slider"></span>
+    </label>
+    <span>Volume entry rule: only enter when volume is Strong</span>
+    <span class="token-status" id="volumeEntryStatus">{% if volume_entry_enabled %}ON - each alert is judged the moment it arrives: Strong volume opens the trade, anything else is skipped{% else %}OFF - every alert that passes the other filters opens a trade, as before{% endif %}</span>
+  </div>
+
+  <div class="settings-box">
+    <label class="switch">
+      <input type="checkbox" id="volumeExitToggle" {% if volume_exit_enabled %}checked{% endif %} onchange="toggleVolumeRule('exit')">
+      <span class="slider"></span>
+    </label>
+    <span>Volume exit rule: exit when volume turns Weak</span>
+    <span class="token-status" id="volumeExitStatus">{% if volume_exit_enabled %}ON - an open trade (paper and live) is closed the first time its volume reads Weak after entry, in addition to its strategy's own exits{% else %}OFF - open trades are closed only by their strategy's own exit rules{% endif %}</span>
+    <span class="token-status">"Strong" and "Weak" are the badge labels on the dashboard (directional volume vs the usual level for that time of day). The exit rule is added on top of the selected strategy, so any stop that strategy has keeps working; with RSI Momentum there is no broker-side stop, and a live position is still only closed by this app. Both switches only affect trades opened or checked from now on.</span>
+  </div>
+
+  <div class="settings-box" style="flex-direction: column; align-items: stretch;">
+    <span style="font-weight: 600;">Recent volume-entry decisions <button class="secondary" onclick="loadVolumeLog()" style="margin-left: 8px;">Refresh</button></span>
+    <div id="volumeLog" class="token-status">Loading...</div>
+    <span class="token-status">Kept in memory only - clears when the app restarts.</span>
+  </div>
+
+  <div class="settings-box">
+    <label class="switch">
+      <input type="checkbox" id="sectorFilterToggle" {% if sector_filter_enabled %}checked{% endif %} onchange="toggleSectorFilter()">
+      <span class="slider"></span>
+    </label>
+    <span>Sector momentum filter</span>
+    <span>Top</span>
+    <input type="text" id="sectorFilterTopN" value="{{ sector_filter_top_n }}" style="width: 40px; text-align: center;" onchange="toggleSectorFilter()">
+    <span class="token-status" id="sectorFilterStatus">
+      {% if sector_filter_enabled %}ON - Buy needs a top-{{ sector_filter_top_n }} sector, Sell needs a bottom-{{ sector_filter_top_n }} sector; everything else is skipped{% else %}OFF - every alert can open a trade, regardless of its sector's performance{% endif %}
+    </span>
+  </div>
+
+  <div class="settings-box er-card" id="erCard">
+    <div class="er-head">
+      <label class="switch"><input type="checkbox" id="erEnabled" onchange="saveEntryRule()"><span class="slider"></span></label>
+      <span class="er-title">Entry rule &mdash; recipe</span>
+      <span class="er-pill" id="erPill">OFF</span>
+      <span class="er-pill live" id="erLive" style="display:none;">LIVE TRADING ON</span>
+    </div>
+    <div class="er-sub">One combined gate that every new trade must pass, <b>paper and live alike</b>. Switch on only the conditions you want; all switched-on conditions must be true (AND). Alerts that fail are skipped and the reason is recorded. Everything here is OFF until you turn it on.</div>
+
+    <div class="er-section">Alert type</div>
+    <div class="er-chips" id="erAlerts"><span class="er-sub">Loading...</span></div>
+    <div class="er-sub">Tick the alerts allowed to open a trade. None ticked = any alert.</div>
+
+    <div class="er-section">Conditions known at entry</div>
+    <div class="er-grid" id="erGrid"></div>
+
+    <div class="er-section">When a reading is not available yet</div>
+    <div class="er-foot">
+      <select id="erMissing" onchange="saveEntryRule()" style="min-width:260px;">
+        <option value="skip">Skip the trade (recommended)</option>
+        <option value="allow">Allow the trade</option>
+      </select>
+      <span class="er-sub">Example: 9:15 readings appear about 9:20, the 9:25 sector value after 9:26.</span>
+    </div>
+    <div class="er-sub">Whole-day volume and the sector's full-day move are only known after the close, so they cannot be entry conditions. Their live counterparts are the existing <i>Volume entry rule</i> and <i>Sector momentum filter</i> above.</div>
+    <div class="er-foot"><span class="er-saved" id="erSaved"></span><button class="secondary" onclick="loadEntryRule()">Refresh</button></div>
+
+    <div class="er-section">Recent entry-rule decisions</div>
+    <div class="er-log" id="erLog"><div class="er-sub">Nothing judged since the app last (re)started. This list is kept in memory only; every trade also stores its own entry-rule result, shown under its symbol on the Paper and Live pages.</div></div>
+  </div>
+
+  <div class="settings-box" style="flex-direction: column; align-items: stretch; gap: 10px;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvGate" {% if fcv.gate_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span style="font-weight:600;">First-candle (9:15) volume entry gate</span>
+      <span class="token-status" id="fcvGateStatus">...</span>
+    </div>
+    <div class="token-status">The 9:15 candle's volume compared with its own average over the previous 10 sessions (the ratio on the First Candle page). When the gate is on, an alert only opens a trade if its stock's ratio falls in a band ticked below. Not every day has 3x or 5x stocks, so tick whichever bands you want to trade.</div>
+    <div style="display:flex; gap:16px; flex-wrap:wrap; align-items:center;">
+      <span>Allowed bands:</span>
+      {% for name in fcv_band_names %}
+      <label style="display:flex; gap:6px; align-items:center;"><input type="checkbox" class="fcvBand" value="{{ loop.index0 }}" {% if loop.index0 in fcv.bands %}checked{% endif %} onchange="saveFcv()"> {{ name }}</label>
+      {% endfor %}
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvDir" {% if fcv.dir_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span>Candle must agree with the alert: at least</span>
+      <input type="text" id="fcvDirMin" value="{{ '%g' % fcv.dir_min_pct }}" style="width:46px; text-align:center;" onchange="saveFcv()">
+      <span>% buying for a Buy alert / selling for a Sell alert</span>
+    </div>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvUnknown" {% if fcv.allow_unknown %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span>Still allow the trade when 9:15 volume isn't available yet</span>
+      <span class="token-status">Off = skip. It isn't available before about 9:22 each day (the 9:15 candle must close and be published), or when a stock has too little history.</span>
+    </div>
+    <hr style="border:none; border-top:1px solid var(--border); width:100%; margin:4px 0;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvRoute" {% if fcv.route_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span style="font-weight:600;">Exit strategy by 9:15 volume band</span>
+      <span class="token-status" id="fcvRouteStatus">...</span>
+    </div>
+    <div class="token-status">When on, each trade uses the strategy picked for its stock's band (this beats the default strategy and Auto). A band left on "default" uses whatever strategy is selected above. A trade keeps its strategy once opened.</div>
+    {% for name in fcv_band_names %}{% set bi = loop.index0 %}
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <span style="min-width:100px;">{{ name }}</span>
+      <select class="fcvRoute" data-band="{{ bi }}" onchange="saveFcv()">
+        <option value="">Use the default strategy</option>
+        {% for sid, label in fcv_strategy_options %}<option value="{{ sid }}" {% if fcv_route_list[bi] == sid %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </div>
+    {% endfor %}
+    <hr style="border:none; border-top:1px solid var(--border); width:100%; margin:4px 0;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvAuto" {% if fcv.auto_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span style="font-weight:600;">Auto-pick the best exit strategy for each 9:15 volume band</span>
+      <span class="token-status" id="fcvAutoStatus">...</span>
+    </div>
+    <div class="token-status">Uses the Exit Compare replays: every past trade replayed through RSI Simple, RSI Momentum, 1st 5 Min FIB and the 5-EMA trail, grouped by 9:15 volume band. A band uses the rule with the best average % - but only if it has enough replayed trades and the rule beats what actually ran there by the margin below; and it must lead the second-best rule clearly over the same trades, not just through one or two big trades (the "confidence" box: about 2 is a normal bar, higher is stricter, 0 switches this check off); otherwise that band keeps your default strategy. Recomputed once a day and when you press Rebuild now, from whatever Exit Compare has replayed so far (run "Replay new trades" there to add recent trades). Priority: a band chosen by hand above, then the rotation test below, then this. The 5-EMA trail has no live version of its own - live trades use the normal live exit rule when it is picked.</div>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <span>Minimum trades in a band</span>
+      <input type="text" id="fcvAutoMin" value="{{ fcv.auto_min_n }}" style="width:46px; text-align:center;" onchange="saveFcv()">
+      <span>Rule must beat what actually ran by</span>
+      <input type="text" id="fcvAutoMargin" value="{{ '%g' % fcv.auto_margin }}" style="width:46px; text-align:center;" onchange="saveFcv()">
+      <span>% average, and lead the second-best rule with confidence at least</span>
+      <input type="text" id="fcvAutoConf" value="{{ '%g' % fcv.auto_conf }}" style="width:46px; text-align:center;" onchange="saveFcv()">
+      <span>(0 = off)</span>
+      <button class="secondary" onclick="rebuildFcvAuto()">Rebuild now</button>
+    </div>
+    <div id="fcvAutoTable" class="token-status">Loading...</div>
+    <hr style="border:none; border-top:1px solid var(--border); width:100%; margin:4px 0;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <label class="switch"><input type="checkbox" id="fcvRot" {% if fcv.rotate_enabled %}checked{% endif %} onchange="saveFcv()"><span class="slider"></span></label>
+      <span style="font-weight:600;">Exit-strategy rotation test (paper and live)</span>
+      <span class="token-status" id="fcvRotStatus">...</span>
+    </div>
+    <div class="token-status">Each new trade takes the next ticked strategy in turn, so every strategy collects its own real trades - compare them on the Stats page under "9:15 Volume Band x Exit Strategy". It applies to live trades too once live trading is on. <b>Note:</b> RSI Momentum and 1st 5 Min FIB have no broker-side stop-loss on a live position, and RSI Simple only has the normal -2% stop - so tick only the strategies you are happy to run live. A band chosen in "Exit strategy by 9:15 volume band" above takes priority over the rotation.</div>
+    <div style="display:flex; gap:14px; flex-wrap:wrap; align-items:center;">
+      {% for sid, label in fcv_strategy_options %}
+      <label style="display:flex; gap:6px; align-items:center;"><input type="checkbox" class="fcvRotItem" value="{{ sid }}" {% if sid in fcv.rotate_list %}checked{% endif %} onchange="saveFcv()"> {{ label }}</label>
+      {% endfor %}
+    </div>
+    <div>
+      <span style="font-weight:600;">Recent first-candle decisions</span>
+      <button class="secondary" onclick="loadFcv()" style="margin-left: 8px;">Refresh</button>
+      <div id="fcvLog" class="token-status" style="margin-top:6px;">Loading...</div>
+      <span class="token-status">Kept in memory only - clears when the app restarts. Every trade also records its 9:15 volume (shown under the symbol) whether or not these switches are on.</span>
+    </div>
+  </div>
+
+  <div class="settings-box">
+    <label class="switch">
+      <input type="checkbox" id="thetaSwitchToggle" {% if theta_switch_enabled %}checked{% endif %} onchange="toggleThetaSwitch()">
+      <span class="slider"></span>
+    </label>
+    <span>Auto-roll to next month expiry (theta protection)</span>
+    <span class="token-status" id="thetaSwitchStatus">
+      {% if theta_switch_enabled %}ON - once the nearest monthly expiry crosses into the back half of its trading-day cycle, new trades open in the NEXT monthly expiry instead{% else %}OFF - always uses the nearest monthly expiry, regardless of how close it is{% endif %}
+    </span>
+  </div>
+
+  <script>
+    function saveTheme() {
+      var t = document.getElementById("themeSelect").value;
+      try { localStorage.setItem("rtt-theme", t); } catch (e) {}
+      document.documentElement.setAttribute("data-theme", t);
+    }
+    loadVolumeLog();
+    loadFcv();
+    loadEntryRule();
+    (function initThemeSelect() {
+      var t = "dark";
+      try { t = localStorage.getItem("rtt-theme") || "dark"; } catch (e) {}
+      var sel = document.getElementById("themeSelect");
+      if (sel) sel.value = t;
+    })();
+
+    async function saveToken() {
+      const token = document.getElementById("tokenInput").value.trim();
+      if (!token) return;
+      const res = await fetch("/api/paper-trading/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ access_token: token }),
+      });
+      const statusEl = document.getElementById("tokenStatus");
+      if (res.ok) {
+        statusEl.textContent = "Token saved for today";
+        statusEl.classList.add("saved");
+        document.getElementById("tokenInput").value = "";
+      } else {
+        statusEl.textContent = "Failed to save token";
+        statusEl.classList.remove("saved");
+      }
+    }
+
+    async function toggleLiveTrading() {
+      const checkbox = document.getElementById("liveToggle");
+      const statusEl = document.getElementById("liveStatus");
+      const enabled = checkbox.checked;
+      if (enabled && !confirm(
+        "This turns ON live trading. The NEXT Buy alert will place a real " +
+        "ATM option order on Upstox (Call for Buy alerts, Put for Sell alerts), sized off your actual available funds, " +
+        "with a -2% SL (Stop-Loss Limit) order placed right after entry. Continue?"
+      )) {
+        checkbox.checked = false;
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/live-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await res.json();
+        statusEl.textContent = result.live_trading_enabled
+          ? "ON - Buy alerts buy the ATM Call, Sell alerts buy the ATM Put (nearest monthly expiry), lots sized off your Upstox available funds. A real -2% SL (Stop-Loss Limit) order is placed with Upstox at entry, so it protects the position even if this app is down"
+          : "OFF - paper trading only";
+        statusEl.style.color = result.live_trading_enabled ? "var(--red)" : "";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        checkbox.checked = !enabled;
+        console.error(err);
+      }
+    }
+
+    async function autoToggle(cb) {
+      const on = cb.checked, el = document.getElementById("autoMsgS");
+      const ok = confirm(on ? "Switch the Auto exit picker ON?\n\nEvery new trade gets its exit rule chosen automatically from the Exit Lab (paper-only unless allowed for live). Open trades keep their rule."
+                            : "Switch the Auto exit picker OFF?\n\nNew trades return to your previous strategy. Open trades keep their rule.");
+      if (!ok) { cb.checked = !on; return; }
+      try {
+        const res = await fetch("/api/auto-vol/action", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: on ? "on" : "off" }) });
+        const data = await res.json();
+        if (!res.ok) { cb.checked = !on; el.style.color = "var(--red)"; el.textContent = data.message || "failed"; return; }
+        el.style.color = "var(--green)"; el.textContent = "Done";
+        setTimeout(() => location.reload(), 700);
+      } catch (e) { cb.checked = !on; el.style.color = "var(--red)"; el.textContent = "request failed"; }
+    }
+
+    async function setStrategy(strategy) {
+      const statusEl = document.getElementById("strategyStatus");
+      try {
+        const res = await fetch("/api/paper-trading/strategy-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ strategy }),
+        });
+        const result = await res.json();
+        statusEl.textContent = result.description || "";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveAtrSettings() {
+      const statusEl = document.getElementById("atrSettingsStatus");
+      const period = parseInt(document.getElementById("atrPeriodInput").value, 10);
+      const multiplier = parseFloat(document.getElementById("atrMultiplierInput").value);
+      if (!period || period < 2 || !multiplier || multiplier < 0.1) {
+        statusEl.textContent = "Enter a valid period (>=2) and multiplier (>=0.1)";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/atr-settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ atr_period: period, atr_multiplier: multiplier }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = `Saved - ATR period ${result.atr_period}, multiplier ${result.atr_multiplier}`;
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveAtrSettingsC() {
+      const statusEl = document.getElementById("atrSettingsCStatus");
+      const period = parseInt(document.getElementById("atrPeriodCInput").value, 10);
+      const multiplier = parseFloat(document.getElementById("atrMultiplierCInput").value);
+      if (!period || period < 2 || !multiplier || multiplier < 0.1) {
+        statusEl.textContent = "Enter a valid period (>=2) and multiplier (>=0.1)";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/atr-settings-c", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ atr_period: period, atr_multiplier: multiplier }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = `Saved - Test-C ATR period ${result.atr_period}, multiplier ${result.atr_multiplier}`;
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveRsiSettings() {
+      const statusEl = document.getElementById("rsiSettingsStatus");
+      const payload = {
+        rsi_period: parseInt(document.getElementById("rsiPeriodInput").value, 10),
+        rsi_ema_period: parseInt(document.getElementById("rsiEmaPeriodInput").value, 10),
+        rsi_confirm_candles: parseInt(document.getElementById("rsiConfirmCandlesInput").value, 10),
+        rsi_call_threshold: parseFloat(document.getElementById("rsiCallThresholdInput").value),
+        rsi_put_strong_threshold: parseFloat(document.getElementById("rsiPutStrongInput").value),
+        rsi_put_warning_threshold: parseFloat(document.getElementById("rsiPutWarningInput").value),
+        rsi_deep_itm_moneyness_pct: parseFloat(document.getElementById("rsiDeepItmMoneynessInput").value),
+        rsi_deep_itm_call_threshold: parseFloat(document.getElementById("rsiDeepItmCallInput").value),
+        rsi_deep_itm_put_warning_threshold: parseFloat(document.getElementById("rsiDeepItmPutInput").value),
+        rsi_midday_start: document.getElementById("rsiMiddayStartInput").value.trim(),
+        rsi_midday_end: document.getElementById("rsiMiddayEndInput").value.trim(),
+        rsi_midday_confirm_candles: parseInt(document.getElementById("rsiMiddayConfirmCandlesInput").value, 10),
+      };
+      for (const [key, val] of Object.entries(payload)) {
+        if (key === "rsi_midday_start" || key === "rsi_midday_end") continue;
+        if (val === null || val === undefined || Number.isNaN(val)) {
+          statusEl.textContent = `Enter a valid number for ${key}`;
+          return;
+        }
+      }
+      if (!/^\d{2}:\d{2}$/.test(payload.rsi_midday_start) || !/^\d{2}:\d{2}$/.test(payload.rsi_midday_end)) {
+        statusEl.textContent = "Mid-day start/end must be HH:MM (e.g. 11:30)";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/rsi-settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const result = await res.json();
+        statusEl.textContent = res.ok ? "Saved - RSI Momentum settings updated" : (result.message || "Failed to save");
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveEntryTimeFilter() {
+      const statusEl = document.getElementById("entryTimeFilterStatus");
+      const raw = document.getElementById("entryTimeFilterInput").value.trim();
+      if (raw && !/^\d{1,2}:\d{2}$/.test(raw)) {
+        statusEl.textContent = "Enter time as HH:MM, e.g. 09:45";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/entry-time-filter", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ entry_time_filter: raw }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = result.entry_time_filter
+            ? `ON - no new trades open before ${result.entry_time_filter} IST`
+            : "OFF - trades can open any time the market's open";
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function clearEntryTimeFilter() {
+      document.getElementById("entryTimeFilterInput").value = "";
+      await saveEntryTimeFilter();
+    }
+
+    async function saveClockSetting(url, field, inputId, statusId, onText, offText) {
+      const statusEl = document.getElementById(statusId);
+      const raw = document.getElementById(inputId).value.trim();
+      if (raw && !/^\d{1,2}:\d{2}$/.test(raw)) {
+        statusEl.textContent = "Enter time as HH:MM, e.g. 15:25";
+        return;
+      }
+      try {
+        const res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ [field]: raw }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = result[field] ? onText(result[field]) : offText;
+          if (result[field]) document.getElementById(inputId).value = result[field];
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    function saveEntryCutoff() {
+      return saveClockSetting(
+        "/api/paper-trading/entry-cutoff-time", "entry_cutoff_time", "entryCutoffInput", "entryCutoffStatus",
+        (v) => `ON - no new trades open from ${v} IST onward`,
+        "OFF - new trades can open until the market closes"
+      );
+    }
+    async function clearEntryCutoff() {
+      document.getElementById("entryCutoffInput").value = "";
+      await saveEntryCutoff();
+    }
+
+    function saveAutoExit() {
+      return saveClockSetting(
+        "/api/paper-trading/auto-exit-time", "auto_exit_time", "autoExitInput", "autoExitStatus",
+        (v) => `ON - anything still open at ${v} IST is closed automatically, paper and live`,
+        "OFF - nothing closes open trades at the end of the day except their own exit strategy"
+      );
+    }
+    async function clearAutoExit() {
+      document.getElementById("autoExitInput").value = "";
+      await saveAutoExit();
+    }
+
+    function escapeHtml(str) {
+      const div = document.createElement("div");
+      div.textContent = String(str);
+      return div.innerHTML;
+    }
+
+    async function toggleVolumeRule(kind) {
+      const isEntry = kind === "entry";
+      const checkbox = document.getElementById(isEntry ? "volumeEntryToggle" : "volumeExitToggle");
+      const statusEl = document.getElementById(isEntry ? "volumeEntryStatus" : "volumeExitStatus");
+      const enabled = checkbox.checked;
+      try {
+        const res = await fetch(isEntry ? "/api/paper-trading/volume-entry-toggle" : "/api/paper-trading/volume-exit-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await res.json();
+        const on = isEntry ? result.volume_entry_enabled : result.volume_exit_enabled;
+        statusEl.textContent = isEntry
+          ? (on ? "ON - each alert is judged the moment it arrives: Strong volume opens the trade, anything else is skipped"
+                : "OFF - every alert that passes the other filters opens a trade, as before")
+          : (on ? "ON - an open trade (paper and live) is closed the first time its volume reads Weak after entry, in addition to its strategy's own exits"
+                : "OFF - open trades are closed only by their strategy's own exit rules");
+      } catch (err) {
+        checkbox.checked = !enabled;
+      }
+    }
+
+    async function loadVolumeLog() {
+      const el = document.getElementById("volumeLog");
+      try {
+        const res = await fetch("/api/volume-entry/log");
+        const data = await res.json();
+        if (!data.decisions.length) {
+          el.textContent = data.entry_enabled
+            ? "No alerts judged yet since the app last started."
+            : "Nothing yet - the volume entry rule is off, so alerts aren't being judged.";
+          return;
+        }
+        el.innerHTML = data.decisions.slice(0, 20).map((d) => {
+          const colour = d.outcome === "ENTERED" ? "var(--green)" : (d.outcome === "error" ? "var(--red)" : "var(--muted)");
+          return `<div><span style="color:${colour}; font-weight:600;">${escapeHtml(d.outcome)}</span> ${escapeHtml(d.at)} ${escapeHtml(d.symbol)} (${escapeHtml(d.category)}) - ${escapeHtml(d.detail)}</div>`;
+        }).join("");
+      } catch (err) {
+        el.textContent = "Couldn't load the log.";
+      }
+    }
+
+    function fcvFillSelects(route) {
+      document.querySelectorAll(".fcvRoute").forEach((sel) => { sel.value = (route && route[sel.dataset.band]) || ""; });
+    }
+
+    function fcvRender(d) {
+      const names = d.band_names || [];
+      document.getElementById("fcvGateStatus").textContent = d.gate_enabled
+        ? (d.bands.length ? "ON - only alerts in: " + d.bands.map((i) => names[i]).join(", ") + (d.dir_enabled ? ", and candle agreeing >= " + d.dir_min_pct + "%" : "") : "ON but no band ticked - every alert will be skipped")
+        : "OFF - 9:15 volume does not affect entries";
+      document.getElementById("fcvRouteStatus").textContent = d.route_enabled ? "ON" : "OFF - every trade uses the default strategy";
+      document.getElementById("fcvRotStatus").textContent = d.rotate_enabled
+        ? (d.rotate_list && d.rotate_list.length ? "ON - " + d.rotate_list.length + " strategies in turn (paper and live)" : "ON but none ticked - nothing rotates")
+        : "OFF";
+      document.getElementById("fcvAutoStatus").textContent = d.auto_enabled ? "ON" : "OFF - table below is for information only";
+      const at = d.auto_table, ael = document.getElementById("fcvAutoTable");
+      if (!at) {
+        ael.textContent = "Not built yet - switch it on or press Rebuild now. It needs trades replayed on the Exit Compare page.";
+      } else {
+        ael.innerHTML = `<div>Built ${escapeHtml(at.built_at)} from ${at.trades} replayed trades (minimum ${at.min_n} per band, margin ${at.margin}%, confidence ${at.conf === undefined ? "n/a" : at.conf})</div>` +
+          Object.keys(at.bands).map((k) => {
+            const b = at.bands[k];
+            const rules = Object.keys(b.rules).map((r) => b.rules[r]).sort((x, y) => y.avg - x.avg)
+              .map((r) => `${escapeHtml(r.name)} ${r.avg > 0 ? "+" : ""}${r.avg}% (win ${r.win}%)`).join(" | ");
+            const verdict = b.pick ? `<span style="color:var(--green); font-weight:600;">uses ${escapeHtml(b.pick_name)}</span>` : `<span style="color:var(--muted);">default strategy - ${escapeHtml(b.why)}</span>`;
+            const lead = (b.pick && b.t !== null && b.t !== undefined) ? ` <span style="color:var(--muted);">(lead over ${escapeHtml(b.runner_up || "next rule")}: confidence ${b.t})</span>` : "";
+            return `<div style="margin-top:6px;"><b>${escapeHtml(b.band)}</b> (${b.n} trades): ${verdict}${lead}<div>${rules}</div></div>`;
+          }).join("");
+      }
+      const el = document.getElementById("fcvLog");
+      if (!d.log || !d.log.length) {
+        el.textContent = (d.gate_enabled || d.route_enabled) ? "No alerts judged yet since the app last started." : "Nothing yet - both switches are off.";
+        return;
+      }
+      el.innerHTML = d.log.slice(0, 20).map((x) => {
+        const colour = (x.outcome === "ALLOWED" || x.outcome === "ROUTED" || x.outcome === "AUTO-PICKED") ? "var(--green)" : (x.outcome === "error" ? "var(--red)" : "var(--muted)");
+        return `<div><span style="color:${colour}; font-weight:600;">${escapeHtml(x.outcome)}</span> ${escapeHtml(x.at)} ${escapeHtml(x.symbol)} (${escapeHtml(x.category)}) - ${escapeHtml(x.detail)}</div>`;
+      }).join("");
+    }
+
+    // ---------- Entry rule (recipe) ----------
+    const ER_ROWS = [
+      { key: "ratio", name: "9:15 volume ratio", hint: "First 5-minute candle volume vs its 10-session average", unit: "x",
+        opts: [1.5, 2, 3, 4, 5, 7, 10], fmt: v => v + "\u00d7" },
+      { key: "share", name: "9:15 candle agrees with the alert", hint: "Buying share for a Buy alert, selling share for a Sell alert", unit: "%",
+        opts: [55, 60, 65, 70, 75, 80, 85, 90, 95], fmt: v => v + "%" },
+      { key: "pressure", name: "Direction pressure", hint: "Buying (Sell: selling) volume of the 9:15 candle vs its average", unit: "x",
+        opts: [1.5, 2, 3, 4, 5, 7, 10], fmt: v => v + "\u00d7" },
+      { key: "sector25", name: "Sector at 09:25 moves with the alert", hint: "Sector average % at 09:25 (Buy: up, Sell: down)", unit: "%",
+        opts: [0.25, 0.5, 0.75, 1, 1.5, 2], fmt: v => v + "%" },
+      { key: "oi", name: "Open interest rising", hint: "Latest OI% above its 09:15 value (futures, vs previous day)", unit: "pts", label: "by at least",
+        opts: [0, 0.05, 0.1, 0.25, 0.5, 1], fmt: v => v === 0 ? "any rise" : v + " pts" },
+      { key: "dv0930", name: "Day volume at 09:30", hint: "Volume of the first three candles (09:15-09:25) vs its usual by 09:30. Known after 09:32; earlier alerts follow the missing-reading choice", unit: "x",
+        opts: [1, 1.25, 1.5, 2, 3, 5], fmt: v => v + "\u00d7" },
+      { key: "dv1030", name: "Day volume at 10:30", hint: "Volume from 09:15 to 10:30 vs its usual by 10:30. Known after 10:32; earlier alerts follow the missing-reading choice", unit: "x",
+        opts: [1, 1.25, 1.5, 2, 3, 5], fmt: v => v + "\u00d7" },
+      { key: "opt_volume", name: "Option liquidity: contracts traded today", hint: "Lots traded today in the option this alert would buy (skips contracts nobody trades)", unit: "lots",
+        opts: [10, 25, 50, 100, 250, 500, 1000], fmt: v => v + " lots" },
+      { key: "opt_active", name: "Option liquidity: active minutes", hint: "Minutes with trades in that option during the last 10 minutes", unit: "min",
+        opts: [2, 3, 5, 7, 9], fmt: v => v + " of last 10" },
+    ];
+    let erState = null, erTimer = null;
+
+    function erBuild(d) {
+      erState = d.rule;
+      const r = d.rule;
+      document.getElementById("erEnabled").checked = !!r.enabled;
+      const pill = document.getElementById("erPill");
+      pill.textContent = r.enabled ? "ON" : "OFF";
+      pill.className = "er-pill" + (r.enabled ? " on" : "");
+      document.getElementById("erLive").style.display = (r.enabled && d.live_trading) ? "" : "none";
+      document.getElementById("erMissing").value = r.if_missing;
+      const names = d.alert_names || [];
+      document.getElementById("erAlerts").innerHTML = names.length ? names.map((n, i) =>
+        '<label class="er-chip' + (r.alerts.indexOf(n) >= 0 ? " sel" : "") + '"><input type="checkbox" class="erAlert" data-i="' + i + '"' + (r.alerts.indexOf(n) >= 0 ? " checked" : "") + "> " + escapeHtml(n) + "</label>").join("")
+        : '<span class="er-sub">No alert names found in the last 45 days.</span>';
+      document.getElementById("erAlerts").dataset.names = JSON.stringify(names);
+      document.querySelectorAll(".erAlert").forEach(cb => { cb.onchange = () => { cb.parentElement.classList.toggle("sel", cb.checked); saveEntryRule(); }; });
+      document.getElementById("erGrid").innerHTML = ER_ROWS.map(row => {
+        const c = r[row.key];
+        const opts = row.opts.slice();
+        if (opts.indexOf(c.min) < 0) { opts.push(c.min); opts.sort((a, b) => a - b); }
+        return '<div class="' + (c.on ? "" : "er-row-off") + '" data-row="' + row.key + '"><label class="switch"><input type="checkbox" class="erOn" data-k="' + row.key + '"' + (c.on ? " checked" : "") + '><span class="slider"></span></label></div>' +
+          '<div class="' + (c.on ? "" : "er-row-off") + '" data-row="' + row.key + '"><div class="er-name">' + row.name + '</div><div class="er-hint">' + row.hint + "</div></div>" +
+          '<div class="er-op ' + (c.on ? "" : "er-row-off") + '" data-row="' + row.key + '">' + (row.key === "oi" ? "" : "&ge;") + "</div>" +
+          '<div class="' + (c.on ? "" : "er-row-off") + '" data-row="' + row.key + '"><select class="erMin" data-k="' + row.key + '">' + opts.map(o => '<option value="' + o + '"' + (o === c.min ? " selected" : "") + ">" + row.fmt(o) + "</option>").join("") + "</select></div>" +
+          '<div class="er-hint ' + (c.on ? "" : "er-row-off") + '" data-row="' + row.key + '">' + (row.label ? row.label + " &middot; " : "") + (c.on ? "ON" : "off") + "</div>";
+      }).join("");
+      document.querySelectorAll(".erOn, .erMin").forEach(el => { el.onchange = saveEntryRule; });
+      document.getElementById("erLog").innerHTML = (d.log || []).length ? d.log.map(x => {
+        const colour = x.outcome === "PASSED" || x.outcome === "ALLOWED" ? "var(--green)" : x.outcome === "ERROR" ? "#f5c542" : "var(--red)";
+        return '<div><span class="er-badge" style="color:' + colour + '">' + escapeHtml(x.outcome) + "</span><span style=\"color:var(--muted)\">" + escapeHtml(x.at) + "</span><b>" + escapeHtml(x.symbol) + "</b> (" + escapeHtml(x.category) + ") &mdash; " + escapeHtml(x.detail) + "</div>";
+      }).join("") : '<div class="er-sub">Nothing judged since the app last (re)started. This list is kept in memory only; every trade also stores its own entry-rule result, shown under its symbol on the Paper and Live pages.</div>';
+    }
+
+    async function loadEntryRule() {
+      try { erBuild(await (await fetch("/api/entry-rule")).json()); }
+      catch (e) { document.getElementById("erSaved").textContent = "Could not load the entry rule."; }
+    }
+
+    async function saveEntryRule() {
+      const names = JSON.parse(document.getElementById("erAlerts").dataset.names || "[]");
+      const body = {
+        enabled: document.getElementById("erEnabled").checked,
+        if_missing: document.getElementById("erMissing").value,
+        alerts: Array.from(document.querySelectorAll(".erAlert")).filter(x => x.checked).map(x => names[+x.dataset.i]),
+      };
+      ER_ROWS.forEach(row => {
+        body[row.key] = {
+          on: document.querySelector('.erOn[data-k="' + row.key + '"]').checked,
+          min: parseFloat(document.querySelector('.erMin[data-k="' + row.key + '"]').value),
+        };
+      });
+      try {
+        const res = await fetch("/api/entry-rule", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const d = await res.json();
+        if (d.status !== "ok") throw new Error(d.message || "save failed");
+        erBuild(d);
+        const el = document.getElementById("erSaved");
+        el.textContent = "Saved \u2713 applies to the next alert";
+        clearTimeout(erTimer);
+        erTimer = setTimeout(() => { el.textContent = ""; }, 3000);
+      } catch (e) {
+        document.getElementById("erSaved").textContent = "Could not save - " + e.message;
+      }
+    }
+
+    async function loadFcv() {
+      try {
+        const res = await fetch("/api/first-candle-gate");
+        const d = await res.json();
+        fcvFillSelects(d.route);
+        fcvRender(d);
+      } catch (err) {
+        document.getElementById("fcvLog").textContent = "Couldn't load.";
+      }
+    }
+
+    async function rebuildFcvAuto() {
+      document.getElementById("fcvAutoTable").textContent = "Rebuilding...";
+      try {
+        const res = await fetch("/api/first-candle-gate", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ auto_rebuild: true }),
+        });
+        fcvRender(await res.json());
+      } catch (err) {
+        document.getElementById("fcvAutoTable").textContent = "Rebuild failed - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveFcv() {
+      const route = {};
+      document.querySelectorAll(".fcvRoute").forEach((sel) => { route[sel.dataset.band] = sel.value; });
+      const body = {
+        gate_enabled: document.getElementById("fcvGate").checked,
+        bands: Array.from(document.querySelectorAll(".fcvBand")).filter((x) => x.checked).map((x) => parseInt(x.value, 10)),
+        dir_enabled: document.getElementById("fcvDir").checked,
+        dir_min_pct: parseFloat(document.getElementById("fcvDirMin").value) || 55,
+        allow_unknown: document.getElementById("fcvUnknown").checked,
+        route_enabled: document.getElementById("fcvRoute").checked,
+        route: route,
+        auto_enabled: document.getElementById("fcvAuto").checked,
+        auto_min_n: parseFloat(document.getElementById("fcvAutoMin").value) || 10,
+        auto_margin: parseFloat(document.getElementById("fcvAutoMargin").value) || 0,
+        auto_conf: (() => { const c = parseFloat(document.getElementById("fcvAutoConf").value); return isNaN(c) ? 2 : c; })(),
+        rotate_enabled: document.getElementById("fcvRot").checked,
+        rotate_list: Array.from(document.querySelectorAll(".fcvRotItem")).filter((x) => x.checked).map((x) => x.value),
+      };
+      try {
+        const res = await fetch("/api/first-candle-gate", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+        });
+        const d = await res.json();
+        if (d.status !== "ok") { document.getElementById("fcvGateStatus").textContent = d.message || "Failed to save"; return; }
+        document.getElementById("fcvDirMin").value = d.dir_min_pct;
+        fcvFillSelects(d.route);
+        fcvRender(d);
+      } catch (err) {
+        document.getElementById("fcvGateStatus").textContent = "Failed to save - see console";
+        console.error(err);
+      }
+    }
+
+    async function toggleSectorFilter() {
+      const checkbox = document.getElementById("sectorFilterToggle");
+      const topNInput = document.getElementById("sectorFilterTopN");
+      const statusEl = document.getElementById("sectorFilterStatus");
+      const enabled = checkbox.checked;
+      const topN = parseInt(topNInput.value, 10) || 5;
+      try {
+        const res = await fetch("/api/paper-trading/sector-filter-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled, top_n: topN }),
+        });
+        const result = await res.json();
+        topNInput.value = result.sector_filter_top_n;
+        statusEl.textContent = result.sector_filter_enabled
+          ? `ON - Buy needs a top-${result.sector_filter_top_n} sector, Sell needs a bottom-${result.sector_filter_top_n} sector; everything else is skipped`
+          : "OFF - every alert can open a trade, regardless of its sector's performance";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function toggleThetaSwitch() {
+      const checkbox = document.getElementById("thetaSwitchToggle");
+      const statusEl = document.getElementById("thetaSwitchStatus");
+      const enabled = checkbox.checked;
+      try {
+        const res = await fetch("/api/paper-trading/theta-switch-toggle", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled }),
+        });
+        const result = await res.json();
+        statusEl.textContent = result.theta_switch_enabled
+          ? "ON - once the nearest monthly expiry crosses into the back half of its trading-day cycle, new trades open in the NEXT monthly expiry instead"
+          : "OFF - always uses the nearest monthly expiry, regardless of how close it is";
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        checkbox.checked = !enabled;
+        console.error(err);
+      }
+    }
+
+    async function saveSupertrendSettings() {
+      const statusEl = document.getElementById("stSettingsStatus");
+      const length = parseInt(document.getElementById("stLengthInput").value, 10);
+      const factor = parseFloat(document.getElementById("stFactorInput").value);
+      try {
+        const res = await fetch("/api/paper-trading/supertrend-settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ length, factor }),
+        });
+        const result = await res.json();
+        statusEl.textContent = res.ok
+          ? "Saved - SuperTrend " + result.supertrend_length + " / " + result.supertrend_factor
+          : (result.message || "Failed to save");
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveLiveFundsUse() {
+      const input = document.getElementById("liveFundsUseInput");
+      const statusEl = document.getElementById("liveFundsUseStatus");
+      const pct = parseFloat(input.value);
+      if (!(pct >= 1 && pct <= 100)) {
+        statusEl.textContent = "Enter a number between 1 and 100";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/live-funds-use", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pct }),
+        });
+        const result = await res.json();
+        statusEl.textContent = res.ok
+          ? "Saved - live lots sized off " + result.live_funds_use_pct + "% of available funds, from the next live trade."
+          : (result.message || "Failed to save");
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveLiveEntryMode() {
+      const select = document.getElementById("liveEntryModeSelect");
+      const statusEl = document.getElementById("liveEntryModeStatus");
+      const mode = select.value;
+      if (mode === "GTT" && !confirm(
+        "GTT entry mode combines your entry order and trailing stop into one broker-managed order. " +
+        "This is newer and less battle-tested than SL mode in this app - verify your first trade's " +
+        "fill and stop behavior directly in your Upstox order book. Continue?"
+      )) {
+        select.value = "SL";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/live-entry-mode", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ mode }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = result.live_entry_mode === "GTT"
+            ? "GTT mode - Upstox's own engine trails the stop server-side using the gap below. Recommended: verify your first GTT trade's fill and stop behavior directly in your Upstox order book before relying on it."
+            : "SL mode - this app polls and manages the exit itself every 5s, with the broker-side SL order as a downside floor.";
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveGttTrailingSettings() {
+      const gapMode = document.getElementById("gttGapModeSelect").value;
+      const gapValue = parseFloat(document.getElementById("gttGapValueInput").value);
+      const statusEl = document.getElementById("gttTrailingStatus");
+      if (!gapValue || gapValue <= 0) {
+        statusEl.textContent = "Enter a valid positive gap value";
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/gtt-trailing-settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ gap_mode: gapMode, gap_value: gapValue }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = `Current: ${result.gap_value}${result.gap_mode === "percent" ? "% of entry price" : " points"}, computed fresh at entry time`;
+        } else {
+          statusEl.textContent = result.message || "Failed to save";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveCapital() {
+      const amount = parseFloat(document.getElementById("capitalInput").value);
+      const statusEl = document.getElementById("capitalStatus");
+      if (!amount || amount <= 0) {
+        statusEl.textContent = "Enter a valid amount greater than 0";
+        return;
+      }
+      const res = await fetch("/api/paper-trading/capital", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ capital: amount }),
+      });
+      if (res.ok) {
+        statusEl.textContent = `Saved - Rs ${inr(amount)} starting capital`;
+      } else {
+        statusEl.textContent = "Failed to save amount";
+      }
+    }
+
+    async function addFunds() {
+      const statusEl = document.getElementById("fundsStatus");
+      const raw = document.getElementById("fundsAmount").value.replace(/,/g, "").trim();
+      const note = document.getElementById("fundsNote").value.trim();
+      const amount = parseFloat(raw);
+      if (!raw || !isFinite(amount) || amount === 0) {
+        statusEl.textContent = "Enter a non-zero amount, e.g. 50000 (negative removes funds)";
+        return;
+      }
+      const verb = amount > 0 ? "Add" : "Remove";
+      if (!confirm(`${verb} Rs ${inr(Math.abs(amount))} ${amount > 0 ? "to" : "from"} the paper account? Your trade history is not affected.`)) {
+        return;
+      }
+      try {
+        const res = await fetch("/api/paper-trading/capital-adjust", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ amount, note }),
+        });
+        const result = await res.json();
+        if (res.ok) {
+          statusEl.textContent = `Done - paper balance is now Rs ${inr(result.current_capital)}`;
+          setTimeout(() => location.reload(), 600);
+        } else {
+          statusEl.textContent = result.message || "Failed to update funds";
+        }
+      } catch (err) {
+        statusEl.textContent = "Failed to update funds - see console";
+        console.error(err);
+      }
+    }
+
+    async function resetPaperTrading() {
+      if (!confirm("This deletes ALL paper trades (open and closed) AND your funds history, and restarts from your starting capital.\n\nJust want more paper money? Cancel and use \"Add / remove paper funds\" - it keeps every trade.\n\nContinue with the full reset?")) {
+        return;
+      }
+      const res = await fetch("/api/paper-trading/reset", { method: "POST" });
+      if (res.ok) {
+        location.reload();
+      } else {
+        alert("Reset failed - see console");
+      }
+    }
+  </script>
+</body>
+</html>
