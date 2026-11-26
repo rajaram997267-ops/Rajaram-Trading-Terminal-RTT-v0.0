@@ -378,7 +378,7 @@
           <table>
             <tr>
               <th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Entry RSI</th><th>Entry Vol</th><th>Exit</th><th>Exit RSI</th><th>Exit Vol</th>
-              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time (IST)</th>
+              <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Entry time (IST)</th><th>Exit time (IST)</th>
             </tr>
             {% for t in group.trades %}
             <tr>
@@ -396,6 +396,7 @@
               <td class="{% if t.rr_multiple and t.rr_multiple > 0 %}pnl-pos{% elif t.rr_multiple and t.rr_multiple < 0 %}pnl-neg{% endif %}">{% if t.rr_multiple is not none %}{% if not t.rr_is_true %}≈{% endif %}{{ "%+.2f"|format(t.rr_multiple) }}R{% else %}-{% endif %}</td>
               <td>{{ t.balance_after|inr }}</td>
               <td>{{ t.exit_reason }}</td>
+              <td>{{ t.entry_time_ist }}</td>
               <td>{{ t.exit_time_ist }}</td>
             </tr>
             {% endfor %}
@@ -574,6 +575,7 @@
               <td class="${rrClass(t)}">${rrText(t)}</td>
               <td>${inr(t.balance_after)}</td>
               <td>${escapeHtml(t.exit_reason || "")}</td>
+              <td>${t.entry_time_ist || ""}</td>
               <td>${t.exit_time_ist || ""}</td>
             </tr>
           `;
@@ -593,7 +595,7 @@
             <div class="date-trades">
               <table>
                 <tr><th>Symbol</th><th>Direction</th><th>Qty</th><th>Entry</th><th>Entry RSI</th><th>Entry Vol</th><th>Exit</th><th>Exit RSI</th><th>Exit Vol</th>
-                    <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Exit time (IST)</th></tr>
+                    <th>P&amp;L (Rs)</th><th>P&amp;L %</th><th title="R multiple = gain divided by risk. Plain number: risk is this strategy&#39;s fixed stop-loss %. &#8776; prefix: no fixed stop for this strategy, risk is the trade&#39;s actual worst drawdown instead.">R:R</th><th>Balance after (Rs)</th><th>Exit reason</th><th>Entry time (IST)</th><th>Exit time (IST)</th></tr>
                 ${rows}
               </table>
             </div>
