@@ -3881,9 +3881,15 @@ def _oi_trend_job(token: str, symbols: list, today: str) -> None:
                     time.sleep(2.0)
             except Exception:
                 pass
-        for sym, qd in _oi_quotes(symbols, token, today).items():
+        for sym, qd in _oi_quotes(symbols, token, today, with_spot=True).items():
             if qd.get("oi") is not None:
                 _oi_latest["map"][sym] = float(qd["oi"])
+            if qd.get("ltp") is not None:
+                _fut_spot["map"][sym] = {
+                    "fut_ltp": qd.get("ltp"), "fut_pct": qd.get("price_pct"),
+                    "spot_ltp": qd.get("spot_ltp"), "spot_pct": qd.get("spot_pct"),
+                    "expiry": next((e for e, k in _futures_cache.get(sym, []) if e >= today), None)}
+        _fut_spot["t"] = time.time()
         _oi_latest["t"] = time.time()
     except Exception as e:
         print(f"[oi-trend] {type(e).__name__}: {e}", flush=True)
@@ -3921,6 +3927,33 @@ def _attach_oi_trend(items: list, token: str | None, is_today: bool) -> None:
         open_pct = round((op - prev) / prev * 100, 2) if op else None
         d = "flat" if open_pct is None or abs(now_pct - open_pct) < 0.05 else ("up" if now_pct > open_pct else "down")
         a["oi_trend"] = {"open_pct": open_pct, "now_pct": now_pct, "dir": d}
+
+
+_fut_spot: dict = {"t": 0.0, "map": {}}      # SYMBOL -> nearest future + spot prices, refreshed by _oi_trend_job (~20 s)
+
+
+def _attach_fut_spot(items: list, is_today: bool) -> None:
+    """Adds 'fut_spot' to today's alerts: nearest-expiry future and spot price + % vs previous close, the future's
+    premium over spot, and 'lead' = future % minus spot % (in percentage points). lead_dir_pp is the lead in the
+    alert's own direction (flipped for Sell). Reads memory only - the numbers come from the OI trend job's
+    existing batched quote call, so this adds no Upstox requests."""
+    if not is_today:
+        return
+    as_of = (datetime.utcfromtimestamp(_fut_spot["t"]) + IST_OFFSET).strftime("%H:%M:%S") if _fut_spot["t"] else None
+    for a in items:
+        d = _fut_spot["map"].get((a.get("symbol") or "").strip().upper())
+        if not d or d.get("fut_ltp") is None or d.get("spot_ltp") is None:
+            continue
+        fl, sl, fp, sp = d["fut_ltp"], d["spot_ltp"], d.get("fut_pct"), d.get("spot_pct")
+        lead = round(fp - sp, 2) if (fp is not None and sp is not None) else None
+        sign = -1.0 if a.get("category") == "Sell" else 1.0
+        a["fut_spot"] = {**d, "premium_pct": round((fl - sl) / sl * 100, 2) if sl else None, "lead_pp": lead,
+                         "lead_dir_pp": round(lead * sign, 2) if lead is not None else None, "as_of": as_of}
+
+
+@app.route("/fut-spot")
+def fut_spot_page():
+    return render_template("fut_spot.html", active_tab="fut_spot", today=(datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d"))
 
 
 def _attach_sector_0925(items: list, date_str: str, token: str | None) -> None:
@@ -4014,7 +4047,7 @@ def _oi_prev_job(token: str, symbols: list, today: str) -> None:
         _oi_state["last_error"] = f"{type(e).__name__}: {e}"
 
 
-def _oi_quotes(symbols: list, token: str, today: str) -> dict:
+def _oi_quotes(symbols: list, token: str, today: str, with_spot: bool = False) -> dict:
     """{symbol: {oi, ltp, price_pct, vwap_pct, buy_qty, sell_qty}} from Upstox full quotes (batches of 100)."""
     key_to_sym = {}
     for sym in symbols:
@@ -4022,7 +4055,13 @@ def _oi_quotes(symbols: list, token: str, today: str) -> dict:
         if k:
             key_to_sym[k] = sym
     out = {}
-    keys = list(key_to_sym)
+    spot_to_sym = {}
+    if with_spot:                      # same batched call also carries the spot (cash) instruments: no extra request
+        for sym in symbols:
+            sk = get_instrument_key(sym)
+            if sk and _fut_key(sym, today):
+                spot_to_sym[sk] = sym
+    keys = list(key_to_sym) + list(spot_to_sym)
     for i in range(0, len(keys), 100):
         batch = keys[i:i + 100]
         url = "https://api.upstox.com/v2/market-quote/quotes?instrument_key=" + ",".join(urllib.parse.quote(k, safe="") for k in batch)
@@ -4031,17 +4070,24 @@ def _oi_quotes(symbols: list, token: str, today: str) -> dict:
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = (json.loads(resp.read().decode()).get("data")) or {}
         for v in data.values():
-            sym = key_to_sym.get(v.get("instrument_token"))
+            tok = v.get("instrument_token")
+            if tok in spot_to_sym:
+                sltp, snet = v.get("last_price"), v.get("net_change")
+                sbase = (sltp - snet) if (sltp is not None and snet is not None) else None
+                out.setdefault(spot_to_sym[tok], {}).update(
+                    {"spot_ltp": sltp, "spot_pct": round(snet / sbase * 100, 2) if sbase else None})
+                continue
+            sym = key_to_sym.get(tok)
             if not sym:
                 continue
             ltp, net, avg = v.get("last_price"), v.get("net_change"), v.get("average_price")
             base = (ltp - net) if (ltp is not None and net is not None) else None
-            out[sym] = {
+            out.setdefault(sym, {}).update({
                 "oi": v.get("oi"), "ltp": ltp,
                 "price_pct": round(net / base * 100, 2) if base else None,
                 "vwap_pct": round((ltp - avg) / avg * 100, 2) if (ltp and avg) else None,
                 "buy_qty": v.get("total_buy_quantity"), "sell_qty": v.get("total_sell_quantity"),
-            }
+            })
     return out
 
 
@@ -9717,6 +9763,7 @@ def index():
             _attach_fno_rank(_items, access_token, selected_date == today_str)
             _attach_oi_trend(_items, access_token, selected_date == today_str)
             _attach_oi_range(_items, selected_date == today_str)
+            _attach_fut_spot(_items, selected_date == today_str)
             _items.sort(key=_volume_rank)   # Strong volume first (stable)
 
         html = render_template(
@@ -9805,6 +9852,7 @@ def api_alerts():
     _attach_fno_rank(merged_alerts, access_token, selected_date == today_str)
     _attach_oi_trend(merged_alerts, access_token, selected_date == today_str)
     _attach_oi_range(merged_alerts, selected_date == today_str)
+    _attach_fut_spot(merged_alerts, selected_date == today_str)
     # Strong volume first within each column (stable: newest-first kept within a rank)
     _cat_pos = {name: i for i, name in enumerate(CATEGORY_ORDER)}
     merged_alerts.sort(key=lambda a: (_cat_pos.get(a.get("category"), len(_cat_pos)), _volume_rank(a)))
