@@ -218,6 +218,9 @@
     .rng-chip.fail { background: transparent; color: var(--muted); border-style: dashed; border-color: currentColor; }
     .rng-chip.fail.up { color: var(--green); }
     .rng-chip.fail.down { color: #ff5370; }
+    .fs-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 7px; border-radius: 8px; border: 1px solid var(--border); color: var(--muted); cursor: help; }
+    .fs-chip.up { background: #0a6b3f; border-color: #0a6b3f; color: #fff; }
+    .fs-chip.down { background: #c62839; border-color: #c62839; color: #fff; }
     .mv-chip { font-size: 10px; font-weight: 700; white-space: nowrap; padding: 1px 6px; border-radius: 8px; border: 1px solid currentColor; cursor: help; }
     .mv-chip.pos { color: var(--green); }
     .mv-chip.neg { color: #ff5370; }
@@ -568,6 +571,8 @@
         <option value="oirise">Sort: OI % rise since 9:15</option>
         <option value="breakout">Sort: OI ceiling breakout</option>
         <option value="breakdown">Sort: OI floor breakdown</option>
+        <option value="futpct">Sort: Futures % move (strongest first)</option>
+        <option value="futlead">Sort: Futures lead over spot</option>
       </select>
       <div class="count">alerts this day: <b id="dayCount">{{ alerts_count }}</b></div>
       <form method="post" action="/clear" onsubmit="return confirm('Clear all saved alerts (all days)?');">
@@ -590,6 +595,7 @@
     <a href="/market-eye" class="{% if active_tab == 'market_eye' %}active{% endif %}">Market EYE &#128065;&#65039;</a>
     <a href="/preopen-context" class="{% if active_tab == 'preopen_context' %}active{% endif %}">Pre-Open Context</a>
     <a href="/oi-range" class="{% if active_tab == 'oi_range' %}active{% endif %}">OI Range</a>
+    <a href="/fut-spot" class="{% if active_tab == 'fut_spot' %}active{% endif %}">Futures vs Spot</a>
   </div>
 
   <div class="layout">
@@ -630,7 +636,7 @@
                 {% for alert in items %}
                 <div class="list-row{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %} confirmed{% endif %}{% if alert['confirmed_count'] and alert['confirmed_count'] >= 3 %} triple-confirmed{% endif %}" data-sector="{{ alert['sector'] }}" {% if alert["alert_name"] %}title="{{ alert['alert_name'] }}"{% endif %}>
                   <div class="row-top">
-                    <span class="sym-wrap"><span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>{% if alert.get("sector") and alert.get("sector") != "Unclassified" %}<span class="sec-chip{% if alert.get('sector_0925') is not none %}{{ ' pos' if alert['sector_0925'] > 0 else (' neg' if alert['sector_0925'] < 0 else '') }}{% endif %}" title="Sector {{ alert['sector'] }}{% if alert.get('sector_0925') is not none %}: {{ '%+.2f'|format(alert['sector_0925']) }}% at 09:25 IST (fixed for the day){% else %}: 09:25 value not available yet{% endif %}">{{ alert['sector'] }}{% if alert.get('sector_0925') is not none %} {{ '%+.2f'|format(alert['sector_0925']) }}%{% endif %}</span>{% endif %}{% set _fcp = alert.get("fc") %}{% if _fcp and _fcp.get("pressure") is not none %}<span class="dp-chip{{ ' good' if _fcp['pressure'] >= 3 else '' }}" title="Dir. pressure {{ '%.2f'|format(_fcp['pressure']) }}x: estimated {{ _fcp['side'] }}ing volume of the 9:15 candle vs its 10-session average">Pressure {{ '%.1f'|format(_fcp['pressure']) }}&times;</span>{% endif %}{% set _mv = alert.get("fno_rank") %}{% if _mv %}<span class="mv-chip {{ 'pos' if _mv['type'] == 'gain' else 'neg' }}" title="{{ 'Top F&O gainer' if _mv['type'] == 'gain' else 'Top F&O loser' }} #{{ _mv['rank'] }} vs the previous close, as of {{ _mv['as_of'] }}">{{ '&uarr;'|safe if _mv['type'] == 'gain' else '&darr;'|safe }} #{{ _mv['rank'] }} {{ '%+.2f'|format(_mv['pct']) }}%</span>{% endif %}{% set _ot = alert.get("oi_trend") %}{% if _ot %}<span class="oi-chip {{ _ot['dir'] }}" title="Open interest vs previous day">OI {% if _ot['open_pct'] is not none %}{{ '%+.2f'|format(_ot['open_pct']) }}% &rarr; {% endif %}{{ '%+.2f'|format(_ot['now_pct']) }}%{{ ' &#9650;'|safe if _ot['dir'] == 'up' else (' &#9660;'|safe if _ot['dir'] == 'down' else '') }}</span>{% endif %}{% set _rg = alert.get("oi_range") %}{% if _rg %}{% if _rg['ceil_state'] %}<span class="rng-chip up{{ ' fail' if _rg['ceil_state'] == 1 else '' }}" title="OI ceiling {{ '%.2f'|format(_rg['ceiling']) }} (strike with the most Call OI, first scan today): {{ 'price is above it now' if _rg['ceil_state'] == 2 else 'price crossed it earlier today and is back inside' }} ({{ '%+.2f'|format(_rg['ceil_over_pct']) }}% beyond)">Breakout &#9650;{{ ' (back inside)' if _rg['ceil_state'] == 1 else '' }}</span>{% endif %}{% if _rg['floor_state'] %}<span class="rng-chip down{{ ' fail' if _rg['floor_state'] == 1 else '' }}" title="OI floor {{ '%.2f'|format(_rg['floor']) }} (strike with the most Put OI, first scan today): {{ 'price is below it now' if _rg['floor_state'] == 2 else 'price crossed it earlier today and is back inside' }} ({{ '%+.2f'|format(_rg['floor_over_pct']) }}% beyond)">Breakdown &#9660;{{ ' (back inside)' if _rg['floor_state'] == 1 else '' }}</span>{% endif %}{% endif %}</span>
+                    <span class="sym-wrap"><span class="sym">{{ alert["symbol"] or "Unknown" }}{% if alert['confirmed_count'] and alert['confirmed_count'] > 1 %}<span class="confirm-badge">{{ alert['confirmed_count'] }}x</span>{% endif %}</span>{% if alert.get("sector") and alert.get("sector") != "Unclassified" %}<span class="sec-chip{% if alert.get('sector_0925') is not none %}{{ ' pos' if alert['sector_0925'] > 0 else (' neg' if alert['sector_0925'] < 0 else '') }}{% endif %}" title="Sector {{ alert['sector'] }}{% if alert.get('sector_0925') is not none %}: {{ '%+.2f'|format(alert['sector_0925']) }}% at 09:25 IST (fixed for the day){% else %}: 09:25 value not available yet{% endif %}">{{ alert['sector'] }}{% if alert.get('sector_0925') is not none %} {{ '%+.2f'|format(alert['sector_0925']) }}%{% endif %}</span>{% endif %}{% set _fcp = alert.get("fc") %}{% if _fcp and _fcp.get("pressure") is not none %}<span class="dp-chip{{ ' good' if _fcp['pressure'] >= 3 else '' }}" title="Dir. pressure {{ '%.2f'|format(_fcp['pressure']) }}x: estimated {{ _fcp['side'] }}ing volume of the 9:15 candle vs its 10-session average">Pressure {{ '%.1f'|format(_fcp['pressure']) }}&times;</span>{% endif %}{% set _mv = alert.get("fno_rank") %}{% if _mv %}<span class="mv-chip {{ 'pos' if _mv['type'] == 'gain' else 'neg' }}" title="{{ 'Top F&O gainer' if _mv['type'] == 'gain' else 'Top F&O loser' }} #{{ _mv['rank'] }} vs the previous close, as of {{ _mv['as_of'] }}">{{ '&uarr;'|safe if _mv['type'] == 'gain' else '&darr;'|safe }} #{{ _mv['rank'] }} {{ '%+.2f'|format(_mv['pct']) }}%</span>{% endif %}{% set _ot = alert.get("oi_trend") %}{% if _ot %}<span class="oi-chip {{ _ot['dir'] }}" title="Open interest vs previous day">OI {% if _ot['open_pct'] is not none %}{{ '%+.2f'|format(_ot['open_pct']) }}% &rarr; {% endif %}{{ '%+.2f'|format(_ot['now_pct']) }}%{{ ' &#9650;'|safe if _ot['dir'] == 'up' else (' &#9660;'|safe if _ot['dir'] == 'down' else '') }}</span>{% endif %}{% set _rg = alert.get("oi_range") %}{% if _rg %}{% if _rg['ceil_state'] %}<span class="rng-chip up{{ ' fail' if _rg['ceil_state'] == 1 else '' }}" title="OI ceiling {{ '%.2f'|format(_rg['ceiling']) }} (strike with the most Call OI, first scan today): {{ 'price is above it now' if _rg['ceil_state'] == 2 else 'price crossed it earlier today and is back inside' }} ({{ '%+.2f'|format(_rg['ceil_over_pct']) }}% beyond)">Breakout &#9650;{{ ' (back inside)' if _rg['ceil_state'] == 1 else '' }}</span>{% endif %}{% if _rg['floor_state'] %}<span class="rng-chip down{{ ' fail' if _rg['floor_state'] == 1 else '' }}" title="OI floor {{ '%.2f'|format(_rg['floor']) }} (strike with the most Put OI, first scan today): {{ 'price is below it now' if _rg['floor_state'] == 2 else 'price crossed it earlier today and is back inside' }} ({{ '%+.2f'|format(_rg['floor_over_pct']) }}% beyond)">Breakdown &#9660;{{ ' (back inside)' if _rg['floor_state'] == 1 else '' }}</span>{% endif %}{% endif %}{% set _fs = alert.get("fut_spot") %}{% if _fs and _fs['fut_pct'] is not none and _fs['spot_pct'] is not none %}{% set _ld = _fs['lead_dir_pp'] or 0 %}<span class="fs-chip{{ ' up' if _ld >= 0.1 else (' down' if _ld <= -0.1 else '') }}" title="Nearest future ({{ _fs['expiry'] }}) {{ '%.2f'|format(_fs['fut_ltp']) }}, {{ '%+.2f'|format(_fs['fut_pct']) }}% vs prev close. Spot {{ '%.2f'|format(_fs['spot_ltp']) }}, {{ '%+.2f'|format(_fs['spot_pct']) }}%. Future premium over spot {{ '%+.2f'|format(_fs['premium_pct'] or 0) }}%. Future % minus spot % in the alert's direction: {{ '%+.2f'|format(_ld) }} pp (green = futures leading, red = lagging).">Fut {{ '%+.2f'|format(_fs['fut_pct']) }}% / Spot {{ '%+.2f'|format(_fs['spot_pct']) }}%</span>{% endif %}</span>
                     <span class="price-wrap"><span class="price">{{ (alert["trigger_price"] or "-")|inr }}</span>{% if alert.get("pct_change_today") is not none %}<span class="pct-change {{ 'pos' if alert['pct_change_today'] >= 0 else 'neg' }}">{{ "%+.2f"|format(alert["pct_change_today"]) }}%</span>{% endif %}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '{{ (alert['symbol'] or '')|escape }}')" title="Fetch live price">&#8635;</button>
                   </div>
                   {% if alert.get("volume") %}
@@ -733,7 +739,7 @@
       return `
         <div class="list-row${isConfirmed ? " confirmed" : ""}${isTripleConfirmed ? " triple-confirmed" : ""}" data-sector="${escapeHtml(a.sector || "Unclassified")}"${titleAttr}>
           <div class="row-top">
-            <span class="sym-wrap"><span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>${secChipHtml(a)}${dirChipHtml(a)}${moverChipHtml(a)}${oiChipHtml(a)}${rangeChipHtml(a)}</span>
+            <span class="sym-wrap"><span class="sym">${escapeHtml(a.symbol || "Unknown")}${confirmBadge}</span>${secChipHtml(a)}${dirChipHtml(a)}${moverChipHtml(a)}${oiChipHtml(a)}${rangeChipHtml(a)}${futChipHtml(a)}</span>
             <span class="price-wrap"><span class="price">${escapeHtml(String(inr(a.trigger_price || "-")))}</span>${pctBadge}</span><button class="btn-refresh-price" onclick="refreshLivePrice(this, '${escapeHtml(a.symbol || "")}')" title="Fetch live price">&#8635;</button>
           </div>
           ${volHtml}
@@ -775,6 +781,18 @@
       const up = m.type === "gain";
       const tip = (up ? "Top F&O gainer #" : "Top F&O loser #") + m.rank + " vs the previous close, as of " + (m.as_of || "");
       return `<span class="mv-chip ${up ? "pos" : "neg"}" title="${escapeHtml(tip)}">${up ? "&uarr;" : "&darr;"} #${m.rank} ${m.pct > 0 ? "+" : ""}${m.pct}%</span>`;
+    }
+
+    // Futures vs spot: nearest-expiry future % and spot % vs the previous close. Green = the future is moving more than spot
+    // in the alert's own direction (by 0.1 pp or more), red = less, grey = in line. The tooltip has the prices and premium.
+    function futChipHtml(a) {
+      const f = a.fut_spot;
+      if (!f || f.fut_pct === null || f.fut_pct === undefined || f.spot_pct === null || f.spot_pct === undefined) return "";
+      const ld = f.lead_dir_pp || 0, sg = v => (v > 0 ? "+" : "") + Number(v).toFixed(2);
+      const tip = "Nearest future (" + f.expiry + ") " + Number(f.fut_ltp).toFixed(2) + ", " + sg(f.fut_pct) + "% vs prev close. Spot " +
+        Number(f.spot_ltp).toFixed(2) + ", " + sg(f.spot_pct) + "%. Future premium over spot " + sg(f.premium_pct || 0) +
+        "%. Future % minus spot % in the alert's direction: " + sg(ld) + " pp (green = futures leading, red = lagging).";
+      return `<span class="fs-chip${ld >= 0.1 ? " up" : (ld <= -0.1 ? " down" : "")}" title="${escapeHtml(tip)}">Fut ${sg(f.fut_pct)}% / Spot ${sg(f.spot_pct)}%</span>`;
     }
 
     // OI ceiling/floor (strikes with the most Call / Put OI, from the OI Range logger): green = price is beyond it now,
@@ -922,7 +940,7 @@
     // Sort choice for the alert columns. "volume" = the server's order (Strong volume first);
     // "share" = highest 9:15 buy share first (selling share for Sell alerts), alerts with no
     // reading yet last, ties keeping the server order. Remembered in this browser.
-    const SORT_KEYS = ["share", "pressure", "oipct", "oirise", "breakout", "breakdown"];
+    const SORT_KEYS = ["share", "pressure", "oipct", "oirise", "breakout", "breakdown", "futpct", "futlead"];
     let sortMode = "volume";
     try { const sv = localStorage.getItem("rtt_dash_sort"); if (SORT_KEYS.indexOf(sv) >= 0) sortMode = sv; } catch (e) {}
     function shareOf(a) { return (a && a.fc && typeof a.fc.share === "number") ? a.fc.share : null; }
@@ -941,9 +959,13 @@
       const ov = which === "ceil" ? r.ceil_over_pct : r.floor_over_pct;
       return st * 100 + Math.min(ov || 0, 99);
     }
+    // Futures sorts. Futures % move: strongest in the alert's own direction first (Buy: highest, Sell: most negative).
+    // Futures lead: future % minus spot % in the alert's direction. Stocks with no future / quote go last.
+    function futPctKey(a) { const f = a && a.fut_spot; return (f && typeof f.fut_pct === "number") ? f.fut_pct * (a.category === "Sell" ? -1 : 1) : null; }
+    function futLeadKey(a) { const f = a && a.fut_spot; return (f && typeof f.lead_dir_pp === "number") ? f.lead_dir_pp : null; }
     function sortAlerts(list) {
       if (SORT_KEYS.indexOf(sortMode) < 0) return list;
-      const keyOf = { share: shareOf, pressure: pressureOf, oipct: oiPctOf, oirise: oiRiseOf, breakout: a => rangeKey(a, "ceil"), breakdown: a => rangeKey(a, "floor") }[sortMode];
+      const keyOf = { share: shareOf, pressure: pressureOf, oipct: oiPctOf, oirise: oiRiseOf, breakout: a => rangeKey(a, "ceil"), breakdown: a => rangeKey(a, "floor"), futpct: futPctKey, futlead: futLeadKey }[sortMode];
       return list.map((a, i) => [a, i]).sort((x, y) => {
         const sx = keyOf(x[0]), sy = keyOf(y[0]);
         if (sx === null && sy === null) return x[1] - y[1];
