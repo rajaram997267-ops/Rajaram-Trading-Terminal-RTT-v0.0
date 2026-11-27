@@ -260,6 +260,8 @@
     </div>
   </div>
 
+  <div id="gatePendingBox"></div>
+
   <h3 class="section-title">Live open positions</h3>
   <div id="openTradesContainer">
     {% if open_trades %}
@@ -590,6 +592,17 @@
         renderOpenTrades(data.open);
         renderClosedTrades(data.closed);
         renderFailedTrades(data.failed);
+        (function () {
+          const box = document.getElementById("gatePendingBox");
+          const p = data.pending || [];
+          box.innerHTML = p.map(x => {
+            const secs = x.gate_deadline ? Math.max(0, Math.round(x.gate_deadline - Date.now() / 1000)) : 0;
+            return '<div class="empty" style="border:1px solid var(--muted); margin-bottom:8px;">' +
+              '<b>' + x.symbol + '</b> (' + x.direction + ') - LIVE PENDING (Case ' + (x.gate_mode || '1') + '): waiting for the stock to ' +
+              (x.gate_mode === '2' ? 'recover and continue ' : 'move ') + (x.direction === "Buy" ? "up" : "down") + ' from ' + x.gate_ref_spot +
+              (x.gate_worst_pct ? ' (deepest dip ' + x.gate_worst_pct.toFixed(2) + '%)' : '') + ' - ' + secs + 's left</div>';
+          }).join("");
+        })();
         if (data.live_available_funds !== undefined) {
           document.getElementById("statLiveFunds").textContent =
             data.live_available_funds === null ? "-" : inr(data.live_available_funds);

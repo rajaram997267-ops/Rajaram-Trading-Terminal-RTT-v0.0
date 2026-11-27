@@ -270,6 +270,39 @@
   </div>
 
   <div class="settings-box">
+    <label class="switch">
+      <input type="checkbox" id="gateEnabled" {% if live_gate_enabled %}checked{% endif %} onchange="saveLiveGate()">
+      <span class="slider"></span>
+    </label>
+    <span>Live Confirmation Gate (paper trade must prove direction first)</span>
+    <div style="margin-top:8px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;">
+      <span>Gate mode:</span>
+      <select id="gateMode" onchange="saveLiveGate()">
+        <option value="1" {% if live_gate_mode == "1" %}selected{% endif %}>Case 1 - direct (move against = skip live)</option>
+        <option value="2" {% if live_gate_mode == "2" %}selected{% endif %}>Case 2 - allow pullback, enter when it recovers</option>
+      </select>
+      <span>Case 2 max pullback:</span>
+      <select id="gatePullback" onchange="saveLiveGate()"><option value="0.2" {% if live_gate_pullback_pct == 0.2 %}selected{% endif %}>0.2%</option><option value="0.3" {% if live_gate_pullback_pct == 0.3 %}selected{% endif %}>0.3%</option><option value="0.5" {% if live_gate_pullback_pct == 0.5 %}selected{% endif %}>0.5%</option><option value="0.75" {% if live_gate_pullback_pct == 0.75 %}selected{% endif %}>0.75%</option><option value="1.0" {% if live_gate_pullback_pct == 1.0 %}selected{% endif %}>1.0%</option><option value="1.5" {% if live_gate_pullback_pct == 1.5 %}selected{% endif %}>1.5%</option></select>
+      <span>Case 2 wait up to:</span>
+      <select id="gateWindow2" onchange="saveLiveGate()"><option value="3" {% if live_gate_window2_min == 3 %}selected{% endif %}>3 min</option><option value="5" {% if live_gate_window2_min == 5 %}selected{% endif %}>5 min</option><option value="10" {% if live_gate_window2_min == 10 %}selected{% endif %}>10 min</option><option value="15" {% if live_gate_window2_min == 15 %}selected{% endif %}>15 min</option><option value="20" {% if live_gate_window2_min == 20 %}selected{% endif %}>20 min</option><option value="30" {% if live_gate_window2_min == 30 %}selected{% endif %}>30 min</option></select>
+      <span>Confirm when stock moves in favour (from paper entry) by:</span>
+      <select id="gateMove" onchange="saveLiveGate()"><option value="0" {% if live_gate_move_pct == 0 %}selected{% endif %}>Any move in direction</option><option value="0.05" {% if live_gate_move_pct == 0.05 %}selected{% endif %}>0.05%</option><option value="0.1" {% if live_gate_move_pct == 0.1 %}selected{% endif %}>0.1%</option><option value="0.15" {% if live_gate_move_pct == 0.15 %}selected{% endif %}>0.15%</option><option value="0.2" {% if live_gate_move_pct == 0.2 %}selected{% endif %}>0.2%</option><option value="0.3" {% if live_gate_move_pct == 0.3 %}selected{% endif %}>0.3%</option><option value="0.5" {% if live_gate_move_pct == 0.5 %}selected{% endif %}>0.5%</option></select>
+      <span>Case 1 wait up to:</span>
+      <select id="gateWindow" onchange="saveLiveGate()"><option value="1" {% if live_gate_window_min == 1 %}selected{% endif %}>1 min</option><option value="2" {% if live_gate_window_min == 2 %}selected{% endif %}>2 min</option><option value="3" {% if live_gate_window_min == 3 %}selected{% endif %}>3 min</option><option value="5" {% if live_gate_window_min == 5 %}selected{% endif %}>5 min</option><option value="10" {% if live_gate_window_min == 10 %}selected{% endif %}>10 min</option></select>
+      <span>Live contract:</span>
+      <select id="gateCase" onchange="saveLiveGate()">
+        <option value="1" {% if live_gate_contract_case == "1" %}selected{% endif %}>Same strike as paper</option>
+        <option value="2" {% if live_gate_contract_case == "2" %}selected{% endif %}>Fresh ATM strike at approval</option>
+      </select>
+      <span>Skip if option premium already up more than:</span>
+      <select id="gateChase" onchange="saveLiveGate()"><option value="0" {% if live_gate_max_chase_pct == 0 %}selected{% endif %}>Off</option><option value="3" {% if live_gate_max_chase_pct == 3 %}selected{% endif %}>3%</option><option value="5" {% if live_gate_max_chase_pct == 5 %}selected{% endif %}>5%</option><option value="8" {% if live_gate_max_chase_pct == 8 %}selected{% endif %}>8%</option><option value="10" {% if live_gate_max_chase_pct == 10 %}selected{% endif %}>10%</option></select>
+    </div>
+    <span class="token-status" id="gateStatus" style="display:block; margin-top:6px;">
+      When ON, a paper trade opens as usual but the LIVE order waits. Buy/CE: the stock must rise, Sell/PE: fall, by the chosen % from the paper entry spot within the window. Moves against the trade, or no move (sideways) by the deadline, skip the live trade (reason shown under Failed live entries). Case 1: a move against the trade skips live. Case 2: a dip (the stock "breathing") is tolerated down to the max pullback; live enters once price recovers and moves in favour by the chosen % from the paper entry spot, and is skipped if the dip goes deeper or no recovery comes in time. Contract: "same strike" has the premium cap applied; "fresh ATM" does not. Applies from the next trade.
+    </span>
+  </div>
+
+  <div class="settings-box">
     <span>Live entry mode:</span>
     <select id="liveEntryModeSelect" onchange="saveLiveEntryMode()">
       <option value="SL" {% if live_entry_mode == "SL" %}selected{% endif %}>SL - direct entry + separate Stop-Loss Limit order (default, battle-tested)</option>
@@ -1136,6 +1169,34 @@
           : (result.message || "Failed to save");
       } catch (err) {
         statusEl.textContent = "Failed to update - see console";
+        console.error(err);
+      }
+    }
+
+    async function saveLiveGate() {
+      const statusEl = document.getElementById("gateStatus");
+      try {
+        const res = await fetch("/api/live-gate/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            enabled: document.getElementById("gateEnabled").checked,
+            move_pct: parseFloat(document.getElementById("gateMove").value),
+            window_min: parseFloat(document.getElementById("gateWindow").value),
+            max_chase_pct: parseFloat(document.getElementById("gateChase").value),
+            contract_case: document.getElementById("gateCase").value,
+            mode: document.getElementById("gateMode").value,
+            pullback_pct: parseFloat(document.getElementById("gatePullback").value),
+            window2_min: parseFloat(document.getElementById("gateWindow2").value),
+          }),
+        });
+        const r = await res.json();
+        statusEl.textContent = res.ok
+          ? "Saved - gate " + (r.enabled ? "ON" : "OFF") + ", confirm at " + (r.move_pct === 0 ? "any move" : r.move_pct + "%") +
+            " within " + r.window_min + " min, chase cap " + (r.max_chase_pct === 0 ? "off" : r.max_chase_pct + "%") + ". Applies from the next trade."
+          : (r.message || "Failed to save");
+      } catch (err) {
+        statusEl.textContent = "Failed to save - see console";
         console.error(err);
       }
     }
