@@ -12159,6 +12159,122 @@ def api_alert_stats():
                     "rows": [{k: v for k, v in r.items() if k != "_sort"} for r in rows], "summary": summ})
 
 
+@app.route("/api/alert-stats-range")
+def api_alert_stats_range():
+    """Multi-day monitoring. ?days=N (last N weekdays up to today) &top=5|10|15|20|30.
+    Per alert type: distinct stock-days alerted, and how many of them were among that day's Top N movers
+    in the alert's direction (Buy -> gainers, Sell -> losers). Past days use the stored end-of-day ranking
+    (built in the background if missing); today uses the live Top 10."""
+    try:
+        days = min(60, max(1, int(request.args.get("days", 10))))
+        top = int(request.args.get("top", 10))
+    except ValueError:
+        return jsonify({"error": "days and top must be numbers"}), 400
+    if top not in (5, 10, 15, 20, 30):
+        top = 10
+    today = _ist_today_str()
+    dates, d = [], datetime.strptime(today, "%Y-%m-%d")
+    while len(dates) < days:
+        if d.weekday() < 5:
+            dates.append(d.strftime("%Y-%m-%d"))
+        d -= timedelta(days=1)
+    dates.sort()
+    try:
+        alerts_by_date = {dt: _alerts_for_ist_date(dt) for dt in dates}
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    alert_dates = [dt for dt in dates if alerts_by_date[dt]]
+    token = get_setting("upstox_access_token")
+    ranks: dict = {}          # date -> {"gain": {sym: rank}, "lose": {sym: rank}, "limit": N}
+    missing: list = []
+    state, universe = "ok", 0
+    past = [dt for dt in alert_dates if dt != today]
+    if past:
+        with get_db() as conn:
+            counts = {r["date"]: r["n"] for r in conn.execute(
+                "SELECT date, COUNT(*) AS n FROM fno_daily_change WHERE date >= ? AND date <= ? GROUP BY date",
+                (past[0], past[-1])).fetchall()}
+            have = [dt for dt in past if counts.get(dt, 0) >= 150]
+            for dt in have:
+                rows = conn.execute("SELECT symbol, pct FROM fno_daily_change WHERE date = ? AND pct IS NOT NULL",
+                                    (dt,)).fetchall()
+                data = [(r["symbol"], float(r["pct"])) for r in rows]
+                universe = max(universe, len(data))
+                g = sorted((x for x in data if x[1] > 0), key=lambda x: -x[1])[:top]
+                l = sorted((x for x in data if x[1] < 0), key=lambda x: x[1])[:top]
+                ranks[dt] = {"gain": {s: i for i, (s, _p) in enumerate(g, 1)},
+                             "lose": {s: i for i, (s, _p) in enumerate(l, 1)}, "limit": top}
+        missing = [dt for dt in past if dt not in ranks]
+        if missing:
+            if not token:
+                state = "no_token"
+            else:
+                with _fno_rank_lock:
+                    free = _fno_rank_state["state"] != "running"
+                    if free:
+                        _fno_rank_state.update(state="running", done=0, total=0, error=None)
+                if free:
+                    threading.Thread(target=_fno_rank_worker, args=(token, missing[0], list(missing)), daemon=True).start()
+                state = "ranking"
+    note_parts = []
+    if today in alert_dates:
+        snap = get_fno_movers_cached(token)
+        if snap and snap.get("status") == "ok":
+            ranks[today] = {"gain": {m["symbol"]: m["rank"] for m in snap.get("gainers", []) if m["rank"] <= top},
+                            "lose": {m["symbol"]: m["rank"] for m in snap.get("losers", []) if m["rank"] <= top},
+                            "limit": min(top, 10)}
+            universe = universe or snap.get("universe", 0)
+            if top > 10:
+                note_parts.append("Today only has the live Top 10, so today counts hits within Top 10")
+        else:
+            missing.append(today)
+            note_parts.append("Today's live movers are unavailable, so today is left out")
+    types: dict = {}
+    for dt in alert_dates:
+        if dt not in ranks:
+            continue
+        rk = ranks[dt]
+        seen: dict = {}
+        for a in alerts_by_date[dt]:
+            sym = (a.get("symbol") or "").strip().upper()
+            name = (a.get("alert_name") or a.get("scan_name") or "").strip() or "(unnamed)"
+            cat = categorize(a)
+            t = types.setdefault(name, {"alert_type": name, "category": cat, "alerts": 0, "stock_days": 0,
+                                        "hit": 0, "opp": 0, "per_date": {}, "active": set()})
+            t["alerts"] += 1
+            if (name, sym) in seen:
+                continue
+            seen[(name, sym)] = True
+            t["stock_days"] += 1
+            t["active"].add(dt)
+            pd = t["per_date"].setdefault(dt, [0, 0])
+            pd[0] += 1
+            if cat in ("Buy", "Sell"):
+                same = rk["gain"].get(sym) if cat == "Buy" else rk["lose"].get(sym)
+                opposite = rk["lose"].get(sym) if cat == "Buy" else rk["gain"].get(sym)
+                if same:
+                    t["hit"] += 1
+                    pd[1] += 1
+                elif opposite:
+                    t["opp"] += 1
+    out = []
+    for t in types.values():
+        directional = t["category"] in ("Buy", "Sell")
+        out.append({"alert_type": t["alert_type"], "category": t["category"], "active_days": len(t["active"]),
+                    "alerts": t["alerts"], "stock_days": t["stock_days"], "hit": t["hit"] if directional else None,
+                    "opp": t["opp"] if directional else None,
+                    "hit_pct": round(t["hit"] / t["stock_days"] * 100, 1) if directional and t["stock_days"] else None,
+                    "per_date": t["per_date"]})
+    out.sort(key=lambda x: -x["stock_days"])
+    baseline = round(top / universe * 100, 1) if universe else None
+    if state == "ranking":
+        note_parts.append("Building the end-of-day ranking for " + ", ".join(missing) + " (about a minute) - refreshing...")
+    elif state == "no_token":
+        note_parts.append("No Upstox token saved, so " + ", ".join(missing) + " can't be ranked and are left out")
+    return jsonify({"state": state, "top": top, "days": days, "dates": dates, "ranked_dates": sorted(ranks),
+                    "missing_dates": missing, "baseline_pct": baseline, "note": ". ".join(note_parts), "types": out})
+
+
 @app.route("/alert-stats")
 def alert_stats_page():
     return render_template("alert_stats.html", active_tab="alert_stats", date=_ist_today_str())
