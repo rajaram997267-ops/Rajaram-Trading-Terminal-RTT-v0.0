@@ -12047,6 +12047,123 @@ def api_first_candle_backfill():
     return jsonify(dict(_fc_backfill))
 
 
+# =============================================================================
+# Alert Stats: every alert of one day, one row per alert (same stock from two scans =
+# two rows), with its alert type, alert time (IST) and where the stock stands among the
+# F&O movers. Read-only: nothing here touches paper or live trading.
+#   Today      -> the live Top-10 gainers/losers snapshot (same source as First Candle).
+#   Past days  -> the stored end-of-day ranking (fno_daily_change); built in the
+#                 background with the same job the Top movers study uses if missing.
+# =============================================================================
+def _alert_time_ist(created_at: str) -> datetime | None:
+    """alerts.created_at is UTC (isoformat, normally without a zone) -> naive IST."""
+    try:
+        dt = datetime.fromisoformat(created_at)
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is not None:
+        return (dt - dt.utcoffset()).replace(tzinfo=None) + IST_OFFSET
+    return dt + IST_OFFSET
+
+
+def _alert_stats_ranks_for_past_day(date_str: str, token: str | None):
+    """({symbol: {type, rank, pct}}, universe, state) for a past day. state: ok | ranking | no_token."""
+    def load():
+        with get_db() as conn:
+            rows = conn.execute("SELECT symbol, pct FROM fno_daily_change WHERE date = ? AND pct IS NOT NULL",
+                                (date_str,)).fetchall()
+        return [(r["symbol"], float(r["pct"])) for r in rows]
+    data = load()
+    if len(data) < 150:
+        if not token:
+            return {}, 0, "no_token"
+        with _fno_rank_lock:
+            free = _fno_rank_state["state"] != "running"
+            if free:
+                _fno_rank_state.update(state="running", done=0, total=0, error=None)
+        if free:
+            threading.Thread(target=_fno_rank_worker, args=(token, date_str, [date_str]), daemon=True).start()
+        return {}, 0, "ranking"
+    gainers = sorted((d for d in data if d[1] > 0), key=lambda x: -x[1])
+    losers = sorted((d for d in data if d[1] < 0), key=lambda x: x[1])
+    out = {}
+    for i, (sym, pct) in enumerate(gainers, 1):
+        out[sym] = {"type": "gain", "rank": i, "pct": round(pct, 2)}
+    for i, (sym, pct) in enumerate(losers, 1):
+        out[sym] = {"type": "lose", "rank": i, "pct": round(pct, 2)}
+    return out, len(data), "ok"
+
+
+@app.route("/api/alert-stats")
+def api_alert_stats():
+    date_str = request.args.get("date") or _ist_today_str()
+    try:
+        datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return jsonify({"error": "date must be YYYY-MM-DD"}), 400
+    try:
+        alerts = _alerts_for_ist_date(date_str)
+    except (psycopg2.Error, RuntimeError):
+        return jsonify({"error": "database unavailable"}), 503
+    token = get_setting("upstox_access_token")
+    is_today = date_str == _ist_today_str()
+    movers_map: dict = {}
+    movers_state, movers_note = "ok", ""
+    if is_today:
+        data = get_fno_movers_cached(token)
+        if data and data.get("status") == "ok":
+            for g in data.get("gainers", []):
+                movers_map[g["symbol"]] = {"type": "gain", "rank": g["rank"], "pct": g["pct"]}
+            for l in data.get("losers", []):
+                movers_map[l["symbol"]] = {"type": "lose", "rank": l["rank"], "pct": l["pct"]}
+            movers_note = f"Live Top 10 as of {data.get('as_of')} (refreshes every 5 min)"
+        else:
+            movers_state = "unavailable"
+            movers_note = "Live movers unavailable (no Upstox token, or not computed yet)"
+    else:
+        movers_map, universe, movers_state = _alert_stats_ranks_for_past_day(date_str, token)
+        movers_note = {"ok": f"End-of-day ranking of {universe} F&O stocks",
+                       "ranking": "Building the day's ranking from Upstox daily candles (about a minute) - refreshing...",
+                       "no_token": "No Upstox token saved, so this day's ranking can't be built"}[movers_state]
+    rows = []
+    for a in alerts:
+        sym = (a.get("symbol") or "").strip().upper()
+        t_ist = _alert_time_ist(a.get("created_at"))
+        cat = categorize(a)
+        m = movers_map.get(sym)
+        agrees = None
+        if m and cat in ("Buy", "Sell"):
+            agrees = (m["type"] == "gain") == (cat == "Buy")
+        rows.append({"symbol": sym, "alert_type": (a.get("alert_name") or a.get("scan_name") or "").strip(),
+                     "category": cat, "time": t_ist.strftime("%H:%M:%S") if t_ist else "",
+                     "_sort": t_ist.isoformat() if t_ist else "", "mover": m, "agrees": agrees})
+    rows.sort(key=lambda r: r["_sort"])
+    summary: dict = {}
+    for r in rows:
+        s = summary.setdefault(r["alert_type"] or "(unnamed)", {"alert_type": r["alert_type"] or "(unnamed)",
+                               "category": r["category"], "alerts": 0, "symbols": set(),
+                               "top10_same_dir": set(), "top10_opposite": set()})
+        s["alerts"] += 1
+        s["symbols"].add(r["symbol"])
+        if r["mover"] and r["mover"]["rank"] <= 10 and r["agrees"] is not None:
+            (s["top10_same_dir"] if r["agrees"] else s["top10_opposite"]).add(r["symbol"])
+    summ = []
+    for s in summary.values():
+        n = len(s["symbols"])
+        summ.append({"alert_type": s["alert_type"], "category": s["category"], "alerts": s["alerts"], "stocks": n,
+                     "top10_same": len(s["top10_same_dir"]), "top10_opposite": len(s["top10_opposite"]),
+                     "top10_same_pct": round(len(s["top10_same_dir"]) / n * 100, 1) if n else 0})
+    summ.sort(key=lambda x: -x["alerts"])
+    return jsonify({"date": date_str, "is_today": is_today, "movers_state": movers_state, "movers_note": movers_note,
+                    "total_alerts": len(rows), "unique_stocks": len({r["symbol"] for r in rows}),
+                    "rows": [{k: v for k, v in r.items() if k != "_sort"} for r in rows], "summary": summ})
+
+
+@app.route("/alert-stats")
+def alert_stats_page():
+    return render_template("alert_stats.html", active_tab="alert_stats", date=_ist_today_str())
+
+
 @app.route("/first-candle")
 def first_candle_page():
     return render_template("first_candle.html", active_tab="first_candle", date=_ist_today_str())
