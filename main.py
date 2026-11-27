@@ -915,6 +915,13 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_exit_rsi DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS mae_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_mae_pct DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_ref_spot DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_ref_premium DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_deadline DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_result TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_mode TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_worst_pct DOUBLE PRECISION",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_decision_spot DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS planned_risk_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS live_planned_risk_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS entry_volume_label TEXT",
@@ -1531,7 +1538,7 @@ def create_paper_trades_for_batch(data: dict) -> None:
 
     with get_db() as conn:
         already_open = conn.execute(
-            "SELECT id FROM paper_trades WHERE status = 'OPEN' OR live_status = 'OPEN' LIMIT 1"
+            "SELECT id FROM paper_trades WHERE status = 'OPEN' OR live_status IN ('OPEN', 'PENDING', 'ENTERING') LIMIT 1"
         ).fetchone()
     if already_open:
         _record_batch_skip(data, category, "A trade is already open")
@@ -1901,6 +1908,490 @@ def api_entry_rule():
                     "log": list(reversed(_entry_rule_log))})
 
 
+# ---------------------------------------------------------------------------
+# Live Confirmation Gate
+# ---------------------------------------------------------------------------
+# The paper trade opens instantly as always. With the gate ON, the LIVE order
+# is parked (live_status = 'PENDING') and only released if the UNDERLYING
+# stock moves in the trade's direction (Buy/CE: up, Sell/PE: down) by the
+# chosen % within the chosen window. Adverse move, no move by the deadline, or
+# an option premium that already ran too far => live is skipped (recorded as
+# FAILED with a "Gate:" reason; gate_result = REJECTED/EXPIRED). Paper trade,
+# paper exits and every strategy are untouched.
+
+def get_live_gate_enabled() -> bool:
+    return get_setting("live_gate_enabled", "0") == "1"
+
+
+def _gate_float(key: str, default: float, lo: float, hi: float) -> float:
+    try:
+        v = float(get_setting(key, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return min(hi, max(lo, v))
+
+
+def get_live_gate_move_pct() -> float:
+    """Favourable spot move (%) needed to confirm. 0 = 'any move in direction'."""
+    return _gate_float("live_gate_move_pct", 0.2, 0.0, 5.0)
+
+
+def get_live_gate_window_min() -> float:
+    return _gate_float("live_gate_window_min", 3.0, 0.5, 30.0)
+
+
+def get_live_gate_mode() -> str:
+    """Gate mode. '1' = Direct confirmation (adverse move => reject).
+    '2' = Pullback-and-recover (adverse 'breathing' is tolerated; live enters
+    only when price comes back and continues in the trade's direction)."""
+    return "2" if get_setting("live_gate_mode", "1") == "2" else "1"
+
+
+def get_live_gate_pullback_pct() -> float:
+    """Case 2: deepest adverse spot move (%) tolerated before the trade is
+    treated as failed and live is skipped."""
+    return _gate_float("live_gate_pullback_pct", 0.5, 0.1, 5.0)
+
+
+def get_live_gate_window2_min() -> float:
+    """Case 2: how long to wait for the dip-and-recover (longer than Case 1)."""
+    return _gate_float("live_gate_window2_min", 10.0, 1.0, 60.0)
+
+
+def get_live_gate_contract_case() -> str:
+    """Contract choice - "1" (default): live buys the SAME strike paper bought (ATM at paper-entry spot).
+    "2": live buys a FRESH ATM strike chosen from the spot at approval time."""
+    return "2" if get_setting("live_gate_contract_case", "1") == "2" else "1"
+
+
+def get_live_gate_max_chase_pct() -> float:
+    """Skip live if the option premium has already risen this % above the paper
+    entry premium by the time confirmation arrives. 0 = check off."""
+    return _gate_float("live_gate_max_chase_pct", 5.0, 0.0, 100.0)
+
+
+def _gate_defer_live_entry(trade_id: int, symbol: str, category: str, price_val: float,
+                           spot_entry_price, premium) -> None:
+    ref_spot = spot_entry_price if spot_entry_price else price_val
+    mode = get_live_gate_mode()
+    window = get_live_gate_window2_min() if mode == "2" else get_live_gate_window_min()
+    deadline = time.time() + window * 60
+    way = 'up' if category == 'Buy' else 'down'
+    note = (f"Gate (Case 2): waiting for pullback to recover and continue {way}" if mode == "2"
+            else f"Gate (Case 1): waiting for {way} confirmation")
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE paper_trades SET live_status = 'PENDING', gate_ref_spot = ?, gate_ref_premium = ?, "
+            "gate_deadline = ?, gate_mode = ?, gate_worst_pct = 0, live_error = ? WHERE id = ?",
+            (ref_spot, premium if premium and premium > 0 else None, deadline, mode, note, trade_id),
+        )
+        conn.commit()
+
+
+def _gate_finish(trade_id: int, result: str, reason: str, spot) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE paper_trades SET live_status = 'FAILED', live_error = ?, gate_result = ?, "
+            "gate_decision_spot = ? WHERE id = ? AND live_status = 'PENDING'",
+            (f"Gate {result.lower()}: {reason}", result, spot, trade_id),
+        )
+        conn.commit()
+
+
+def process_live_gate_pending() -> None:
+    """Called every exit-check pass. Cheap no-op when nothing is PENDING.
+
+    Case 1 (direct): favourable move >= buffer => approve; adverse move >= buffer => reject.
+    Case 2 (pullback-and-recover): a dip against the trade is tolerated (price is
+    'breathing') down to the pullback limit; approve once price comes back and
+    continues in the trade's direction (favourable move >= buffer from the paper
+    entry spot); reject only if the dip exceeds the pullback limit."""
+    with get_db() as conn:
+        pending = [dict(r) for r in conn.execute(
+            "SELECT * FROM paper_trades WHERE live_status = 'PENDING'").fetchall()]
+    if not pending:
+        return
+    access_token = get_setting("upstox_access_token")
+    move = get_live_gate_move_pct()
+    pullback = get_live_gate_pullback_pct()
+    for t in pending:
+        tid, symbol, category = t["id"], t["symbol"], t["direction"]
+        mode = t.get("gate_mode") or "1"
+        try:
+            if t.get("status") != "OPEN":
+                _gate_finish(tid, "EXPIRED", "paper trade closed before confirmation", None)
+                continue
+            ref = t.get("gate_ref_spot")
+            spot = None
+            if access_token and ref:
+                key = get_instrument_key(symbol)
+                spot = get_ltp_with_retry(key, access_token, retries=1) if key else None
+            worst = t.get("gate_worst_pct") or 0.0
+            if spot and ref:
+                fav = (spot - ref) / ref * 100.0 * (1 if category == "Buy" else -1)
+                confirm_at = move if move > 0 else 0.02
+                if fav < worst:  # deepest dip so far (negative number), kept for the record
+                    worst = fav
+                    with get_db() as conn:
+                        conn.execute("UPDATE paper_trades SET gate_worst_pct = ? WHERE id = ?", (worst, tid))
+                        conn.commit()
+                if mode == "2":
+                    if fav <= -pullback:
+                        _gate_finish(tid, "REJECTED",
+                                     f"pullback went {fav:+.2f}% against the trade, beyond the {pullback:g}% limit "
+                                     f"(paper entry {ref:g}) - trend failed", spot)
+                        continue
+                else:
+                    reject_at = move if move > 0 else 0.05
+                    if fav <= -reject_at:
+                        _gate_finish(tid, "REJECTED",
+                                     f"spot moved against the trade ({fav:+.2f}% vs paper entry {ref:g})", spot)
+                        continue
+                if fav >= confirm_at:
+                    _gate_release(t, spot, fav, access_token)
+                    continue
+            if t.get("gate_deadline") and time.time() >= t["gate_deadline"]:
+                win = get_live_gate_window2_min() if mode == "2" else get_live_gate_window_min()
+                what = "no recovery and continuation" if mode == "2" else "no confirmation"
+                _gate_finish(tid, "EXPIRED",
+                             f"{what} {'up' if category == 'Buy' else 'down'} within the window "
+                             f"(deepest dip {worst:+.2f}%)", spot)
+        except Exception as e:
+            print(f"[live-gate] trade {tid} error: {e}")
+
+
+def _gate_release(t: dict, spot: float, fav: float, access_token: str) -> None:
+    """Direction confirmed: revalidate, then hand over to the existing live entry."""
+    tid, symbol, category = t["id"], t["symbol"], t["direction"]
+    with get_db() as conn:  # atomic claim so a trade is never released twice
+        claimed = conn.execute(
+            "UPDATE paper_trades SET live_status = 'ENTERING', gate_result = 'APPROVED', "
+            "gate_decision_spot = ? WHERE id = ? AND live_status = 'PENDING' RETURNING id",
+            (spot, tid)).fetchone()
+        conn.commit()
+    if not claimed:
+        return
+    try:
+        if not get_live_trading_enabled():
+            return _mark_live_failed(tid, "Gate approved but live trading was switched off meanwhile")
+        opt_type = "CE" if category == "Buy" else "PE"
+        # Same contract paper bought: strike chosen from the ENTRY spot, not the moved one.
+        if get_live_gate_contract_case() == "2":
+            option = get_atm_option(symbol, opt_type, spot)  # Case 2: fresh ATM at approval spot
+        else:
+            option = get_atm_option(symbol, opt_type, t.get("gate_ref_spot") or t.get("spot_entry_price") or spot)  # Case 1
+        if not option:
+            return _mark_live_failed(tid, f"Gate approved but no {opt_type} option chain data found for {symbol}")
+        premium = get_ltp_with_retry(option["instrument_key"], access_token)
+        if not premium or premium <= 0:
+            return _mark_live_failed(tid, f"Gate approved but could not fetch option premium for {symbol} {opt_type}")
+        ref_prem, max_chase = t.get("gate_ref_premium"), get_live_gate_max_chase_pct()
+        if ref_prem and max_chase > 0 and get_live_gate_contract_case() == "1":
+            chase = (premium - ref_prem) / ref_prem * 100.0
+            if chase > max_chase:
+                _gate_finish_force(tid, f"premium already up {chase:.1f}% from paper entry "
+                                        f"({ref_prem:g} -> {premium:g}), limit {max_chase:g}% - not chasing", spot)
+                return
+        with get_db() as conn:  # funds/lots/duplicate protections live inside _execute_live_entry
+            conn.execute("UPDATE paper_trades SET live_error = NULL WHERE id = ?", (tid,))
+            conn.commit()
+        _execute_live_entry(tid, symbol, category, t.get("spot_entry_price") or spot,
+                            t.get("strategy"), t.get("entry_rsi"), option, premium)
+    except Exception as e:
+        _mark_live_failed(tid, f"Gate approved but live entry errored: {e}")
+
+
+def _gate_finish_force(trade_id: int, reason: str, spot) -> None:
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE paper_trades SET live_status = 'FAILED', live_error = ?, gate_result = 'REJECTED', "
+            "gate_decision_spot = ? WHERE id = ?",
+            (f"Gate rejected: {reason}", spot, trade_id))
+        conn.commit()
+
+
+def _execute_live_entry(trade_id: int, symbol: str, category: str, price_val: float,
+                        entry_strategy, entry_rsi_val, option, premium) -> None:
+    """The live-order half of a trade entry (option lookup, funds/lot sizing,
+    entry order, broker-side SL/GTT). Unchanged logic - lifted out of
+    open_trade_for_symbol() so the Live Confirmation Gate can run it LATER
+    (once the paper trade has proven the direction) instead of instantly."""
+    opt_type = "CE" if category == "Buy" else "PE"
+    access_token = get_setting("upstox_access_token")
+    if not access_token:
+        _mark_live_failed(trade_id, "Live trading is on but no Upstox access token is saved")
+    else:
+        # Reuse the SAME option lookup + quote the paper trade just
+        # used a few lines up, instead of calling get_atm_option/
+        # get_ltp_with_retry a second time for the identical
+        # contract. That redundant second call was a real, provable
+        # source of paper-vs-live entry price drift (two quotes
+        # fetched moments apart can simply differ) on top of the
+        # real market-order fill slippage that's inherent to live
+        # execution and can't be removed - see the paper-vs-live
+        # entry price discussion. Only fall back to a fresh lookup
+        # here if paper didn't already get a usable one (e.g. paper
+        # fell back to equity because no option chain was found).
+        live_option = option if (option and premium and premium > 0) else get_atm_option(symbol, opt_type, price_val)
+        if not live_option:
+            _mark_live_failed(trade_id, f"No {opt_type} option chain data found for {symbol} (nearest monthly expiry)")
+        else:
+            option = live_option
+            live_premium = premium if (option and premium and premium > 0) else get_ltp_with_retry(option["instrument_key"], access_token)
+            if not live_premium or live_premium <= 0:
+                _mark_live_failed(trade_id, f"Could not fetch option premium for {symbol} {opt_type}")
+            else:
+                premium = live_premium
+                available_funds = get_upstox_available_funds(access_token)
+                if available_funds is None:
+                    _mark_live_failed(trade_id, "Could not fetch available Upstox funds - live order skipped")
+                else:
+                    lot_size = option["lot_size"]
+                    lots = int((available_funds * get_live_funds_use_pct() / 100.0) // (premium * lot_size))  # buffer: market fill can be above the quoted premium
+                    label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
+                    if lots < 1:
+                        _mark_live_failed(
+                            trade_id,
+                            f"Available funds (Rs {fmt_inr(available_funds, 2)}) not enough for 1 lot "
+                            f"({lot_size} qty) of {label} at premium Rs {fmt_inr(premium)}",
+                            live_quantity=0,
+                        )
+                    else:
+                        live_quantity = lots * lot_size
+                        label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
+
+                        if get_live_entry_mode() == "GTT" and entry_strategy not in ("RSI_MOMENTUM", "CAMARILLA_LADDER", "FIRST5MIN_FIB", "SUPERTREND"):
+                            # GTT mode: entry AND trailing stop-loss are
+                            # ONE combined order - Upstox's engine
+                            # places the entry when the ENTRY leg fires
+                            # (IMMEDIATE = right away) and then trails
+                            # the STOPLOSS leg itself via trailing_gap,
+                            # entirely server-side. See
+                            # get_live_entry_mode()'s docstring for why
+                            # this can't just be "attach a stop to an
+                            # existing position" - the entry itself has
+                            # to be part of the same GTT.
+                            gap_mode = get_gtt_trailing_gap_mode()
+                            gap_value = get_gtt_trailing_gap_value()
+                            raw_gap = premium * (gap_value / 100) if gap_mode == "percent" else gap_value
+                            # Both the trigger AND the gap need to be
+                            # tick-aligned - the gap defines the
+                            # increments the trigger will move by as
+                            # Upstox trails it, so a non-tick-aligned
+                            # gap could just push the same rejection
+                            # further down the line on the first trail
+                            # update instead of at placement time.
+                            trailing_gap = max(0.05, _round_to_tick(raw_gap))
+                            stop_trigger = _round_to_tick(premium * 0.98)
+                            entry_trigger = _round_to_tick(premium)
+
+                            gtt_result = place_gtt_order(
+                                option["instrument_key"], "BUY", live_quantity, "D",
+                                rules=[
+                                    {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": entry_trigger},
+                                    {
+                                        "strategy": "STOPLOSS", "trigger_type": "IMMEDIATE",
+                                        "trigger_price": stop_trigger, "trailing_gap": trailing_gap,
+                                    },
+                                ],
+                                access_token=access_token,
+                            )
+
+                            if not gtt_result["ok"]:
+                                with get_db() as conn:
+                                    conn.execute(
+                                        """
+                                        UPDATE paper_trades
+                                        SET live_status = 'FAILED', live_error = ?, live_quantity = ?,
+                                            live_option_label = ?
+                                        WHERE id = ?
+                                        """,
+                                        (f"GTT entry+stop placement failed: {gtt_result['error']}", live_quantity, label, trade_id),
+                                    )
+                                    conn.commit()
+                            else:
+                                # The GTT's ENTRY leg fires asynchronously
+                                # even with IMMEDIATE trigger - there's
+                                # no synchronous fill confirmation the way
+                                # a direct order gives one. Best-effort
+                                # attempt to read a fill price back from
+                                # the GTT's own details; if the response
+                                # shape doesn't expose one cleanly (this
+                                # hasn't been verified against a real
+                                # filled GTT leg yet), fall back to the
+                                # reference premium and flag it clearly
+                                # rather than silently guess at a wrong
+                                # field name.
+                                gtt_details = get_gtt_order_details(gtt_result["gtt_order_id"], access_token)
+                                live_entry_price = premium
+                                gtt_note = (
+                                    "GTT entry+trailing-stop placed - fill price not yet independently "
+                                    "confirmed from GTT order details (using reference premium until verified); "
+                                    "check this trade's actual fill in your Upstox order book."
+                                )
+                                try:
+                                    if gtt_details:
+                                        for leg in gtt_details.get("rules", []):
+                                            if leg.get("strategy") == "ENTRY" and leg.get("average_price"):
+                                                live_entry_price = leg["average_price"]
+                                                gtt_note = None
+                                except Exception:
+                                    pass
+
+                                with get_db() as conn:
+                                    conn.execute(
+                                        """
+                                        UPDATE paper_trades
+                                        SET live_status = 'OPEN', live_quantity = ?,
+                                            live_instrument_key = ?, live_option_label = ?, live_entry_price = ?,
+                                            live_gtt_order_id = ?, live_gtt_trailing_gap = ?, live_error = ?,
+                                            live_entry_rsi = ?
+                                        WHERE id = ?
+                                        """,
+                                        (live_quantity, option["instrument_key"], label, live_entry_price,
+                                         gtt_result["gtt_order_id"], trailing_gap, gtt_note, entry_rsi_val, trade_id),
+                                    )
+                                    conn.commit()
+
+                        else:
+                            result = place_live_order_checked(
+                                option["instrument_key"], "BUY", live_quantity, access_token,
+                                tag=f"rtt-{trade_id}-B",
+                            )
+                            if result["ok"]:
+                                # Fetch the REAL fill price - this is what
+                                # live P&L must be based on, not the
+                                # theoretical premium we used to size the
+                                # order (see get_order_average_price).
+                                live_entry_price = result.get("fill_price")  # None if still pending: loop retries it
+
+                                # Immediately place a broker-side SL (Stop-
+                                # Loss LIMIT) stop at -2% from the real fill
+                                # price. This is what actually protects the
+                                # position if this app, the server, or the
+                                # network goes down - Upstox's own engine
+                                # fires it, not our polling loop.
+                                #
+                                # Deliberately 'SL', not 'SL-M': NSE
+                                # rejects Stop-Loss MARKET orders on index
+                                # and stock options outright (has since
+                                # Sept 2021, NSE circular NSE/FAOP/49677) -
+                                # every SL-M attempt on an option contract
+                                # fails at the exchange, every time. SL
+                                # needs both a trigger price and a limit
+                                # price; the limit sits a further 2% out so
+                                # the order still fills like a market order
+                                # under normal conditions, while capping
+                                # the worst case if price truly gaps past
+                                # it (SL-M's whole appeal - fire at any
+                                # price - is also exactly the freak-trade
+                                # risk the exchange banned it over).
+                                #
+                                # Best-effort: a failure here doesn't fail
+                                # the trade (the position is already live
+                                # and open), it's just recorded so it's
+                                # visible that this position is running
+                                # without a broker-side net and needs the
+                                # app's own monitoring.
+                                #
+                                # EXCEPTION - RSI_MOMENTUM: skipped
+                                # entirely, by explicit user choice, to
+                                # match paper exactly (no fixed floor at
+                                # all - see the doc this strategy came
+                                # from). This position has NOTHING
+                                # resting at the broker; the RSI/EMA
+                                # check in run_paper_trade_check is the
+                                # only thing that will ever close it. If
+                                # this app/server/network goes down,
+                                # there is no safety net until it's back
+                                # up and this trade's next poll runs.
+                                live_sl_order_id = None
+                                live_sl_trigger_price = None
+                                sl_note = None
+                                if entry_strategy == "RSI_MOMENTUM":
+                                    sl_note = (
+                                        "RSI Momentum Exit: no broker-side stop placed by design (matches "
+                                        "paper exactly, per your choice) - the RSI/EMA check is the only "
+                                        "thing that closes this position. No safety net if this app goes down."
+                                    )
+                                elif entry_strategy == "SUPERTREND":
+                                    sl_note = (
+                                        "SuperTrend exit: no broker-side stop placed by design - the SuperTrend "
+                                        "flip on a closed 5-min candle is the stop-loss. No safety net if this app goes down."
+                                    )
+                                elif entry_strategy == "CAMARILLA_LADDER":
+                                    sl_note = (
+                                        "Camarilla Ladder: no broker-side stop yet - pre-T1 phase runs on "
+                                        "RSI Simple Exit's bare rule (RSI-only, no EMA). A real SL order gets "
+                                        "placed automatically the moment spot first reaches T1, then moves up "
+                                        "as further tiers are reached. No safety net until that first happens."
+                                    )
+                                elif entry_strategy == "FIRST5MIN_FIB":
+                                    sl_note = (
+                                        "1st 5 Min FIB levels strategy: no broker-side stop at all, for this "
+                                        "trade's ENTIRE life - pre-T1 runs on RSI Simple Exit's bare rule; "
+                                        "once T1 is reached, exit fires purely in software the instant T2 "
+                                        "hits or price reverses back through T1. No safety net ever, by design."
+                                    )
+                                elif isinstance(entry_strategy, str) and entry_strategy.startswith("LAB:"):
+                                    _lab = _lab_rule_by_id(entry_strategy)
+                                    _lab_stop = _lab["spec"].get("stop") if _lab else None
+                                    if live_entry_price and _lab_stop:
+                                        live_sl_trigger_price = round(live_entry_price * (1 - _lab_stop / 100), 1)
+                                        live_sl_limit_price = round(live_sl_trigger_price * 0.98, 1)
+                                        sl_result = place_live_order(
+                                            option["instrument_key"], "SELL", live_quantity, access_token,
+                                            order_type="SL", trigger_price=live_sl_trigger_price, price=live_sl_limit_price,
+                                        )
+                                        if sl_result["ok"]:
+                                            live_sl_order_id = sl_result["order_id"]
+                                        else:
+                                            sl_note = f"Entry filled but broker SL stop failed to place: {sl_result['error']}"
+                                    else:
+                                        sl_note = "Lab rule: no fill price yet - broker SL stop skipped, app-side monitoring only"
+                                elif live_entry_price:
+                                    live_sl_trigger_price = round(live_entry_price * 0.98, 1)
+                                    live_sl_limit_price = round(live_entry_price * 0.96, 1)
+                                    sl_result = place_live_order(
+                                        option["instrument_key"], "SELL", live_quantity, access_token,
+                                        order_type="SL", trigger_price=live_sl_trigger_price, price=live_sl_limit_price,
+                                    )
+                                    if sl_result["ok"]:
+                                        live_sl_order_id = sl_result["order_id"]
+                                    else:
+                                        sl_note = f"Entry filled but broker SL stop failed to place: {sl_result['error']}"
+                                else:
+                                    sl_note = "Entry filled but no fill price yet - broker SL stop skipped, app-side monitoring only"
+
+                                with get_db() as conn:
+                                    conn.execute(
+                                        """
+                                        UPDATE paper_trades
+                                        SET live_status = 'OPEN', live_entry_order_id = ?, live_quantity = ?,
+                                            live_instrument_key = ?, live_option_label = ?, live_entry_price = ?,
+                                            live_sl_order_id = ?, live_sl_trigger_price = ?, live_error = ?,
+                                            live_entry_rsi = ?
+                                        WHERE id = ?
+                                        """,
+                                        (result["order_id"], live_quantity, option["instrument_key"], label,
+                                         live_entry_price, live_sl_order_id, live_sl_trigger_price, sl_note,
+                                         entry_rsi_val, trade_id),
+                                    )
+                                    conn.commit()
+                            else:
+                                with get_db() as conn:
+                                    conn.execute(
+                                        """
+                                        UPDATE paper_trades
+                                        SET live_status = 'FAILED', live_error = ?, live_quantity = ?,
+                                            live_option_label = ?
+                                        WHERE id = ?
+                                        """,
+                                        (result["error"], live_quantity, label, trade_id),
+                                    )
+                                    conn.commit()
+
+
 def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_name: str = "", scan_name: str = "") -> tuple[bool, str | None]:
     """Opens exactly one paper trade (and, if live trading is on, a
     matching live order) for a single already-resolved symbol/category/
@@ -2188,281 +2679,14 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
     if get_live_trading_enabled() and auto_paper_only:
         _mark_live_failed(row["id"], "Auto (volume-driven) is paper-only until you allow it for live trades on the Exit Lab page")
     elif get_live_trading_enabled():
-        opt_type = "CE" if category == "Buy" else "PE"
-        trade_id = row["id"]
-        access_token = get_setting("upstox_access_token")
-        if not access_token:
-            _mark_live_failed(trade_id, "Live trading is on but no Upstox access token is saved")
+        if get_live_gate_enabled():
+            # Live Confirmation Gate ON: do NOT place the live order yet. Park it
+            # as PENDING; process_live_gate_pending() (exit-check loop) releases
+            # it only if the underlying moves in the trade's direction in time.
+            _gate_defer_live_entry(row["id"], symbol, category, price_val, spot_entry_price, premium)
         else:
-            # Reuse the SAME option lookup + quote the paper trade just
-            # used a few lines up, instead of calling get_atm_option/
-            # get_ltp_with_retry a second time for the identical
-            # contract. That redundant second call was a real, provable
-            # source of paper-vs-live entry price drift (two quotes
-            # fetched moments apart can simply differ) on top of the
-            # real market-order fill slippage that's inherent to live
-            # execution and can't be removed - see the paper-vs-live
-            # entry price discussion. Only fall back to a fresh lookup
-            # here if paper didn't already get a usable one (e.g. paper
-            # fell back to equity because no option chain was found).
-            live_option = option if (option and premium and premium > 0) else get_atm_option(symbol, opt_type, price_val)
-            if not live_option:
-                _mark_live_failed(trade_id, f"No {opt_type} option chain data found for {symbol} (nearest monthly expiry)")
-            else:
-                option = live_option
-                live_premium = premium if (option and premium and premium > 0) else get_ltp_with_retry(option["instrument_key"], access_token)
-                if not live_premium or live_premium <= 0:
-                    _mark_live_failed(trade_id, f"Could not fetch option premium for {symbol} {opt_type}")
-                else:
-                    premium = live_premium
-                    available_funds = get_upstox_available_funds(access_token)
-                    if available_funds is None:
-                        _mark_live_failed(trade_id, "Could not fetch available Upstox funds - live order skipped")
-                    else:
-                        lot_size = option["lot_size"]
-                        lots = int((available_funds * get_live_funds_use_pct() / 100.0) // (premium * lot_size))  # buffer: market fill can be above the quoted premium
-                        label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
-                        if lots < 1:
-                            _mark_live_failed(
-                                trade_id,
-                                f"Available funds (Rs {fmt_inr(available_funds, 2)}) not enough for 1 lot "
-                                f"({lot_size} qty) of {label} at premium Rs {fmt_inr(premium)}",
-                                live_quantity=0,
-                            )
-                        else:
-                            live_quantity = lots * lot_size
-                            label = f"{symbol} {option['strike']:g} {opt_type} exp {option['expiry']}"
-
-                            if get_live_entry_mode() == "GTT" and entry_strategy not in ("RSI_MOMENTUM", "CAMARILLA_LADDER", "FIRST5MIN_FIB", "SUPERTREND"):
-                                # GTT mode: entry AND trailing stop-loss are
-                                # ONE combined order - Upstox's engine
-                                # places the entry when the ENTRY leg fires
-                                # (IMMEDIATE = right away) and then trails
-                                # the STOPLOSS leg itself via trailing_gap,
-                                # entirely server-side. See
-                                # get_live_entry_mode()'s docstring for why
-                                # this can't just be "attach a stop to an
-                                # existing position" - the entry itself has
-                                # to be part of the same GTT.
-                                gap_mode = get_gtt_trailing_gap_mode()
-                                gap_value = get_gtt_trailing_gap_value()
-                                raw_gap = premium * (gap_value / 100) if gap_mode == "percent" else gap_value
-                                # Both the trigger AND the gap need to be
-                                # tick-aligned - the gap defines the
-                                # increments the trigger will move by as
-                                # Upstox trails it, so a non-tick-aligned
-                                # gap could just push the same rejection
-                                # further down the line on the first trail
-                                # update instead of at placement time.
-                                trailing_gap = max(0.05, _round_to_tick(raw_gap))
-                                stop_trigger = _round_to_tick(premium * 0.98)
-                                entry_trigger = _round_to_tick(premium)
-
-                                gtt_result = place_gtt_order(
-                                    option["instrument_key"], "BUY", live_quantity, "D",
-                                    rules=[
-                                        {"strategy": "ENTRY", "trigger_type": "IMMEDIATE", "trigger_price": entry_trigger},
-                                        {
-                                            "strategy": "STOPLOSS", "trigger_type": "IMMEDIATE",
-                                            "trigger_price": stop_trigger, "trailing_gap": trailing_gap,
-                                        },
-                                    ],
-                                    access_token=access_token,
-                                )
-
-                                if not gtt_result["ok"]:
-                                    with get_db() as conn:
-                                        conn.execute(
-                                            """
-                                            UPDATE paper_trades
-                                            SET live_status = 'FAILED', live_error = ?, live_quantity = ?,
-                                                live_option_label = ?
-                                            WHERE id = ?
-                                            """,
-                                            (f"GTT entry+stop placement failed: {gtt_result['error']}", live_quantity, label, trade_id),
-                                        )
-                                        conn.commit()
-                                else:
-                                    # The GTT's ENTRY leg fires asynchronously
-                                    # even with IMMEDIATE trigger - there's
-                                    # no synchronous fill confirmation the way
-                                    # a direct order gives one. Best-effort
-                                    # attempt to read a fill price back from
-                                    # the GTT's own details; if the response
-                                    # shape doesn't expose one cleanly (this
-                                    # hasn't been verified against a real
-                                    # filled GTT leg yet), fall back to the
-                                    # reference premium and flag it clearly
-                                    # rather than silently guess at a wrong
-                                    # field name.
-                                    gtt_details = get_gtt_order_details(gtt_result["gtt_order_id"], access_token)
-                                    live_entry_price = premium
-                                    gtt_note = (
-                                        "GTT entry+trailing-stop placed - fill price not yet independently "
-                                        "confirmed from GTT order details (using reference premium until verified); "
-                                        "check this trade's actual fill in your Upstox order book."
-                                    )
-                                    try:
-                                        if gtt_details:
-                                            for leg in gtt_details.get("rules", []):
-                                                if leg.get("strategy") == "ENTRY" and leg.get("average_price"):
-                                                    live_entry_price = leg["average_price"]
-                                                    gtt_note = None
-                                    except Exception:
-                                        pass
-
-                                    with get_db() as conn:
-                                        conn.execute(
-                                            """
-                                            UPDATE paper_trades
-                                            SET live_status = 'OPEN', live_quantity = ?,
-                                                live_instrument_key = ?, live_option_label = ?, live_entry_price = ?,
-                                                live_gtt_order_id = ?, live_gtt_trailing_gap = ?, live_error = ?,
-                                                live_entry_rsi = ?
-                                            WHERE id = ?
-                                            """,
-                                            (live_quantity, option["instrument_key"], label, live_entry_price,
-                                             gtt_result["gtt_order_id"], trailing_gap, gtt_note, entry_rsi_val, trade_id),
-                                        )
-                                        conn.commit()
-
-                            else:
-                                result = place_live_order_checked(
-                                    option["instrument_key"], "BUY", live_quantity, access_token,
-                                    tag=f"rtt-{trade_id}-B",
-                                )
-                                if result["ok"]:
-                                    # Fetch the REAL fill price - this is what
-                                    # live P&L must be based on, not the
-                                    # theoretical premium we used to size the
-                                    # order (see get_order_average_price).
-                                    live_entry_price = result.get("fill_price")  # None if still pending: loop retries it
-
-                                    # Immediately place a broker-side SL (Stop-
-                                    # Loss LIMIT) stop at -2% from the real fill
-                                    # price. This is what actually protects the
-                                    # position if this app, the server, or the
-                                    # network goes down - Upstox's own engine
-                                    # fires it, not our polling loop.
-                                    #
-                                    # Deliberately 'SL', not 'SL-M': NSE
-                                    # rejects Stop-Loss MARKET orders on index
-                                    # and stock options outright (has since
-                                    # Sept 2021, NSE circular NSE/FAOP/49677) -
-                                    # every SL-M attempt on an option contract
-                                    # fails at the exchange, every time. SL
-                                    # needs both a trigger price and a limit
-                                    # price; the limit sits a further 2% out so
-                                    # the order still fills like a market order
-                                    # under normal conditions, while capping
-                                    # the worst case if price truly gaps past
-                                    # it (SL-M's whole appeal - fire at any
-                                    # price - is also exactly the freak-trade
-                                    # risk the exchange banned it over).
-                                    #
-                                    # Best-effort: a failure here doesn't fail
-                                    # the trade (the position is already live
-                                    # and open), it's just recorded so it's
-                                    # visible that this position is running
-                                    # without a broker-side net and needs the
-                                    # app's own monitoring.
-                                    #
-                                    # EXCEPTION - RSI_MOMENTUM: skipped
-                                    # entirely, by explicit user choice, to
-                                    # match paper exactly (no fixed floor at
-                                    # all - see the doc this strategy came
-                                    # from). This position has NOTHING
-                                    # resting at the broker; the RSI/EMA
-                                    # check in run_paper_trade_check is the
-                                    # only thing that will ever close it. If
-                                    # this app/server/network goes down,
-                                    # there is no safety net until it's back
-                                    # up and this trade's next poll runs.
-                                    live_sl_order_id = None
-                                    live_sl_trigger_price = None
-                                    sl_note = None
-                                    if entry_strategy == "RSI_MOMENTUM":
-                                        sl_note = (
-                                            "RSI Momentum Exit: no broker-side stop placed by design (matches "
-                                            "paper exactly, per your choice) - the RSI/EMA check is the only "
-                                            "thing that closes this position. No safety net if this app goes down."
-                                        )
-                                    elif entry_strategy == "SUPERTREND":
-                                        sl_note = (
-                                            "SuperTrend exit: no broker-side stop placed by design - the SuperTrend "
-                                            "flip on a closed 5-min candle is the stop-loss. No safety net if this app goes down."
-                                        )
-                                    elif entry_strategy == "CAMARILLA_LADDER":
-                                        sl_note = (
-                                            "Camarilla Ladder: no broker-side stop yet - pre-T1 phase runs on "
-                                            "RSI Simple Exit's bare rule (RSI-only, no EMA). A real SL order gets "
-                                            "placed automatically the moment spot first reaches T1, then moves up "
-                                            "as further tiers are reached. No safety net until that first happens."
-                                        )
-                                    elif entry_strategy == "FIRST5MIN_FIB":
-                                        sl_note = (
-                                            "1st 5 Min FIB levels strategy: no broker-side stop at all, for this "
-                                            "trade's ENTIRE life - pre-T1 runs on RSI Simple Exit's bare rule; "
-                                            "once T1 is reached, exit fires purely in software the instant T2 "
-                                            "hits or price reverses back through T1. No safety net ever, by design."
-                                        )
-                                    elif isinstance(entry_strategy, str) and entry_strategy.startswith("LAB:"):
-                                        _lab = _lab_rule_by_id(entry_strategy)
-                                        _lab_stop = _lab["spec"].get("stop") if _lab else None
-                                        if live_entry_price and _lab_stop:
-                                            live_sl_trigger_price = round(live_entry_price * (1 - _lab_stop / 100), 1)
-                                            live_sl_limit_price = round(live_sl_trigger_price * 0.98, 1)
-                                            sl_result = place_live_order(
-                                                option["instrument_key"], "SELL", live_quantity, access_token,
-                                                order_type="SL", trigger_price=live_sl_trigger_price, price=live_sl_limit_price,
-                                            )
-                                            if sl_result["ok"]:
-                                                live_sl_order_id = sl_result["order_id"]
-                                            else:
-                                                sl_note = f"Entry filled but broker SL stop failed to place: {sl_result['error']}"
-                                        else:
-                                            sl_note = "Lab rule: no fill price yet - broker SL stop skipped, app-side monitoring only"
-                                    elif live_entry_price:
-                                        live_sl_trigger_price = round(live_entry_price * 0.98, 1)
-                                        live_sl_limit_price = round(live_entry_price * 0.96, 1)
-                                        sl_result = place_live_order(
-                                            option["instrument_key"], "SELL", live_quantity, access_token,
-                                            order_type="SL", trigger_price=live_sl_trigger_price, price=live_sl_limit_price,
-                                        )
-                                        if sl_result["ok"]:
-                                            live_sl_order_id = sl_result["order_id"]
-                                        else:
-                                            sl_note = f"Entry filled but broker SL stop failed to place: {sl_result['error']}"
-                                    else:
-                                        sl_note = "Entry filled but no fill price yet - broker SL stop skipped, app-side monitoring only"
-
-                                    with get_db() as conn:
-                                        conn.execute(
-                                            """
-                                            UPDATE paper_trades
-                                            SET live_status = 'OPEN', live_entry_order_id = ?, live_quantity = ?,
-                                                live_instrument_key = ?, live_option_label = ?, live_entry_price = ?,
-                                                live_sl_order_id = ?, live_sl_trigger_price = ?, live_error = ?,
-                                                live_entry_rsi = ?
-                                            WHERE id = ?
-                                            """,
-                                            (result["order_id"], live_quantity, option["instrument_key"], label,
-                                             live_entry_price, live_sl_order_id, live_sl_trigger_price, sl_note,
-                                             entry_rsi_val, trade_id),
-                                        )
-                                        conn.commit()
-                                else:
-                                    with get_db() as conn:
-                                        conn.execute(
-                                            """
-                                            UPDATE paper_trades
-                                            SET live_status = 'FAILED', live_error = ?, live_quantity = ?,
-                                                live_option_label = ?
-                                            WHERE id = ?
-                                            """,
-                                            (result["error"], live_quantity, label, trade_id),
-                                        )
-                                        conn.commit()
+            _execute_live_entry(row["id"], symbol, category, price_val, entry_strategy,
+                                entry_rsi_val, option, premium)
 
     # Record the directional-volume reading as of this entry on the trade
     # row (for the Stats "by entry volume strength" test). Deliberately the
@@ -6444,7 +6668,7 @@ def _open_trade_if_free(symbol: str, category: str, price_val: float,
     with _entry_lock:
         with get_db() as conn:
             already_open = conn.execute(
-                "SELECT id FROM paper_trades WHERE status = 'OPEN' OR live_status = 'OPEN' LIMIT 1"
+                "SELECT id FROM paper_trades WHERE status = 'OPEN' OR live_status IN ('OPEN', 'PENDING', 'ENTERING') LIMIT 1"
             ).fetchone()
         if already_open:
             _record_alert_decision(symbol, category, "SKIPPED", "A trade is already open", price_val)
@@ -8182,6 +8406,10 @@ def _exit_check_loop() -> None:
             run_paper_trade_check()
         except Exception as e:
             print(f"[exit-check-loop] error: {e}")
+        try:
+            process_live_gate_pending()
+        except Exception as e:
+            print(f"[live-gate] loop error: {e}")
         time.sleep(EXIT_CHECK_INTERVAL_SECONDS)
 
 
@@ -9905,7 +10133,7 @@ def api_manual_enter_alert(alert_id):
 
     with get_db() as conn:
         already_open = conn.execute(
-            "SELECT id FROM paper_trades WHERE status = 'OPEN' OR live_status = 'OPEN' LIMIT 1"
+            "SELECT id FROM paper_trades WHERE status = 'OPEN' OR live_status IN ('OPEN', 'PENDING', 'ENTERING') LIMIT 1"
         ).fetchone()
     if already_open:
         return jsonify({"status": "error", "message": "A trade is already open - exit it first before manually entering another"}), 409
@@ -13570,6 +13798,14 @@ def settings_page():
         theta_switch_enabled=get_theta_switch_enabled(),
         live_entry_mode=get_live_entry_mode(),
         live_funds_use_pct=get_live_funds_use_pct(),
+        live_gate_enabled=get_live_gate_enabled(),
+        live_gate_move_pct=get_live_gate_move_pct(),
+        live_gate_window_min=get_live_gate_window_min(),
+        live_gate_max_chase_pct=get_live_gate_max_chase_pct(),
+        live_gate_contract_case=get_live_gate_contract_case(),
+        live_gate_mode=get_live_gate_mode(),
+        live_gate_pullback_pct=get_live_gate_pullback_pct(),
+        live_gate_window2_min=get_live_gate_window2_min(),
         supertrend_length=get_supertrend_length(),
         supertrend_factor=get_supertrend_factor(),
         gtt_trailing_gap_mode=get_gtt_trailing_gap_mode(),
@@ -13680,6 +13916,9 @@ def live_trading_data():
         failed_trades = conn.execute(
             "SELECT * FROM paper_trades WHERE live_status = 'FAILED' ORDER BY id DESC LIMIT 50"
         ).fetchall()
+        pending_trades = [dict(t) for t in conn.execute(
+            "SELECT id, symbol, direction, gate_ref_spot, gate_deadline, gate_mode, gate_worst_pct FROM paper_trades "
+            "WHERE live_status IN ('PENDING', 'ENTERING') ORDER BY id DESC").fetchall()]
     open_trades = [dict(t) for t in open_trades]
     _attach_rule_notes(open_trades)
     closed_trades = [dict(t) for t in closed_trades]
@@ -13713,6 +13952,8 @@ def live_trading_data():
         "open": open_trades,
         "closed": closed_trades,
         "failed": failed_trades,
+        "pending": pending_trades,
+        "gate_enabled": get_live_gate_enabled(),
         "live_open": live_stats["live_open"],
         "live_closed": live_stats["live_closed"],
         "live_pnl": live_stats["live_pnl"],
@@ -14100,6 +14341,31 @@ def paper_trading_supertrend_settings():
     set_setting("supertrend_length", str(length))
     set_setting("supertrend_factor", f"{factor:g}")
     return jsonify({"status": "ok", "supertrend_length": length, "supertrend_factor": factor})
+
+
+@app.route("/api/live-gate/settings", methods=["POST"])
+def live_gate_settings():
+    """Live Confirmation Gate settings: on/off, favourable-move %, window (min), chase cap %."""
+    d = request.get_json(silent=True) or {}
+    try:
+        enabled = "1" if d.get("enabled") else "0"
+        case = "2" if str(d.get("contract_case")) == "2" else "1"
+        mode = "2" if str(d.get("mode")) == "2" else "1"
+        pullback = float(d.get("pullback_pct", 0.5)); window2 = float(d.get("window2_min", 10))
+        move = float(d.get("move_pct")); window = float(d.get("window_min")); chase = float(d.get("max_chase_pct"))
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid values"}), 400
+    if not (0 <= move <= 5 and 0.5 <= window <= 30 and 0 <= chase <= 100 and 0.1 <= pullback <= 5 and 1 <= window2 <= 60):
+        return jsonify({"status": "error", "message": "Value out of range"}), 400
+    set_setting("live_gate_enabled", enabled)
+    set_setting("live_gate_move_pct", f"{move:g}")
+    set_setting("live_gate_window_min", f"{window:g}")
+    set_setting("live_gate_max_chase_pct", f"{chase:g}")
+    set_setting("live_gate_contract_case", case)
+    set_setting("live_gate_mode", mode)
+    set_setting("live_gate_pullback_pct", f"{pullback:g}")
+    set_setting("live_gate_window2_min", f"{window2:g}")
+    return jsonify({"status": "ok", "enabled": enabled == "1", "move_pct": move, "window_min": window, "max_chase_pct": chase, "contract_case": case, "mode": mode, "pullback_pct": pullback, "window2_min": window2})
 
 
 @app.route("/api/paper-trading/live-funds-use", methods=["POST"])
