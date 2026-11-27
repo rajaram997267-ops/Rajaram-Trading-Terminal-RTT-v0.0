@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <script>(function(){try{var t=localStorage.getItem('rtt-theme')||'dark';document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RTT v0.0 - Alert Stats</title>
+  <style>
+    :root { --bg:#0b0e14; --panel:#131722; --border:#1e222d; --text:#e6e9f0; --muted:#6b7280; --green:#00c896; --gold:#ffb800; --red:#ff5370; }
+    :root[data-theme="light-gray"] { --red:#dc2626; --bg:#e9ebee; --panel:#ffffff; --border:#d0d4da; --text:#1a1d23; --muted:#6b7280; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="sky-blue"] { --red:#dc2626; --bg:#eaf4fb; --panel:#ffffff; --border:#bfe0f2; --text:#10222c; --muted:#4a6572; --green:#0e9f6e; --gold:#b45309; }
+    :root[data-theme="off-white"] { --red:#dc2626; --bg:#f7f5f0; --panel:#ffffff; --border:#e2ddd2; --text:#1f1c16; --muted:#6b6455; --green:#0e9f6e; --gold:#b45309; }
+    * { box-sizing: border-box; }
+    body { font-family:'Segoe UI',Arial,sans-serif; background:var(--bg); color:var(--text); margin:0; padding:24px 32px 48px; }
+    a { color: var(--green); }
+    .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    .tabbar { display:flex; gap:4px; border-bottom:1px solid var(--border); margin:18px 0 20px; overflow-x:auto; }
+    .tabbar a { padding:10px 14px; color:var(--muted); text-decoration:none; font-size:14px; border-bottom:2px solid transparent; white-space:nowrap; }
+    .tabbar a.active { color:var(--text); border-bottom-color:var(--green); }
+    .tabbar a:hover { color:var(--text); }
+    .controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:0 0 14px; font-size:13px; color:var(--muted); }
+    .controls input { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:13px; }
+    .controls input[type=number] { width:70px; }
+    .controls button { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
+    .controls button:hover { border-color:var(--green); }
+    #status { font-size:13px; color:var(--muted); margin:0 0 12px; min-height:18px; }
+    .wrap { overflow-x:auto; background:var(--panel); border:1px solid var(--border); border-radius:8px; }
+    table { border-collapse:collapse; width:100%; font-size:12px; }
+    th, td { border-bottom:1px solid var(--border); padding:8px 10px; text-align:left; white-space:nowrap; }
+    th { color:var(--muted); font-size:11px; text-transform:uppercase; cursor:pointer; user-select:none; }
+    th:hover { color:var(--text); }
+    tr:last-child td { border-bottom:none; }
+    tr.hot td { background:rgba(0,200,150,0.10); }
+    .pos { color:var(--green); } .neg { color:var(--red); } .mut { color:var(--muted); }
+    .tag { font-size:10px; padding:1px 6px; border-radius:8px; border:1px solid var(--border); }
+    .tag.Buy { color:var(--green); border-color:var(--green); } .tag.Sell { color:var(--red); border-color:var(--red); }
+    h3 { margin:28px 0 4px; font-size:16px; }
+    .bench-controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:10px 0 12px; font-size:13px; color:var(--muted); }
+    .bench-controls input, .bench-controls select { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 8px; font-size:13px; }
+    .bench-controls input[type=number] { width:70px; }
+    .bench-controls button { background:var(--panel); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
+    .bench-controls button:hover { border-color:var(--green); }
+    #benchStatus { font-size:13px; color:var(--muted); margin:0 0 10px; min-height:18px; }
+    tr.allrow td { font-weight:600; border-top:2px solid var(--border); }
+    .foot { margin-top:14px; font-size:11px; color:var(--muted); line-height:1.5; }
+    .movers { margin: 10px 0 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
+  .movers-head { margin-bottom: 6px; font-size: 13px; }
+  .movers-row { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
+  .mv-label { font-weight: 700; font-size: 12px; min-width: 62px; }
+  .mv-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border); font-size: 12px; white-space: nowrap; }
+  .mv-chip.pos { color: var(--green); }
+  .mv-chip.neg { color: var(--red); }
+  .mv-chip.alerted { border-color: currentColor; font-weight: 700; }
+</style>
+  <style>
+    .movers { margin: 10px 0 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; }
+    .movers-head { margin-bottom: 6px; font-size: 13px; }
+    .movers-row { display: flex; align-items: baseline; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
+    .mv-label { font-weight: 700; font-size: 12px; min-width: 62px; }
+    .mv-chip { display: inline-block; margin: 2px 4px 2px 0; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--border); font-size: 12px; white-space: nowrap; }
+    .mv-chip.pos { color: var(--green); }
+    .mv-chip.neg { color: var(--red); }
+    .mv-chip.alerted { border-color: currentColor; font-weight: 700; }
+    .mv { display:inline-block; font-size:11px; padding:1px 8px; border-radius:10px; border:1px solid var(--border); }
+    .mv.gain { color:var(--green); border-color:var(--green); } .mv.lose { color:var(--red); border-color:var(--red); }
+    .mv.top10 { font-weight:700; background:rgba(255,184,0,0.12); }
+    .mv.far { opacity:.6; }
+    .ok { color:var(--green); } .bad { color:var(--red); }
+    .cards { display:flex; gap:12px; flex-wrap:wrap; margin:0 0 14px; }
+    .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:8px 14px; font-size:13px; }
+    .card b { font-size:18px; display:block; }
+    td.num { text-align:right; } th.num { text-align:right; }
+  </style>
+</head>
+<body>
+  <h2 style="margin:0;">Rajaram Trading Terminal - Alert Stats</h2>
+  <div class="sub">Every alert of the day: stock, alert type, alert time and where the stock stands among the F&amp;O movers.</div>
+  <div class="tabbar">
+    <a href="/">Dashboard</a>
+    <a href="/paper-trading">Paper Trading</a>
+    <a href="/live-trading">Live Trading</a>
+    <a href="/stats">Stats</a>
+    <a href="/websocket-stats">WS Speed</a>
+    <a href="/settings">Settings</a>
+    <a href="/shadow">Manual vs RSI</a>
+    <a href="/exit-lab">Exit Lab</a>
+    <a href="/first-candle">First Candle</a>
+    <a href="/alert-stats" class="active">Alert Stats</a>
+    <a href="/exit-compare">Exit Compare</a>
+    <a href="/market-eye" class="{% if active_tab == 'market_eye' %}active{% endif %}">Market EYE &#128065;&#65039;</a>
+    <a href="/preopen-context" class="{% if active_tab == 'preopen_context' %}active{% endif %}">Pre-Open Context</a>
+    <a href="/oi-range" class="{% if active_tab == 'oi_range' %}active{% endif %}">OI Range</a>
+    <a href="/fut-spot" class="{% if active_tab == 'fut_spot' %}active{% endif %}">Futures vs Spot</a>
+  </div>
+
+  <div class="controls">
+    <label>Date <input type="date" id="dateInput" value="{{ date }}"></label>
+    <button id="loadBtn">Load</button>
+    <label>Side <select id="catSel"><option value="all">All</option><option value="Buy">Buy</option><option value="Sell">Sell</option><option value="Others">Others</option></select></label>
+    <label>Alert type <select id="typeSel"><option value="all">All</option></select></label>
+    <label>Show <select id="moverSel"><option value="all">All alerts</option><option value="top10">In Top 10 movers</option><option value="same">Mover in alert direction</option><option value="opp">Mover against alert</option><option value="none">Not a mover</option></select></label>
+  </div>
+  <div id="status"></div>
+
+  <div id="moversWrap" class="movers" style="display:none;">
+    <div class="movers-head"><b>Top 10 F&amp;O movers</b> <span id="moversMeta" class="mut"></span></div>
+    <div class="movers-row"><span class="mv-label pos">Gainers</span><span id="mvGain"></span></div>
+    <div class="movers-row"><span class="mv-label neg">Losers</span><span id="mvLose"></span></div>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <h3 style="margin-top:6px;">By alert type</h3>
+  <div class="sub" style="margin-bottom:8px;">&ldquo;Top 10 same direction&rdquo; = distinct stocks from that alert type that are among the day's Top 10 gainers (Buy alerts) or losers (Sell alerts).</div>
+  <div class="wrap"><table id="sumTbl">
+    <thead><tr><th>Alert type</th><th>Side</th><th class="num">Alerts</th><th class="num">Stocks</th><th class="num">Top 10 same direction</th><th class="num">% of stocks</th><th class="num">Top 10 opposite</th></tr></thead>
+    <tbody id="sumBody"></tbody>
+  </table></div>
+
+  <h3>All alerts</h3>
+  <div class="wrap"><table id="tbl">
+    <thead><tr><th>#</th><th data-k="symbol">Symbol</th><th data-k="alert_type">Alert type</th><th data-k="time">Alert time</th><th data-k="fno_mover">F&amp;O mover</th></tr></thead>
+    <tbody id="body"></tbody>
+  </table></div>
+
+<script>
+  let DATA = null, timer = null;
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+  // Same cell as the First Candle page: arrow, rank and % in a chip (today = live Top 10; other days = end-of-day ranking).
+  function moverCell(r) {
+    const m = r.fno_info;
+    if (!m) return '<span class="mut">-</span>';
+    const up = m.type === "gain";
+    return '<span class="mv-chip ' + (up ? "pos" : "neg") + '" title="' + (up ? "Top F&O gainer" : "Top F&O loser") + ' #' + m.rank +
+           ' vs the previous close, as of ' + esc(m.as_of) + '">' + (up ? "&uarr; " : "&darr; ") + '#' + m.rank + ' ' +
+           (m.pct > 0 ? "+" : "") + m.pct + '%</span>';
+  }
+
+  // ---------- Top F&O movers (live, today only; the server refreshes it once per 5-minute candle close) ----------
+  let moversData = null, moversAsOf = null, sortKey = "time", sortDir = 1;
+  function isTodayView() {
+    const ist = new Date(Date.now() + 5.5 * 3600 * 1000).toISOString().slice(0, 10);
+    return $("dateInput").value === ist;
+  }
+  // Sets r.fno_info (the chip), r.fno_mover (signed %, what the column sorts by) and r.agrees on every row.
+  function applyMovers() {
+    if (!DATA) return;
+    const map = {};
+    if (isTodayView()) {
+      if (moversData && moversData.status === "ok") {
+        (moversData.gainers || []).forEach(g => { map[g.symbol] = { type: "gain", rank: g.rank, pct: g.pct, as_of: moversData.as_of }; });
+        (moversData.losers || []).forEach(l => { map[l.symbol] = { type: "lose", rank: l.rank, pct: l.pct, as_of: moversData.as_of }; });
+      }
+    } else {
+      DATA.rows.forEach(r => { if (r.mover) map[r.symbol] = { type: r.mover.type, rank: r.mover.rank, pct: r.mover.pct, as_of: "that day's close" }; });
+    }
+    DATA.rows.forEach(r => {
+      const m = map[r.symbol];
+      r.fno_info = m || null; r.fno_mover = m ? m.pct : null;
+      r.agrees = (m && (r.category === "Buy" || r.category === "Sell")) ? ((m.type === "gain") === (r.category === "Buy")) : null;
+    });
+  }
+  function moversPanel() {
+    const wrap = $("moversWrap"), d = moversData;
+    if (!isTodayView() || !d || d.status !== "ok") { wrap.style.display = "none"; return; }
+    const alerted = new Set(DATA ? DATA.rows.filter(r => r.category === "Buy" || r.category === "Sell").map(r => r.symbol) : []);
+    const chip = (m, cls) => '<span class="mv-chip ' + cls + (alerted.has(m.symbol) ? " alerted" : "") + '" title="' +
+      (alerted.has(m.symbol) ? "Has a Buy/Sell alert today" : "No alert today") + '">' + m.rank + ' ' + esc(m.symbol) + ' ' + (m.pct > 0 ? "+" : "") + m.pct + '%</span>';
+    $("mvGain").innerHTML = (d.gainers || []).map(m => chip(m, "pos")).join("") || '<span class="mut">none</span>';
+    $("mvLose").innerHTML = (d.losers || []).map(m => chip(m, "neg")).join("") || '<span class="mut">none</span>';
+    $("moversMeta").textContent = (d.market_open ? "as of the " + d.as_of + " candle close" : "market closed - latest as of " + d.as_of) +
+      " (" + d.count + " of " + d.universe + " stocks ranked; refreshes every 5 min). Outlined = has an alert today.";
+    wrap.style.display = "";
+  }
+  async function loadMovers() {
+    if (document.hidden) return;
+    if (!isTodayView()) { moversPanel(); return; }
+    try {
+      const res = await fetch("/api/fno-movers");
+      const d = await res.json();
+      if (d.status === "ok") {
+        const stamp = d.slot + "|" + d.fetched_at;
+        const changed = stamp !== moversAsOf;
+        moversData = d; moversAsOf = stamp;
+        if (changed) { applyMovers(); render(); }
+      }
+      moversPanel();
+    } catch (e) { /* keep showing the last snapshot */ }
+  }
+  setInterval(loadMovers, 30000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) loadMovers(); });
+
+  function render() {
+    if (!DATA) return;
+    const cat = $("catSel").value, typ = $("typeSel").value, mv = $("moverSel").value;
+    const rows = DATA.rows.filter(r => {
+      if (cat !== "all" && r.category !== cat) return false;
+      if (typ !== "all" && r.alert_type !== typ) return false;
+      if (mv === "top10") return r.mover && r.mover.rank <= 10;
+      if (mv === "same") return r.agrees === true;
+      if (mv === "opp") return r.agrees === false;
+      if (mv === "none") return !r.mover;
+      return true;
+    });
+    rows.sort((x, y) => {
+      let a = x[sortKey], b = y[sortKey];
+      if (sortKey === "fno_mover") {                      // signed %; stocks that are not movers always last
+        if (a == null && b == null) return 0;
+        if (a == null) return 1; if (b == null) return -1;
+        return (a - b) * sortDir;
+      }
+      return String(a).localeCompare(String(b)) * sortDir;
+    });
+    document.querySelectorAll("#tbl thead th[data-k]").forEach(th => {
+      const base = th.dataset.base || (th.dataset.base = th.innerHTML);
+      th.innerHTML = base + (th.dataset.k === sortKey ? (sortDir < 0 ? " &darr;" : " &uarr;") : "");
+      th.onclick = () => { const k = th.dataset.k; if (k === sortKey) sortDir = -sortDir; else { sortKey = k; sortDir = (k === "fno_mover") ? -1 : 1; } render(); };
+    });
+    $("body").innerHTML = rows.length ? rows.map((r, i) =>
+      "<tr><td class='mut'>" + (i + 1) + "</td><td><b>" + esc(r.symbol) + "</b></td>" +
+      "<td><span class='tag " + esc(r.category) + "'>" + esc(r.category) + "</span> " + esc(r.alert_type) + "</td>" +
+      "<td>" + esc(r.time) + "</td><td>" + moverCell(r) + "</td></tr>").join("")
+      : "<tr><td colspan='5' class='mut'>No alerts for this selection.</td></tr>";
+  }
+
+  function renderAll() {
+    const d = DATA;
+    $("cards").innerHTML =
+      '<div class="card">Alerts<b>' + d.total_alerts + '</b></div>' +
+      '<div class="card">Distinct stocks<b>' + d.unique_stocks + '</b></div>';
+    $("sumBody").innerHTML = d.summary.length ? d.summary.map(s =>
+      "<tr><td>" + esc(s.alert_type) + "</td><td><span class='tag " + esc(s.category) + "'>" + esc(s.category) + "</span></td>" +
+      "<td class='num'>" + s.alerts + "</td><td class='num'>" + s.stocks + "</td>" +
+      "<td class='num'>" + s.top10_same + "</td><td class='num'>" + s.top10_same_pct + "%</td><td class='num'>" + s.top10_opposite + "</td></tr>").join("")
+      : "<tr><td colspan='7' class='mut'>No alerts.</td></tr>";
+    const sel = $("typeSel"), keep = sel.value;
+    sel.innerHTML = '<option value="all">All</option>' + d.summary.map(s => '<option value="' + esc(s.alert_type) + '">' + esc(s.alert_type) + '</option>').join("");
+    sel.value = d.summary.some(s => s.alert_type === keep) ? keep : "all";
+    applyMovers();
+    moversPanel();
+    render();
+  }
+
+  async function load() {
+    clearTimeout(timer);
+    const date = $("dateInput").value;
+    $("status").textContent = "Loading...";
+    try {
+      const res = await fetch("/api/alert-stats?date=" + encodeURIComponent(date));
+      const d = await res.json();
+      if (!res.ok) { $("status").textContent = d.error || "Failed to load"; return; }
+      DATA = d;
+      $("status").textContent = d.movers_note || "";
+      renderAll();
+      if (d.movers_state === "ranking") timer = setTimeout(load, 8000);
+      else if (d.is_today) timer = setTimeout(load, 30000);
+    } catch (e) {
+      $("status").textContent = "Failed to load - see console";
+      console.error(e);
+    }
+  }
+  $("loadBtn").onclick = load;
+  $("dateInput").onchange = () => { moversAsOf = null; load(); loadMovers(); };
+  ["catSel", "typeSel", "moverSel"].forEach(id => $(id).onchange = render);
+  load();
+  loadMovers();
+</script>
+</body>
+</html>
