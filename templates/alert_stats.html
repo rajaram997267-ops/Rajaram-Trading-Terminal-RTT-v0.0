@@ -94,6 +94,13 @@
   </div>
 
   <div class="controls">
+    <label>View
+      <select id="viewSel"><option value="day">Single day</option><option value="range">Multi-day</option></select>
+    </label>
+  </div>
+
+  <div id="daySec">
+  <div class="controls">
     <label>Date <input type="date" id="dateInput" value="{{ date }}"></label>
     <button id="loadBtn">Load</button>
     <label>Side <select id="catSel"><option value="all">All</option><option value="Buy">Buy</option><option value="Sell">Sell</option><option value="Others">Others</option></select></label>
@@ -122,6 +129,23 @@
     <thead><tr><th>#</th><th data-k="symbol">Symbol</th><th data-k="alert_type">Alert type</th><th data-k="time">Alert time</th><th data-k="fno_mover">F&amp;O mover</th></tr></thead>
     <tbody id="body"></tbody>
   </table></div>
+
+  </div>
+
+  <div id="rangeSec" style="display:none;">
+    <div class="controls">
+      <label>Last <select id="rgDays"><option value="5">5</option><option value="10" selected>10</option><option value="15">15</option><option value="20">20</option><option value="30">30</option><option value="60">60</option></select> weekdays</label>
+      <label>Top <select id="rgTop"><option value="5">5</option><option value="10" selected>10</option><option value="15">15</option><option value="20">20</option><option value="30">30</option></select> movers</label>
+      <button id="rgLoad">Load</button>
+    </div>
+    <div id="rgStatus" class="sub" style="margin-bottom:10px;"></div>
+    <div class="sub" style="margin-bottom:8px;">
+      For each alert type: distinct stock-days alerted, and how many of them finished the day among the Top N F&amp;O gainers (Buy alerts) or losers (Sell alerts).
+      &ldquo;Chance&rdquo; is what a random pick would score (Top N &divide; F&amp;O stocks). Past days use the day's closing ranking; today uses the live Top 10.
+      Day cells read <b>hits/stocks</b>. Alert types with under 10 stock-days are greyed: too few to judge.
+    </div>
+    <div class="wrap"><table id="rgTbl"><thead id="rgHead"></thead><tbody id="rgBody"></tbody></table></div>
+  </div>
 
 <script>
   let DATA = null, timer = null;
@@ -264,6 +288,51 @@
   $("loadBtn").onclick = load;
   $("dateInput").onchange = () => { moversAsOf = null; load(); loadMovers(); };
   ["catSel", "typeSel", "moverSel"].forEach(id => $(id).onchange = render);
+
+  // ---------- Multi-day view ----------
+  let rgTimer = null;
+  function setView() {
+    const range = $("viewSel").value === "range";
+    $("daySec").style.display = range ? "none" : "";
+    $("rangeSec").style.display = range ? "" : "none";
+    if (range) loadRange();
+  }
+  async function loadRange() {
+    clearTimeout(rgTimer);
+    $("rgStatus").textContent = "Loading...";
+    try {
+      const res = await fetch("/api/alert-stats-range?days=" + $("rgDays").value + "&top=" + $("rgTop").value);
+      const d = await res.json();
+      if (!res.ok) { $("rgStatus").textContent = d.error || "Failed to load"; return; }
+      renderRange(d);
+      if (d.state === "ranking") rgTimer = setTimeout(() => { if ($("viewSel").value === "range") loadRange(); }, 8000);
+    } catch (e) { $("rgStatus").textContent = "Failed to load - see console"; console.error(e); }
+  }
+  function renderRange(d) {
+    const ranked = new Set(d.ranked_dates);
+    const cols = d.dates.filter(x => ranked.has(x) || d.missing_dates.includes(x));
+    $("rgStatus").textContent = (d.note ? d.note + ". " : "") + "Ranked days: " + d.ranked_dates.length + " of " + d.dates.length +
+      " weekdays (days without alerts are skipped)." + (d.baseline_pct ? " Chance for Top " + d.top + " = " + d.baseline_pct + "%." : "");
+    $("rgHead").innerHTML = "<tr><th>Alert type</th><th>Side</th><th class='num'>Days</th><th class='num'>Alerts</th><th class='num'>Stock-days</th>" +
+      "<th class='num'>Hits (Top " + d.top + ", alert direction)</th><th class='num'>Hit %</th><th class='num'>Against</th>" +
+      cols.map(x => "<th class='num' title='" + x + "'>" + x.slice(5) + "</th>").join("") + "</tr>";
+    const base = d.baseline_pct || 0;
+    $("rgBody").innerHTML = d.types.length ? d.types.map(t => {
+      const small = t.stock_days < 10;
+      const pct = t.hit_pct == null ? '<span class="mut">n/a</span>' :
+        '<span class="' + (t.hit_pct > base * 2 ? "pos" : "") + '">' + t.hit_pct + '%</span>';
+      const cells = cols.map(x => {
+        const c = t.per_date[x];
+        if (!c) return "<td class='num mut'>-</td>";
+        return "<td class='num'>" + (t.hit_pct == null ? c[0] : '<span class="' + (c[1] ? "pos" : "mut") + '">' + c[1] + "/" + c[0] + "</span>") + "</td>";
+      }).join("");
+      return "<tr style='" + (small ? "opacity:.55" : "") + "'><td>" + esc(t.alert_type) + "</td><td><span class='tag " + esc(t.category) + "'>" + esc(t.category) + "</span></td>" +
+        "<td class='num'>" + t.active_days + "</td><td class='num'>" + t.alerts + "</td><td class='num'>" + t.stock_days + "</td>" +
+        "<td class='num'>" + (t.hit == null ? "-" : t.hit) + "</td><td class='num'>" + pct + "</td><td class='num'>" + (t.opp == null ? "-" : t.opp) + "</td>" + cells + "</tr>";
+    }).join("") : "<tr><td colspan='8' class='mut'>No ranked days with alerts yet.</td></tr>";
+  }
+  $("viewSel").onchange = setView;
+  $("rgLoad").onclick = loadRange;
   load();
   loadMovers();
 </script>
