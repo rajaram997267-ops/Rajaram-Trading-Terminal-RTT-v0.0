@@ -263,6 +263,16 @@
 
   <div id="gatePendingBox"></div>
 
+  <div id="gateDecisionsBox" style="display:none;">
+    <h3 class="section-title">Live Confirmation Gate - decisions</h3>
+    <div class="sub" style="margin-bottom:8px;">DRY = live trading was OFF, so nothing was ordered; this is what the gate would have decided. Latest 60 trades the gate looked at.</div>
+    <div style="overflow-x:auto;"><table style="width:100%;">
+      <thead><tr><th>Entry time</th><th>Symbol</th><th>Side</th><th>Case</th><th>Decision</th><th>Paper entry spot</th><th>Decision spot</th><th>Deepest dip</th><th>Reason</th></tr></thead>
+      <tbody id="gateDecisionsBody"></tbody>
+    </table></div>
+  </div>
+
+
   <h3 class="section-title">Live open positions</h3>
   <div id="openTradesContainer">
     {% if open_trades %}
@@ -594,12 +604,23 @@
         renderClosedTrades(data.closed);
         renderFailedTrades(data.failed);
         (function () {
+          const g = data.gate_decisions || [];
+          document.getElementById("gateDecisionsBox").style.display = g.length ? "" : "none";
+          const esc = v => String(v == null ? "" : v).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+          const col = r => r === "APPROVED" ? "var(--green)" : r === "WATCHING" ? "var(--muted)" : "var(--red)";
+          document.getElementById("gateDecisionsBody").innerHTML = g.map(x =>
+            "<tr><td>" + esc(String(x.entry_time || "").replace("T", " ").slice(0, 19)) + "</td><td><b>" + esc(x.symbol) + "</b></td><td>" + esc(x.direction) +
+            "</td><td>" + esc(x.gate_mode || "1") + "</td><td style='color:" + col(x.gate_result) + ";font-weight:700;'>" + esc(x.gate_result) +
+            (x.gate_dry ? " <span style='opacity:.7;font-weight:400;'>(DRY)</span>" : "") + "</td><td>" + esc(x.gate_ref_spot) + "</td><td>" + esc(x.gate_decision_spot == null ? "-" : x.gate_decision_spot) +
+            "</td><td>" + (x.gate_worst_pct ? Number(x.gate_worst_pct).toFixed(2) + "%" : "-") + "</td><td>" + esc(x.gate_note) + "</td></tr>").join("");
+        })();
+        (function () {
           const box = document.getElementById("gatePendingBox");
           const p = data.pending || [];
           box.innerHTML = p.map(x => {
             const secs = x.gate_deadline ? Math.max(0, Math.round(x.gate_deadline - Date.now() / 1000)) : 0;
             return '<div class="empty" style="border:1px solid var(--muted); margin-bottom:8px;">' +
-              '<b>' + x.symbol + '</b> (' + x.direction + ') - LIVE PENDING (Case ' + (x.gate_mode || '1') + '): waiting for the stock to ' +
+              '<b>' + x.symbol + '</b> (' + x.direction + ') - ' + (x.gate_dry ? 'DRY RUN watching' : 'LIVE PENDING') + ' (Case ' + (x.gate_mode || '1') + '): waiting for the stock to ' +
               (x.gate_mode === '2' ? 'recover and continue ' : 'move ') + (x.direction === "Buy" ? "up" : "down") + ' from ' + x.gate_ref_spot +
               (x.gate_worst_pct ? ' (deepest dip ' + x.gate_worst_pct.toFixed(2) + '%)' : '') + ' - ' + secs + 's left</div>';
           }).join("");

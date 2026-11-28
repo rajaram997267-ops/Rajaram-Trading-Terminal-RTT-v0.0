@@ -204,7 +204,7 @@
 
 <script>
   const COLS = [
-    ["symbol", "Symbol"], ["category", "Alert"], ["sector_pct_0925", "Sector @9:25"], ["fno_mover", "F&O mover"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
+    ["symbol", "Symbol"], ["category", "Alert"], ["sector_pct_0925", "Sector @9:25"], ["fno_mover", "F&O mover"], ["lot_value", "Lot value"], ["first_candle_ratio", "9:15 ratio"], ["beats_sessions", "Beats"],
     ["pct_of_avg_day_volume", "9:15 % of day"], ["first_candle_body_pct", "9:15 body %"], ["gap_open_pct", "Gap %"],
     ["day_volume_ratio", "Day vol"], ["below_20d_high_pct", "Below 20d high %"],
     ["day_high_vs_prev_close_pct", "Day high %"], ["last_close_vs_prev_close_pct", "Last %"],
@@ -243,6 +243,10 @@
       const up = m.type === "gain";
       return '<span class="mv-chip ' + (up ? "pos" : "neg") + '" title="' + (up ? "Top F&O gainer" : "Top F&O loser") + ' #' + m.rank + ' vs the previous close, as of ' + esc(m.as_of) + '">' +
              (up ? "&uarr; " : "&darr; ") + '#' + m.rank + ' ' + (m.pct > 0 ? "+" : "") + m.pct + '%</span>';
+    }
+    if (k === "lot_value") {
+      const txt = v >= 1e7 ? (v / 1e7).toFixed(2) + " Cr" : v >= 1e5 ? (v / 1e5).toFixed(2) + " L" : String(Math.round(v));
+      return '<span title="Lot value (turnover) = lot size ' + esc(r.lot_size) + ' x alert price ' + esc(r.alert_price) + ' = Rs ' + Number(v).toLocaleString("en-IN") + '">' + txt + '</span>';
     }
     if (k === "beats_sessions") return esc(v);
     if (PCT.has(k)) return '<span class="' + (v > 0 ? "pos" : v < 0 ? "neg" : "") + '">' + (v > 0 ? "+" : "") + v + '%</span>';
