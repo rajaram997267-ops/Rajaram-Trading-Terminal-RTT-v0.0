@@ -920,6 +920,8 @@ def init_db():
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_deadline DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_result TEXT",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_mode TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_note TEXT",
+            "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_dry INTEGER DEFAULT 0",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_worst_pct DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS gate_decision_spot DOUBLE PRECISION",
             "ALTER TABLE paper_trades ADD COLUMN IF NOT EXISTS planned_risk_pct DOUBLE PRECISION",
@@ -1971,7 +1973,7 @@ def get_live_gate_max_chase_pct() -> float:
 
 
 def _gate_defer_live_entry(trade_id: int, symbol: str, category: str, price_val: float,
-                           spot_entry_price, premium) -> None:
+                           spot_entry_price, premium, dry: bool = False) -> None:
     ref_spot = spot_entry_price if spot_entry_price else price_val
     mode = get_live_gate_mode()
     window = get_live_gate_window2_min() if mode == "2" else get_live_gate_window_min()
@@ -1979,22 +1981,34 @@ def _gate_defer_live_entry(trade_id: int, symbol: str, category: str, price_val:
     way = 'up' if category == 'Buy' else 'down'
     note = (f"Gate (Case 2): waiting for pullback to recover and continue {way}" if mode == "2"
             else f"Gate (Case 1): waiting for {way} confirmation")
+    prem = premium if premium and premium > 0 else None
     with get_db() as conn:
-        conn.execute(
-            "UPDATE paper_trades SET live_status = 'PENDING', gate_ref_spot = ?, gate_ref_premium = ?, "
-            "gate_deadline = ?, gate_mode = ?, gate_worst_pct = 0, live_error = ? WHERE id = ?",
-            (ref_spot, premium if premium and premium > 0 else None, deadline, mode, note, trade_id),
-        )
+        if dry:
+            # live_status is left alone (NONE): a dry run must never touch live trading state.
+            conn.execute(
+                "UPDATE paper_trades SET gate_result = 'WATCHING', gate_dry = 1, gate_ref_spot = ?, gate_ref_premium = ?, "
+                "gate_deadline = ?, gate_mode = ?, gate_worst_pct = 0, gate_note = ? WHERE id = ?",
+                (ref_spot, prem, deadline, mode, "Dry run - " + note, trade_id))
+        else:
+            conn.execute(
+                "UPDATE paper_trades SET live_status = 'PENDING', gate_ref_spot = ?, gate_ref_premium = ?, "
+                "gate_deadline = ?, gate_mode = ?, gate_worst_pct = 0, gate_dry = 0, live_error = ?, gate_note = ? WHERE id = ?",
+                (ref_spot, prem, deadline, mode, note, note, trade_id))
         conn.commit()
 
 
-def _gate_finish(trade_id: int, result: str, reason: str, spot) -> None:
+def _gate_finish(trade_id: int, result: str, reason: str, spot, dry: bool = False) -> None:
     with get_db() as conn:
-        conn.execute(
-            "UPDATE paper_trades SET live_status = 'FAILED', live_error = ?, gate_result = ?, "
-            "gate_decision_spot = ? WHERE id = ? AND live_status = 'PENDING'",
-            (f"Gate {result.lower()}: {reason}", result, spot, trade_id),
-        )
+        if dry:
+            conn.execute(
+                "UPDATE paper_trades SET gate_result = ?, gate_decision_spot = ?, gate_note = ? "
+                "WHERE id = ? AND gate_result = 'WATCHING'",
+                (result, spot, f"Dry run - gate {result.lower()}: {reason}", trade_id))
+        else:
+            conn.execute(
+                "UPDATE paper_trades SET live_status = 'FAILED', live_error = ?, gate_result = ?, "
+                "gate_decision_spot = ?, gate_note = ? WHERE id = ? AND live_status = 'PENDING'",
+                (f"Gate {result.lower()}: {reason}", result, spot, f"Gate {result.lower()}: {reason}", trade_id))
         conn.commit()
 
 
@@ -2008,7 +2022,7 @@ def process_live_gate_pending() -> None:
     entry spot); reject only if the dip exceeds the pullback limit."""
     with get_db() as conn:
         pending = [dict(r) for r in conn.execute(
-            "SELECT * FROM paper_trades WHERE live_status = 'PENDING'").fetchall()]
+            "SELECT * FROM paper_trades WHERE live_status = 'PENDING' OR gate_result = 'WATCHING'").fetchall()]
     if not pending:
         return
     access_token = get_setting("upstox_access_token")
@@ -2017,9 +2031,10 @@ def process_live_gate_pending() -> None:
     for t in pending:
         tid, symbol, category = t["id"], t["symbol"], t["direction"]
         mode = t.get("gate_mode") or "1"
+        dry = bool(t.get("gate_dry"))
         try:
             if t.get("status") != "OPEN":
-                _gate_finish(tid, "EXPIRED", "paper trade closed before confirmation", None)
+                _gate_finish(tid, "EXPIRED", "paper trade closed before confirmation", None, dry)
                 continue
             ref = t.get("gate_ref_spot")
             spot = None
@@ -2039,25 +2054,59 @@ def process_live_gate_pending() -> None:
                     if fav <= -pullback:
                         _gate_finish(tid, "REJECTED",
                                      f"pullback went {fav:+.2f}% against the trade, beyond the {pullback:g}% limit "
-                                     f"(paper entry {ref:g}) - trend failed", spot)
+                                     f"(paper entry {ref:g}) - trend failed", spot, dry)
                         continue
                 else:
                     reject_at = move if move > 0 else 0.05
                     if fav <= -reject_at:
                         _gate_finish(tid, "REJECTED",
-                                     f"spot moved against the trade ({fav:+.2f}% vs paper entry {ref:g})", spot)
+                                     f"spot moved against the trade ({fav:+.2f}% vs paper entry {ref:g})", spot, dry)
                         continue
                 if fav >= confirm_at:
-                    _gate_release(t, spot, fav, access_token)
+                    if dry:
+                        _gate_dry_release(t, spot, fav, access_token)
+                    else:
+                        _gate_release(t, spot, fav, access_token)
                     continue
             if t.get("gate_deadline") and time.time() >= t["gate_deadline"]:
                 win = get_live_gate_window2_min() if mode == "2" else get_live_gate_window_min()
                 what = "no recovery and continuation" if mode == "2" else "no confirmation"
                 _gate_finish(tid, "EXPIRED",
                              f"{what} {'up' if category == 'Buy' else 'down'} within the window "
-                             f"(deepest dip {worst:+.2f}%)", spot)
+                             f"(deepest dip {worst:+.2f}%)", spot, dry)
         except Exception as e:
             print(f"[live-gate] trade {tid} error: {e}")
+
+
+def _gate_dry_release(t: dict, spot: float, fav: float, access_token: str) -> None:
+    """Dry run: direction confirmed. Do everything _gate_release does EXCEPT place an order - look up
+    the contract and premium live would pay now, apply the chase cap, and record the verdict."""
+    tid, symbol, category = t["id"], t["symbol"], t["direction"]
+    opt_type = "CE" if category == "Buy" else "PE"
+    try:
+        ref_spot = t.get("gate_ref_spot") or t.get("spot_entry_price") or spot
+        case2 = get_live_gate_contract_case() == "2"
+        option = get_atm_option(symbol, opt_type, spot if case2 else ref_spot)
+        premium = get_ltp_with_retry(option["instrument_key"], access_token) if option else None
+        ref_prem, max_chase = t.get("gate_ref_premium"), get_live_gate_max_chase_pct()
+        detail = f"spot {spot:g} ({fav:+.2f}% from paper entry {ref_spot:g})"
+        if premium and ref_prem:
+            chase = (premium - ref_prem) / ref_prem * 100.0
+            detail += f", {opt_type} premium {premium:g} vs paper {ref_prem:g} ({chase:+.1f}%)"
+            if max_chase > 0 and not case2 and chase > max_chase:
+                return _gate_finish(tid, "REJECTED", f"{detail} - premium up more than the {max_chase:g}% cap, would not chase", spot, True)
+        elif premium:
+            detail += f", {opt_type} premium {premium:g}"
+        _gate_finish_approved_dry(tid, f"Dry run - gate approved: would have gone live - {detail}", spot)
+    except Exception as e:
+        _gate_finish_approved_dry(tid, f"Dry run - gate approved at spot {spot:g} ({fav:+.2f}%) (premium lookup failed: {e})", spot)
+
+
+def _gate_finish_approved_dry(trade_id: int, note: str, spot) -> None:
+    with get_db() as conn:
+        conn.execute("UPDATE paper_trades SET gate_result = 'APPROVED', gate_decision_spot = ?, gate_note = ? "
+                     "WHERE id = ? AND gate_result = 'WATCHING'", (spot, note, trade_id))
+        conn.commit()
 
 
 def _gate_release(t: dict, spot: float, fav: float, access_token: str) -> None:
@@ -2105,8 +2154,8 @@ def _gate_finish_force(trade_id: int, reason: str, spot) -> None:
     with get_db() as conn:
         conn.execute(
             "UPDATE paper_trades SET live_status = 'FAILED', live_error = ?, gate_result = 'REJECTED', "
-            "gate_decision_spot = ? WHERE id = ?",
-            (f"Gate rejected: {reason}", spot, trade_id))
+            "gate_decision_spot = ?, gate_note = ? WHERE id = ?",
+            (f"Gate rejected: {reason}", spot, f"Gate rejected: {reason}", trade_id))
         conn.commit()
 
 
@@ -2687,6 +2736,10 @@ def open_trade_for_symbol(symbol: str, category: str, price_val: float, alert_na
         else:
             _execute_live_entry(row["id"], symbol, category, price_val, entry_strategy,
                                 entry_rsi_val, option, premium)
+    elif get_live_gate_enabled() and not auto_paper_only:
+        # Live trading is OFF but the gate is ON: DRY RUN. Nothing is ever ordered; the gate
+        # still watches the stock and records what it WOULD have decided, so it can be tested.
+        _gate_defer_live_entry(row["id"], symbol, category, price_val, spot_entry_price, premium, dry=True)
 
     # Record the directional-volume reading as of this entry on the trade
     # row (for the Stats "by entry volume strength" test). Deliberately the
@@ -4154,6 +4207,47 @@ def _attach_oi_trend(items: list, token: str | None, is_today: bool) -> None:
 
 
 _fut_spot: dict = {"t": 0.0, "map": {}}      # SYMBOL -> nearest future + spot prices, refreshed by _oi_trend_job (~20 s)
+
+
+# Lot value ("turnover volume" as the user defines it): F&O lot size x price = the notional rupee value of one lot.
+# Lot sizes come from the option chain already loaded from the Upstox instrument master (nearest upcoming expiry).
+_lot_map_cache: dict = {"src": None, "map": {}}
+_lot_master_kick = {"started": False}
+
+
+def _lot_size_for(symbol: str):
+    chains = _option_chain_cache
+    if not chains:
+        # Instrument master not loaded yet (first minutes after a restart): load it once in the background,
+        # never inside a page request.
+        if not _lot_master_kick["started"]:
+            _lot_master_kick["started"] = True
+            threading.Thread(target=_load_instrument_master, daemon=True).start()
+        return None
+    if _lot_map_cache["src"] is not chains:
+        today = (datetime.utcnow() + IST_OFFSET).strftime("%Y-%m-%d")
+        m = {}
+        for sym, contracts in chains.items():
+            upcoming = [c for c in contracts if c["expiry"] >= today]
+            pool = upcoming or contracts
+            if pool:
+                nearest = min(c["expiry"] for c in pool)
+                m[sym] = next(c["lot_size"] for c in pool if c["expiry"] == nearest)
+        _lot_map_cache["map"], _lot_map_cache["src"] = m, chains
+    return _lot_map_cache["map"].get((symbol or "").strip().upper())
+
+
+def _attach_lot_value(items: list) -> None:
+    """Adds lot_size and lot_value (= lot size x the alert's trigger price) to each alert dict."""
+    for a in items:
+        try:
+            price = float(a.get("trigger_price") or 0)
+        except (TypeError, ValueError):
+            price = 0
+        lot = _lot_size_for(a.get("symbol"))
+        if lot and price > 0:
+            a["lot_size"] = lot
+            a["lot_value"] = round(price * lot)
 
 
 def _attach_fut_spot(items: list, is_today: bool) -> None:
@@ -9992,6 +10086,7 @@ def index():
             _attach_oi_trend(_items, access_token, selected_date == today_str)
             _attach_oi_range(_items, selected_date == today_str)
             _attach_fut_spot(_items, selected_date == today_str)
+            _attach_lot_value(_items)
             _items.sort(key=_volume_rank)   # Strong volume first (stable)
 
         html = render_template(
@@ -10081,6 +10176,7 @@ def api_alerts():
     _attach_oi_trend(merged_alerts, access_token, selected_date == today_str)
     _attach_oi_range(merged_alerts, selected_date == today_str)
     _attach_fut_spot(merged_alerts, selected_date == today_str)
+    _attach_lot_value(merged_alerts)
     # Strong volume first within each column (stable: newest-first kept within a rank)
     _cat_pos = {name: i for i, name in enumerate(CATEGORY_ORDER)}
     merged_alerts.sort(key=lambda a: (_cat_pos.get(a.get("category"), len(_cat_pos)), _volume_rank(a)))
@@ -11624,6 +11720,16 @@ def api_first_candle_board():
                     if sym in cats and categorize(a) == cats[sym] and nm:
                         names.setdefault(sym, set()).add(nm)
                 alert_names = {k: sorted(v) for k, v in names.items()}
+                prices_by_sym: dict = {}
+                for a in sorted(day_alerts, key=lambda x: x.get("created_at") or ""):
+                    sym = (a.get("symbol") or "").strip().upper()
+                    if sym in cats and sym not in prices_by_sym:
+                        try:
+                            pv = float(a.get("trigger_price") or 0)
+                        except (TypeError, ValueError):
+                            pv = 0
+                        if pv > 0:
+                            prices_by_sym[sym] = pv
             except (psycopg2.Error, RuntimeError):
                 return jsonify({"error": "database unavailable"}), 503
             symbols = list(cats)[:_FC_BOARD_MAX_SYMBOLS]
@@ -11632,7 +11738,7 @@ def api_first_candle_board():
                 for k in old_dates[:len(_fc_board) - 29]:
                     _fc_board.pop(k, None)
             st = {"state": "running", "started": now_m, "finished": None, "total": len(symbols), "alerted": len(cats),
-                  "done": 0, "reports": [], "error": None, "names": alert_names}
+                  "done": 0, "reports": [], "error": None, "names": alert_names, "prices": prices_by_sym}
             _fc_board[date_str] = st
             if not symbols:
                 st["state"] = "done"
@@ -11651,6 +11757,11 @@ def api_first_candle_board():
         r["decision"] = d["decision"] if d else None
         r["decision_reason"] = d["reason"] if d else None
         r["alert_names"] = (st.get("names") or {}).get(r["symbol"], [])
+        _p = (st.get("prices") or {}).get(r["symbol"])
+        _lot = _lot_size_for(r["symbol"])
+        r["alert_price"] = _p
+        r["lot_size"] = _lot
+        r["lot_value"] = round(_p * _lot) if _p and _lot else None
         r["sector"] = SECTOR_MAP.get(r["symbol"])
         r["sector_pct_0925"] = sec25.get(r["sector"]) if r["sector"] else None
     return jsonify({"date": date_str, "state": st["state"], "total": st["total"], "done": st["done"],
@@ -14150,8 +14261,12 @@ def live_trading_data():
             "SELECT * FROM paper_trades WHERE live_status = 'FAILED' ORDER BY id DESC LIMIT 50"
         ).fetchall()
         pending_trades = [dict(t) for t in conn.execute(
-            "SELECT id, symbol, direction, gate_ref_spot, gate_deadline, gate_mode, gate_worst_pct FROM paper_trades "
-            "WHERE live_status IN ('PENDING', 'ENTERING') ORDER BY id DESC").fetchall()]
+            "SELECT id, symbol, direction, gate_ref_spot, gate_deadline, gate_mode, gate_worst_pct, gate_dry FROM paper_trades "
+            "WHERE live_status IN ('PENDING', 'ENTERING') OR gate_result = 'WATCHING' ORDER BY id DESC").fetchall()]
+        gate_decisions = [dict(t) for t in conn.execute(
+            "SELECT id, symbol, direction, entry_time, gate_mode, gate_dry, gate_result, gate_ref_spot, "
+            "gate_decision_spot, gate_worst_pct, gate_note FROM paper_trades "
+            "WHERE gate_result IS NOT NULL ORDER BY id DESC LIMIT 60").fetchall()]
     open_trades = [dict(t) for t in open_trades]
     _attach_rule_notes(open_trades)
     closed_trades = [dict(t) for t in closed_trades]
@@ -14186,6 +14301,7 @@ def live_trading_data():
         "closed": closed_trades,
         "failed": failed_trades,
         "pending": pending_trades,
+        "gate_decisions": gate_decisions,
         "gate_enabled": get_live_gate_enabled(),
         "live_open": live_stats["live_open"],
         "live_closed": live_stats["live_closed"],
